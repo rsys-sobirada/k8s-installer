@@ -1,0 +1,6 @@
+server1.domain.com,0000:00:1f.6
+server2.domain.com,0000:00:1f.7
+server3.domain.com,0000:00:1f.8
+server4.domain.com,0000:01:00.0
+server5.domain.com,0000:01:00.1
+server6.domain.com,0000:02:00.0
