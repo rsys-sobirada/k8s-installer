@@ -1,1 +1,1 @@
-server1,172.27.28.216,root,root@123,/home/labadmin/6.3.0/EA1/TRILLIUM_5GCN_CNF_REL_6.3.0/common/tools/install/k8s-v1.31.4/,0000:08:00.0,0000:09:00.0
+server1:172.27.28.216:/home/labadmin/6.3.0/EA1/TRILLIUM_5GCN_CNF_REL_6.3.0/common/tools/install/k8s-v1.31.4
