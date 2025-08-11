@@ -1,0 +1,6 @@
+# reset_uninstall.yml (TEMPLATE kept in your repo)
+# The Jenkins script will replace __KSPRAY_ROOT__ with the real path before running.
+- name: Uninstall (non-interactive)
+  import_playbook: __KSPRAY_ROOT__/playbooks/reset.yml
+  vars:
+    uninstall_mode: true
