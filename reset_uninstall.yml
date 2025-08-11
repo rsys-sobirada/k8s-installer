@@ -1,7 +1,0 @@
-# reset_uninstall.yml  (kept in your GitHub repo)
-# Jenkins will replace __KSPRAY_ROOT__ with the actual Kubespray path on the controller.
-- name: Uninstall (non-interactive)
-  import_playbook: __KSPRAY_ROOT__/playbooks/reset.yml
-  vars:
-    skip_confirmation: true
-    reset_confirmation: true
