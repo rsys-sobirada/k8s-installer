@@ -3,6 +3,14 @@
 # With pre-check (skip if no pods) and abort handler (kill running processes & stop run)
 
 set -euo pipefail
+# ---- Feature gate: run only when CLUSTER_RESET is enabled ----
+CR="${CLUSTER_RESET:-No}"
+shopt -s nocasematch
+if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
+  echo "ℹ️  CLUSTER_RESET is disabled (got: '$CR'). Skipping cluster reset."
+  exit 0
+fi
+shopt -u nocasematch
 
 # ---------- Tunables ----------
 SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
