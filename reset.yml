@@ -1,5 +1,4 @@
 ---
-# Kubespray reset (auto-confirm)
 - name: Common tasks for every playbooks
   import_playbook: boilerplate.yml
 
@@ -11,7 +10,7 @@
   gather_facts: false
 
   vars:
-    # Force non-interactive run
+    # Make non-interactive the default
     skip_confirmation: true
     reset_confirmation: true
 
@@ -21,19 +20,18 @@
         prompt: "Are you sure you want to reset cluster state? Type 'yes' to reset your cluster."
       register: reset_confirmation_prompt
       run_once: true
-      when:
-        - not (skip_confirmation | default(false) | bool)
-        - reset_confirmation is not defined
+      when: >
+        not (skip_confirmation | default(false) | bool)
+        and not (reset_confirmation | default(false) | bool)
 
     - name: Check confirmation
-      fail:
-        msg: "Reset confirmation failed"
-      when:
-        - not reset_confirmation | default(false) | bool
-        - not reset_confirmation_prompt.user_input | default("") == "yes"
-
-    - name: Gather information about installed services
-      service_facts:
+      assert:
+        that:
+          - reset_confirmation | default(false) | bool
+            or (reset_confirmation_prompt.user_input | default('')) == 'yes'
+        fail_msg: "Reset confirmation failed"
+      when: >
+        not (skip_confirmation | default(false) | bool)
 
   environment: "{{ proxy_disable_env }}"
   roles:
