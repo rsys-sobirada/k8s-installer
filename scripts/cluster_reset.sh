@@ -28,7 +28,7 @@ OLD_VERSION="${OLD_VERSION:-}"          # e.g. 6.3.0_EA1
 OLD_BUILD_PATH="${OLD_BUILD_PATH:-}"    # e.g. /home/labadmin
 REQ_WAIT_SECS="${REQ_WAIT_SECS:-360}"
 RETRY_COUNT="${RETRY_COUNT:-3}"
-RETRY_DELAY_SECS="${RETRY_DELAY_SECS:-10}"   # ⬅️ delay between retries
+RETRY_DELAY_SECS="${RETRY_DELAY_SECS:-10}"   # delay between retries
 RESET_YML_WS="${RESET_YML_WS:-$WORKSPACE/reset.yml}"
 
 [[ -f "$SSH_KEY" ]]     || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
