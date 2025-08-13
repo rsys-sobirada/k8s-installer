@@ -1,44 +1,47 @@
 #!/bin/bash
 # scripts/cluster_install.sh
 # Install orchestrator (sequential per server)
-# - Accepts server list lines in CSV "server,pci" OR colon "name:ip[:path]"
-# - Ensures 10.10.10.20/24 is present (iface may remain DOWN)
-# - Builds NEW path from NEW_* and runs "yes yes | ./install_k8s.sh"
+# - server list supports CSV "server,pci" OR colon "name:ip[:custom_base]"
+# - Ensures 10.10.10.20/24 exists (iface may remain DOWN)
+# - Builds NEW path per server and runs "yes yes | ./install_k8s.sh"
 
 set -euo pipefail
 
-# ---- tiny helpers ----
+# ---- helpers ----
 require(){ local n="$1" ex="$2"; [[ -n "${!n:-}" ]] || { echo "❌ Missing $n (e.g. $ex)"; exit 1; }; }
-ver_num(){ echo "${1%%_*}"; }   # 6.3.0_EA2 -> 6.3.0
-ver_tag(){ echo "${1##*_}"; }   # 6.3.0_EA2 -> EA2
-normalize_k8s_path(){ # <BASE> <VERSION> <K8S_VER> [REL_SUFFIX]
-  local base="${1%/}" ver="$2" kver="$3" rel="${4-}"
-  local num tag; num="$(ver_num "$ver")"; tag="$(ver_tag "$ver")"
-  echo "$base/${num}/${tag}/TRILLIUM_5GCN_CNF_REL_${num}${rel}/common/tools/install/k8s-v${kver}"
+base_ver(){ echo "${1%%_*}"; }                                   # 6.3.0_EA2 -> 6.3.0
+ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }    # 6.3.0_EA2 -> EA2 ; 6.3.0 -> ""
+
+# Build final kubespray path: <base_dir>/<BASE>/<TAG>/TRILLIUM_.../k8s-vX.Y.Z
+make_k8s_path(){  # <base_dir> <BASE> <TAG> <K8S_VER> [REL_SUFFIX]
+  local bdir="${1%/}" base="$2" tag="$3" kver="$4" rel="${5-}"
+  echo "$bdir/${base}/${tag}/TRILLIUM_5GCN_CNF_REL_${base}${rel}/common/tools/install/k8s-v${kver}"
 }
 
-# ---- inputs from Jenkins / env ----
+# ---- inputs ----
 require NEW_VERSION     "6.3.0_EA2"
 require NEW_BUILD_PATH  "/home/labadmin"
 : "${K8S_VER:=1.31.4}"
-: "${REL_SUFFIX:=}"                          # usually empty
+: "${REL_SUFFIX:=}"                              # usually empty
 : "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
-: "${INSTALL_SERVER_FILE:=server_pci_map.txt}"   # CSV (server,pci) or colon (name:ip[:path])
-: "${INSTALL_IP_ADDR:=10.10.10.20/24}"      # the address to ensure
-: "${INSTALL_IP_IFACE:=}"                   # optional: force iface (e.g., enp1s0)
+: "${INSTALL_SERVER_FILE:=server_pci_map.txt}"   # CSV or colon file
+: "${INSTALL_IP_ADDR:=10.10.10.20/24}"
+: "${INSTALL_IP_IFACE:=}"                        # optional forced iface
 
 [[ -f "$SSH_KEY" ]] || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
 chmod 600 "$SSH_KEY" || true
 [[ -f "$INSTALL_SERVER_FILE" ]] || { echo "❌ Missing $INSTALL_SERVER_FILE"; exit 1; }
 
-NEW_VER_PATH="$(normalize_k8s_path "$NEW_BUILD_PATH" "$NEW_VERSION" "$K8S_VER" "$REL_SUFFIX")"
-
 # SSH speed-ups (connection reuse)
 SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
 
+BASE="$(base_ver "$NEW_VERSION")"
+TAG_IN="$(ver_tag "$NEW_VERSION")"   # may be empty if NEW_VERSION=6.3.0
+
 echo "NEW_VERSION:      $NEW_VERSION"
 echo "NEW_BUILD_PATH:   $NEW_BUILD_PATH"
-echo "NEW_VER_PATH:     $NEW_VER_PATH"
+echo "BASE version:     $BASE"
+[[ -n "$TAG_IN" ]] && echo "Provided TAG:   $TAG_IN" || echo "Provided TAG:   (none; will detect per host)"
 echo "INSTALL_LIST:     $INSTALL_SERVER_FILE"
 echo "IP to ensure:     $INSTALL_IP_ADDR"
 [[ -n "$INSTALL_IP_IFACE" ]] && echo "Forced iface:    $INSTALL_IP_IFACE"
@@ -74,6 +77,21 @@ ip addr replace "$IP_CIDR" dev "$IFACE" || true
 echo "[IP] Plumbed $IP_CIDR on ${IFACE} (iface may remain DOWN)"
 RSCRIPT
 
+# $1=base_dir, $2=BASE (6.3.0)
+read -r -d '' DETECT_TAG_SNIPPET <<'RSCRIPT' || true
+set -euo pipefail
+BDIR="$1"; BASE="$2"
+shopt -s nullglob
+arr=( "$BDIR/$BASE"/EA* )
+if (( ${#arr[@]} > 0 )); then
+  # pick the first EA* folder; adjust if you want newest instead
+  bn="$(basename "${arr[0]}")"
+  echo "$bn"
+else
+  echo "EA1"
+fi
+RSCRIPT
+
 # $1=install_path
 read -r -d '' RUN_INSTALL_SNIPPET <<'RSCRIPT' || true
 set -euo pipefail
@@ -86,22 +104,23 @@ RSCRIPT
 
 any_failed=0
 
-# ---- iterate servers: supports CSV "server,pci" or colon "name:ip[:path]" ----
+# ---- iterate servers ----
+# supports:
+#   CSV:   server,pci
+#   colon: name:ip[:custom_base]
 while IFS= read -r raw || [[ -n "${raw:-}" ]]; do
   line="$(echo -n "${raw:-}" | tr -d '\r')"
   [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
 
-  host=""
+  host=""; custom_base=""
   if [[ "$line" == *,* ]]; then
-    # CSV
     IFS=',' read -r server pci <<<"$line"
     host="$(echo -n "${server:-}" | xargs)"
   elif [[ "$line" == *:* ]]; then
-    # Colon
     IFS=':' read -r name ip maybe_path <<<"$line"
     host="$(echo -n "${ip:-}" | xargs)"
+    custom_base="$(echo -n "${maybe_path:-}" | xargs)"
   else
-    # Single token
     host="$(echo -n "$line" | xargs)"
   fi
 
@@ -110,11 +129,27 @@ while IFS= read -r raw || [[ -n "${raw:-}" ]]; do
     continue
   fi
 
+  # base directory to use on THIS host
+  host_base="${custom_base:-$NEW_BUILD_PATH}"
+
+  # Determine TAG for this host:
+  # - if NEW_VERSION has a tag → use it
+  # - else detect EA* folder on the host under <host_base>/<BASE>
+  TAG="$TAG_IN"
+  if [[ -z "$TAG" ]]; then
+    TAG="$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$host_base" "$BASE" <<<"$DETECT_TAG_SNIPPET")" || TAG="EA1"
+  fi
+
+  # Compose final kubespray path for this host
+  NEW_VER_PATH="$(make_k8s_path "$host_base" "$BASE" "$TAG" "$K8S_VER" "$REL_SUFFIX")"
+
   echo ""
   echo "🧩 Host:  $host"
+  echo "📁 Base:  $host_base"
+  echo "🏷️  Tag:   $TAG"
   echo "📁 Path:  $NEW_VER_PATH"
 
-  # 1) Ensure IP exists
+  # 1) Ensure the alias IP exists
   if ! ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET"; then
     echo "❌ Failed to ensure $INSTALL_IP_ADDR on $host"
     any_failed=1
