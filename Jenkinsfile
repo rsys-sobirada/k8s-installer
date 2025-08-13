@@ -6,7 +6,7 @@ pipeline {
     SERVER_FILE = 'server_pci_map.txt'
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key' // used for target servers
     K8S_VER     = '1.31.4'
-    EXTRACT_BUILD_TARBALLS = 'true'
+    EXTRACT_BUILD_TARBALLS = 'False'
   }
 
   parameters {
