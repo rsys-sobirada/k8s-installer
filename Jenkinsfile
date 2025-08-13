@@ -34,7 +34,7 @@ pipeline {
         sh '''
           set -e
 
-          # Validate required inputs here (don’t call .trim() on Secrets in Groovy)
+          # Validate required inputs (don’t .trim() secrets in Groovy)
           if [ -z "${BUILD_SRC_HOST}" ]; then
             echo "ERROR: BUILD_SRC_HOST is required when FETCH_BUILD=true" >&2
             exit 2
@@ -50,7 +50,12 @@ pipeline {
             exit 2
           fi
 
+          # Ensure LF endings (strip Windows CRLF if the file came in that way)
+          sed -i 's/\\r$//' scripts/fetch_build.sh || true
+
           chmod +x scripts/fetch_build.sh
+
+          # 👇 Run with bash explicitly (minimal alternative fix)
           NEW_VERSION="${NEW_VERSION}" \
           NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
           BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
@@ -58,7 +63,7 @@ pipeline {
           BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
           BUILD_SRC_PASS="${BUILD_SRC_PASS}" \
           EXTRACT_BUILD_TARBALLS="true" \
-          scripts/fetch_build.sh
+          bash -euo pipefail scripts/fetch_build.sh
         '''
       }
     }
