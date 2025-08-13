@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 withCredentials([
   usernamePassword(credentialsId: 'build-src-creds', usernameVariable: 'BUILD_SRC_USER', passwordVariable: 'BUILD_SRC_PASS'),
   sshUserPrivateKey(credentialsId: 'cn-ssh-key', keyFileVariable: 'CN_KEY', usernameVariable: 'CN_USER')
