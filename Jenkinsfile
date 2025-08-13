@@ -53,17 +53,18 @@ pipeline {
         sh '''
           set -e
           chmod +x scripts/fetch_build.sh
-          echo ">>> Fetching build ${NEW_VERSION} from ${BUILD_SRC_USER}@${BUILD_SRC_HOST}:${BUILD_SRC_BASE} -> ${NEW_BUILD_PATH}"
-          NEW_VERSION="${NEW_VERSION}" \
-          NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-          BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
-          BUILD_SRC_USER="${BUILD_SRC_USER}" \
-          BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
-          BUILD_TRANSFER_MODE="${BUILD_TRANSFER_MODE}" \
-          SSH_KEY="${SSH_KEY}" \
-          EXTRACT_BUILD_TARBALLS="true" \
-          REQUIRE_BIN_REL="false" \
-          bash -euo pipefail scripts/fetch_build.sh
+          # pass env safely; no stray spaces
+          env \
+            NEW_VERSION="${NEW_VERSION}" \
+            NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+            BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
+            BUILD_SRC_USER="${BUILD_SRC_USER}" \
+            BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
+            BUILD_TRANSFER_MODE="${BUILD_TRANSFER_MODE}" \
+            SSH_KEY="${SSH_KEY}" \
+            EXTRACT_BUILD_TARBALLS="true" \
+            REQUIRE_BIN_REL="false" \
+          bash scripts/fetch_build.sh
         '''
       }
     }
