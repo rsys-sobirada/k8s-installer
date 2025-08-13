@@ -1,99 +1,99 @@
 pipeline {
   agent any
+  options {
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+  }
 
   parameters {
-    // --- Versions & paths ---
-    string(name: 'NEW_VERSION',  defaultValue: '6.3.0_EA2',     description: 'Target CN/K8s bundle version to install')
-    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin', description: 'Base directory that contains NEW_VERSION on targets')
-    string(name: 'OLD_VERSION',  defaultValue: '6.3.0_EA1',     description: 'Existing version currently on servers (for reset)')
-    string(name: 'OLD_BUILD_PATH', defaultValue: '/home/labadmin', description: 'Base directory that contains OLD_VERSION on targets')
-    booleanParam(name: 'CLUSTER_RESET', defaultValue: true, description: 'Reset cluster before install')
-    string(name: 'K8S_VER', defaultValue: '1.31.4', description: 'Kubernetes version directory (k8s-v<ver>)')
-    string(name: 'KSPRAY_DIR', defaultValue: 'kubespray-2.27.0', description: 'Kubespray dir name under the version path')
+    // ── Core inputs ───────────────────────────────────────────
+    string(name: 'NEW_VERSION',     defaultValue: '6.3.0_EA2',  description: 'Target CN/K8s bundle to install')
+    string(name: 'OLD_VERSION',     defaultValue: '6.3.0_EA1',  description: 'Existing bundle (used only if CLUSTER_RESET=true)')
+    booleanParam(name: 'CLUSTER_RESET', defaultValue: true,     description: 'Run scripts/cluster_reset.sh before install')
+    string(name: 'OLD_BUILD_PATH',  defaultValue: '/home/labadmin', description: 'Base dir on target servers that contains OLD_VERSION')
+    string(name: 'NEW_BUILD_PATH',  defaultValue: '/home/labadmin', description: 'Base dir on target servers that contains NEW_VERSION')
+    string(name: 'SERVER_FILE',     defaultValue: 'server_pci_map.txt', description: 'name:ip[:custom_k8s_base] list in repo root')
+    string(name: 'SSH_KEY',         defaultValue: '/var/lib/jenkins/.ssh/jenkins_key', description: 'SSH key used to reach target servers')
+    string(name: 'K8S_VER',         defaultValue: '1.31.4',     description: 'Kubespray k8s version directory suffix (k8s-v<ver>)')
 
-    // --- Optional: fetch new build from a remote server (Active Choices) ---
+    // ── Optional: fetch build from a remote host ──────────────
     booleanParam(name: 'FETCH_BUILD', defaultValue: false,
-      description: 'Fetch NEW build from a remote server before install')
-
-    // Info panel that reacts to FETCH_BUILD
-    [$class: 'DynamicReferenceParameter',
-      name: 'BUILD_COPY_SECTION',
-      referencedParameters: 'FETCH_BUILD',
-      script: [$class: 'GroovyScript', script: [sandbox: true, script: '''
-if (FETCH_BUILD.toBoolean()) {
-  return "<div style=\\"margin:6px 0;padding:8px;border:1px solid #ccd;background:#f6f9ff\\"><b>Remote build copy is ENABLED.</b> Fill details below.</div>"
-}
-return "<span style=\\"color:#888\\">Remote build copy is disabled.</span>"
-''']]]
-
-    // Reactive inputs (only used when FETCH_BUILD=true)
-    [$class: 'CascadeChoiceParameter', name: 'BUILD_SRC_HOST',
-      description: 'Remote build server hostname/IP',
-      referencedParameters: 'FETCH_BUILD', choiceType: 'PT_TEXTBOX',
-      script: [$class: 'GroovyScript', script: [sandbox: true, script: 'return ""']]]
-
-    [$class: 'CascadeChoiceParameter', name: 'BUILD_SRC_USER',
-      description: 'SSH user on the build server',
-      referencedParameters: 'FETCH_BUILD', choiceType: 'PT_TEXTBOX',
-      script: [$class: 'GroovyScript', script: [sandbox: true, script: 'return "labadmin"']]]
-
-    [$class: 'CascadeChoiceParameter', name: 'BUILD_SRC_BASE',
-      description: 'Base path on the build server; versioned path is derived from NEW_VERSION',
-      referencedParameters: 'FETCH_BUILD', choiceType: 'PT_TEXTBOX',
-      script: [$class: 'GroovyScript', script: [sandbox: true, script: 'return "/home/labadmin"']]]
-
-    [$class: 'CascadeChoiceParameter', name: 'BUILD_SSH_KEY_PATH',
-      description: 'SSH private key path for the build server',
-      referencedParameters: 'FETCH_BUILD', choiceType: 'PT_TEXTBOX',
-      script: [$class: 'GroovyScript', script: [sandbox: true, script: 'return "/var/lib/jenkins/.ssh/jenkins_key"']]]
-
-    [$class: 'CascadeChoiceParameter', name: 'BUILD_TRANSFER_MODE',
-      description: 'Copy mode',
-      referencedParameters: 'FETCH_BUILD', choiceType: 'PT_SINGLE_SELECT',
-      script: [$class: 'GroovyScript', script: [sandbox: true, script: '''
-return FETCH_BUILD.toBoolean() ? ["stage-then-push (recommended)"] : ["(disabled)"]
-''']]]
+                 description: 'Copy the build from a remote host to NEW_BUILD_PATH before install')
+    activeChoiceReactiveParam(name: 'BUILD_TRANSFER_MODE') {
+      description('Only used when FETCH_BUILD=true')
+      choiceType('SINGLE_SELECT')
+      groovyScript {
+        script('return FETCH_BUILD.toBoolean() ? ["scp","rsync"] : ["(disabled)"]')
+        fallbackScript('return ["scp"]')
+      }
+      referencedParameter('FETCH_BUILD')
+    }
+    string(name: 'BUILD_SRC_HOST',      defaultValue: '',          description: 'Remote host (ignored if FETCH_BUILD=false)')
+    string(name: 'BUILD_SRC_USER',      defaultValue: 'labadmin',  description: 'Remote user (ignored if FETCH_BUILD=false)')
+    string(name: 'BUILD_SRC_BASE',      defaultValue: '/repo/builds', description: 'Remote base dir that contains NEW_VERSION/')
+    string(name: 'BUILD_SSH_KEY_PATH',  defaultValue: '/var/lib/jenkins/.ssh/jenkins_key', description: 'SSH key for remote build host')
   }
 
   stages {
-    stage('Reset → Install') {
+    stage('Checkout') {
       steps {
-        script {
-          // Optional validation when fetch is enabled
-          if (params.FETCH_BUILD && !params.BUILD_SRC_HOST?.trim()) {
-            error "BUILD_SRC_HOST is required when FETCH_BUILD=true"
-          }
+        checkout scm
+        sh 'git rev-parse --short HEAD || true'
+      }
+    }
 
-          sh """
-            set -e
-            env \
-              # reset controls
-              CLUSTER_RESET="${params.CLUSTER_RESET}" \
-              OLD_VERSION="${params.OLD_VERSION}" \
-              OLD_BUILD_PATH="${params.OLD_BUILD_PATH}" \
-              K8S_VER="${params.K8S_VER}" \
-              KSPRAY_DIR="${params.KSPRAY_DIR}" \
-              RESET_YML_WS="\$WORKSPACE/reset.yml" \
-              SSH_KEY="/var/lib/jenkins/.ssh/jenkins_key" \
-              SERVER_FILE="server_pci_map.txt" \
-              REQ_WAIT_SECS="360" \
-              RETRY_COUNT="3" \
-              # install controls
-              NEW_VERSION="${params.NEW_VERSION}" \
-              NEW_BUILD_PATH="${params.NEW_BUILD_PATH}" \
-              INSTALL_SERVER_FILE="server_pci_map.txt" \
-              INSTALL_IP_ADDR="10.10.10.20/24" \
-              INSTALL_IP_IFACE="" \
-              # optional remote build fetch
-              FETCH_BUILD="${params.FETCH_BUILD}" \
-              BUILD_SRC_HOST="${params.BUILD_SRC_HOST}" \
-              BUILD_SRC_USER="${params.BUILD_SRC_USER}" \
-              BUILD_SRC_BASE="${params.BUILD_SRC_BASE}" \
-              BUILD_SSH_KEY_PATH="${params.BUILD_SSH_KEY_PATH}" \
-              BUILD_TRANSFER_MODE="${params.BUILD_TRANSFER_MODE}" \
-            bash scripts/run_upgrade_chain.sh
-          """
-        }
+    stage('Fetch build (optional)') {
+      when { expression { return params.FETCH_BUILD } }
+      steps {
+        sh '''
+          set -euo pipefail
+          echo "[Fetch] ${BUILD_TRANSFER_MODE} from ${BUILD_SRC_USER}@${BUILD_SRC_HOST}:${BUILD_SRC_BASE}/${NEW_VERSION} -> ${NEW_BUILD_PATH}/${NEW_VERSION}"
+          if [ "${BUILD_TRANSFER_MODE}" = "scp" ]; then
+            ssh -o StrictHostKeyChecking=no -i "${BUILD_SSH_KEY_PATH}" \
+                "${BUILD_SRC_USER}@${BUILD_SRC_HOST}" "test -d '${BUILD_SRC_BASE}/${NEW_VERSION}'"
+            mkdir -p "${NEW_BUILD_PATH}/${NEW_VERSION}"
+            scp -o StrictHostKeyChecking=no -i "${BUILD_SSH_KEY_PATH}" -r \
+                "${BUILD_SRC_USER}@${BUILD_SRC_HOST}:${BUILD_SRC_BASE}/${NEW_VERSION}/" \
+                "${NEW_BUILD_PATH}/${NEW_VERSION}/"
+          else
+            rsync -az --delete -e "ssh -o StrictHostKeyChecking=no -i ${BUILD_SSH_KEY_PATH}" \
+                "${BUILD_SRC_USER}@${BUILD_SRC_HOST}:${BUILD_SRC_BASE}/${NEW_VERSION}/" \
+                "${NEW_BUILD_PATH}/${NEW_VERSION}/"
+          fi
+        '''
+      }
+    }
+
+    stage('Cluster reset (optional)') {
+      when { expression { return params.CLUSTER_RESET } }
+      steps {
+        sh '''
+          set -euo pipefail
+          chmod +x scripts/cluster_reset.sh
+          RESET_YML_WS="${WORKSPACE}/reset.yml" \
+          SSH_KEY="${SSH_KEY}" \
+          SERVER_FILE="${SERVER_FILE}" \
+          OLD_VERSION="${OLD_VERSION}" \
+          OLD_BUILD_PATH="${OLD_BUILD_PATH}" \
+          K8S_VER="${K8S_VER}" \
+          scripts/cluster_reset.sh
+        '''
+      }
+    }
+
+    stage('Cluster install') {
+      steps {
+        sh '''
+          set -euo pipefail
+          chmod +x scripts/cluster_install.sh
+          NEW_VERSION="${NEW_VERSION}" \
+          NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+          SSH_KEY="${SSH_KEY}" \
+          SERVER_FILE="${SERVER_FILE}" \
+          K8S_VER="${K8S_VER}" \
+          scripts/cluster_install.sh
+        '''
       }
     }
   }
