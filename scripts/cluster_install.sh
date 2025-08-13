@@ -7,6 +7,7 @@
 # - Preflight: ensure kube ports 6443/10257 are free
 # - Retries end-to-end per host (waits for TRILLIUM tar if fetch runs in parallel)
 # - SSH key auth to root@host
+# - Abort trap: kills remote activity and frees kube ports on pipeline abort
 
 set -euo pipefail
 
@@ -40,9 +41,9 @@ require NEW_BUILD_PATH  "/home/labadmin"
 : "${INSTALL_IP_IFACE:=}"
 
 # Retries / waits
-: "${INSTALL_RETRY_COUNT:=3}"           # ⬅️ attempts per host
-: "${INSTALL_RETRY_DELAY_SECS:=20}"     # ⬅️ delay between attempts
-: "${BUILD_WAIT_SECS:=300}"             # ⬅️ wait for TRILLIUM tar to appear (fetch may be parallel)
+: "${INSTALL_RETRY_COUNT:=3}"           # attempts per host
+: "${INSTALL_RETRY_DELAY_SECS:=20}"     # delay between attempts
+: "${BUILD_WAIT_SECS:=300}"             # wait for TRILLIUM tar (fetch may be parallel)
 
 [[ -f "$SSH_KEY" ]] || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
 chmod 600 "$SSH_KEY" || true
@@ -52,6 +53,30 @@ SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o 
 
 BASE="$(base_ver "$NEW_VERSION")"
 TAG_IN="$(ver_tag "$NEW_VERSION")"
+
+# ---- Abort trap (after SSH_OPTS/SSH_KEY are set) ----
+declare -a HOSTS_TOUCHED=()
+ABORTING=0
+on_abort() {
+  [[ $ABORTING -eq 1 ]] && return
+  ABORTING=1
+  echo ""
+  echo "⚠️  Abort received — stopping remote actions on touched hosts..."
+  for host in "${HOSTS_TOUCHED[@]}"; do
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<'RS'
+set -euo pipefail
+pkill -f 'install_k8s\.sh|ansible-playbook|kubeadm|kubespray' 2>/dev/null || true
+systemctl stop kubelet || true
+rm -f /etc/kubernetes/manifests/*.yaml || true
+if command -v crictl >/dev/null 2>&1; then
+  crictl ps -a | awk '{print $1}' | xargs -r crictl rm -f
+fi
+RS
+  done
+  echo "🔚 Exiting due to abort."
+  exit 130
+}
+trap on_abort INT TERM HUP QUIT
 
 echo "NEW_VERSION:      $NEW_VERSION"
 echo "NEW_BUILD_PATH:   $NEW_BUILD_PATH"
@@ -113,7 +138,7 @@ interval=3
 while [[ ! -s "$TRIL_TAR" && "$elapsed" -lt "$WAIT" ]]; do
   echo "[TRIL] Waiting for $TRIL_TAR to appear ... (${elapsed}/${WAIT}s)"
   sleep "$interval"; elapsed=$((elapsed+interval))
-done
+enddone
 
 if [[ ! -s "$TRIL_TAR" ]]; then
   echo "[ERROR] TRILLIUM tar not found at $TRIL_TAR after ${WAIT}s"; exit 2
@@ -176,6 +201,8 @@ while IFS= read -r raw || [[ -n "${raw:-}" ]]; do
     host="$(echo -n "$line" | xargs)"
   fi
   [[ -z "$host" ]] && { echo "⚠️  Skipping malformed line: $line"; continue; }
+
+  HOSTS_TOUCHED+=("$host")
 
   # Prep /mnt on every host (once before attempts)
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<<"$PREPARE_MNT_SNIPPET"
