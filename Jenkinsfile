@@ -27,33 +27,26 @@ pipeline {
     stage('Checkout') { steps { checkout scm } }
 
     stage('Fetch build (optional)') {
-      when { expression { return params.FETCH_BUILD } }
+      when { expression { return params.FETCH_BUILD } }  // run only if enabled
       steps {
         sh '''
           set -euo pipefail
-          echo "[Fetch] ${BUILD_TRANSFER_MODE} from ${BUILD_SRC_USER}@${BUILD_SRC_HOST}:${BUILD_SRC_BASE}/${NEW_VERSION} -> ${NEW_BUILD_PATH}/${NEW_VERSION}"
-
-          if [ -z "${BUILD_SRC_HOST}" ]; then
-            echo "ERROR: BUILD_SRC_HOST is empty but FETCH_BUILD=true"; exit 2
-          fi
-
-          mkdir -p "${NEW_BUILD_PATH}/${NEW_VERSION}"
-
-          SSH_OPTS='-o StrictHostKeyChecking=no -i '"${SSH_KEY}"
-
-          if [ "${BUILD_TRANSFER_MODE}" = "scp" ]; then
-            ssh ${SSH_OPTS} "${BUILD_SRC_USER}@${BUILD_SRC_HOST}" "test -d '${BUILD_SRC_BASE}/${NEW_VERSION}'"
-            scp ${SSH_OPTS} -r \
-              "${BUILD_SRC_USER}@${BUILD_SRC_HOST}:${BUILD_SRC_BASE}/${NEW_VERSION}/" \
-              "${NEW_BUILD_PATH}/${NEW_VERSION}/"
-          else
-            rsync -az --delete -e "ssh ${SSH_OPTS}" \
-              "${BUILD_SRC_USER}@${BUILD_SRC_HOST}:${BUILD_SRC_BASE}/${NEW_VERSION}/" \
-              "${NEW_BUILD_PATH}/${NEW_VERSION}/"
-          fi
+          chmod +x scripts/fetch_build.sh
+    
+          # Pass inputs expected by fetch_build.sh
+          NEW_VERSION="${NEW_VERSION}" \
+          NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+          BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
+          BUILD_SRC_USER="${BUILD_SRC_USER}" \
+          BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
+          SSH_KEY="${SSH_KEY}" \
+          EXTRACT_BUILD_TARBALLS="true" \
+          REQUIRE_BIN_REL="false" \
+          scripts/fetch_build.sh
         '''
       }
     }
+
 
     // (cluster_reset & cluster_install stages unchanged)
   }
