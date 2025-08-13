@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/fetch_build.sh
-# Uses PASSWORD auth to CN servers (sshpass). Always uses NEW_BUILD_PATH (no per-host overrides).
+# CN login logic matches cluster_reset.sh: SSH key to root (or CN_USER) using SSH_KEY.
+# Always use NEW_BUILD_PATH-derived directory on CN (ignore any per-host override).
 
 set -euo pipefail
 
@@ -16,9 +17,9 @@ BUILD_SRC_BASE="${BUILD_SRC_BASE:-/repo/builds}"
 BUILD_SRC_PASS="${BUILD_SRC_PASS:-}"                              # if set → sshpass
 BUILD_SRC_KEY="${BUILD_SRC_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
 
-# CN auth (PASSWORD REQUIRED for this variant)
-CN_USER="${CN_USER:-root}"                                        # set via Jenkins credentials
-CN_PASS="${CN_PASS:?CN_PASS is required for CN password auth}"    # set via Jenkins credentials
+# CN auth (KEY-BASED like cluster_reset.sh)
+SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
+CN_USER="${CN_USER:-root}"                                        # cluster_reset uses root; override if needed
 CN_PORT="${CN_PORT:-22}"
 
 EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS:-true}"
@@ -47,7 +48,7 @@ case "$DEST_DIR" in
 esac
 if [[ -n "$TAG" && "$DEST_DIR" == */"${BASE_VER}" ]]; then DEST_DIR="${DEST_DIR}/${TAG}"; fi
 
-# ---- SSH helpers ----
+# ---- SSH/SCP helpers ----
 # Build-host side: allow password or key
 if [[ -n "$BUILD_SRC_PASS" ]]; then
   command -v sshpass >/dev/null 2>&1 || { echo "❌ sshpass required for BUILD_SRC_PASS" >&2; exit 2; }
@@ -60,10 +61,11 @@ else
 fi
 REMOTE_BUILD="${BUILD_SRC_USER}@${BUILD_SRC_HOST}"
 
-# CN side: ALWAYS password
-command -v sshpass >/dev/null 2>&1 || { echo "❌ sshpass required for CN password auth" >&2; exit 2; }
-c_ssh=(sshpass -p "$CN_PASS" ssh -p "$CN_PORT" -o StrictHostKeyChecking=no)
-c_scp=(sshpass -p "$CN_PASS" scp -q -P "$CN_PORT" -o StrictHostKeyChecking=no)
+# CN side: KEY-BASED, like cluster_reset.sh
+[[ -f "$SSH_KEY" ]] || { echo "❌ SSH key not found: $SSH_KEY" >&2; exit 2; }
+chmod 600 "$SSH_KEY" || true
+c_ssh=(ssh -i "$SSH_KEY" -p "$CN_PORT" -o StrictHostKeyChecking=no)
+c_scp=(scp -i "$SSH_KEY" -P "$CN_PORT" -q -o StrictHostKeyChecking=no)
 
 # ---- Locate source dir on build host ----
 ROOT="${BUILD_SRC_BASE%/}"
@@ -118,6 +120,7 @@ while IFS= read -r raw; do
 
   echo ""
   echo "🧩 Target CN: $host"
+  echo "🔑 CN login : ${CN_USER}@${host} with key ${SSH_KEY}"
   echo "📁 Dest dir : $DEST_DIR"
 
   # 1) Ensure destination exists on CN (ALWAYS NEW_BUILD_PATH-based)
