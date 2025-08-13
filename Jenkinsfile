@@ -28,45 +28,43 @@ pipeline {
     stage('Checkout') { steps { checkout scm } }
 
     stage('Fetch build (optional)') {
-      // ✅ Only check FETCH_BUILD here. Validate password inside the step.
       when { expression { return params.FETCH_BUILD } }
       steps {
         sh '''
           set -e
-
+    
           # Validate required inputs (don’t .trim() secrets in Groovy)
-          if [ -z "${BUILD_SRC_HOST}" ]; then
-            echo "ERROR: BUILD_SRC_HOST is required when FETCH_BUILD=true" >&2
-            exit 2
-          fi
-          if [ -z "${BUILD_SRC_PASS}" ]; then
-            echo "ERROR: BUILD_SRC_PASS is required when FETCH_BUILD=true" >&2
-            exit 2
-          fi
-
+          [ -z "${BUILD_SRC_HOST}" ] && { echo "ERROR: BUILD_SRC_HOST is required when FETCH_BUILD=true" >&2; exit 2; }
+          [ -z "${BUILD_SRC_PASS}" ] && { echo "ERROR: BUILD_SRC_PASS is required when FETCH_BUILD=true" >&2; exit 2; }
+    
           # sshpass must exist for password-based scp/ssh
           if ! command -v sshpass >/dev/null 2>&1 ; then
             echo "ERROR: sshpass is required on this Jenkins agent for password-based SCP." >&2
             exit 2
           fi
-
-          # Ensure LF endings (strip Windows CRLF if the file came in that way)
+    
+          # Normalize script file endings & shebang issues
+          # - Remove Windows CRLF
           sed -i 's/\\r$//' scripts/fetch_build.sh || true
-
+          # - Remove UTF-8 BOM if present
+          perl -i -pe 'BEGIN{binmode(STDIN);binmode(STDOUT)} s/^\\x{FEFF}// if $.==1' scripts/fetch_build.sh || true
+    
           chmod +x scripts/fetch_build.sh
-
-          # 👇 Run with bash explicitly (minimal alternative fix)
-          NEW_VERSION="${NEW_VERSION}" \
-          NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-          BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
-          BUILD_SRC_USER="${BUILD_SRC_USER}" \
-          BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
-          BUILD_SRC_PASS="${BUILD_SRC_PASS}" \
-          EXTRACT_BUILD_TARBALLS="true" \
+    
+          # <<< IMPORTANT: run with bash explicitly >>>
+          export NEW_VERSION="${NEW_VERSION}"
+          export NEW_BUILD_PATH="${NEW_BUILD_PATH}"
+          export BUILD_SRC_HOST="${BUILD_SRC_HOST}"
+          export BUILD_SRC_USER="${BUILD_SRC_USER}"
+          export BUILD_SRC_BASE="${BUILD_SRC_BASE}"
+          export BUILD_SRC_PASS="${BUILD_SRC_PASS}"
+          export EXTRACT_BUILD_TARBALLS="true"
+    
           bash -euo pipefail scripts/fetch_build.sh
         '''
       }
     }
+
 
     stage('Cluster reset (optional)') {
       when { expression { return params.CLUSTER_RESET } }
