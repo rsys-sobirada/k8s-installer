@@ -4,8 +4,6 @@ pipeline {
   options {
     timestamps()
     disableConcurrentBuilds()
-    // ansiColor fallback for older plugins
-    wrap([$class: 'AnsiColorBuildWrapper', colorMapName: 'xterm'])
   }
 
   parameters {
