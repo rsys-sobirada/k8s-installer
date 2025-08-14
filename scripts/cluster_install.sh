@@ -7,6 +7,7 @@
 # - Preflight: ensure kube ports 6443/10257 are free
 # - Retries end-to-end per host (waits for TRILLIUM tar if fetch runs in parallel)
 # - SSH key auth to root@host
+# - Success judged by kubectl health, not installer RC
 # - Abort trap: kills remote activity and frees kube ports on pipeline abort
 
 set -euo pipefail
@@ -15,11 +16,6 @@ set -euo pipefail
 require(){ local n="$1" ex="$2"; [[ -n "${!n:-}" ]] || { echo "❌ Missing $n (e.g. $ex)"; exit 1; }; }
 base_ver(){ echo "${1%%_*}"; }                                   # 6.3.0_EA2 -> 6.3.0
 ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }    # 6.3.0_EA2 -> EA2 ; 6.3.0 -> ""
-
-make_k8s_path(){  # <root> <BASE> <TAG> <K8S_VER> [REL_SUFFIX]
-  local root="${1%/}" base="$2" tag="$3" kver="$4" rel="${5-}"
-  echo "$root/${base}/${tag}/TRILLIUM_5GCN_CNF_REL_${base}${rel}/common/tools/install/k8s-v${kver}"
-}
 
 normalize_root(){  # <path> <BASE> [TAG]
   local p="${1%/}" base="$2" tag="${3-}"
@@ -34,7 +30,6 @@ normalize_root(){  # <path> <BASE> [TAG]
 require NEW_VERSION     "6.3.0_EA2"
 require NEW_BUILD_PATH  "/home/labadmin"
 : "${K8S_VER:=1.31.4}"
-: "${REL_SUFFIX:=}"
 : "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
 : "${INSTALL_SERVER_FILE:=server_pci_map.txt}"   # "name:ip" or just "ip"
 : "${INSTALL_IP_ADDR:=10.10.10.20/24}"           # leave empty to skip plumbing
@@ -139,6 +134,7 @@ exit 2
 RS
 
 # 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>/<TAG>, waiting for a tar if needed
+#    On success, ECHO the actual TRILLIUM directory path to stdout (caller captures it).
 # $1=root_base_dir (normalized), $2=BASE, $3=TAG, $4=WAIT_SECS
 read -r -d '' ENSURE_TRILLIUM_EXTRACTED <<'RS' || true
 set -euo pipefail
@@ -152,6 +148,8 @@ shopt -s nullglob
 matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
 if (( ${#matches[@]} )); then
   echo "[TRIL] Found existing dir: ${matches[0]}"
+  # print path for caller
+  echo "${matches[0]}"
   exit 0
 fi
 
@@ -180,6 +178,8 @@ tar -C "$DEST_DIR" -xzf "$found_tar"
 matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
 [[ ${#matches[@]} -gt 0 ]] || { echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2; }
 echo "[TRIL] Extracted dir: ${matches[0]}"
+# print path for caller
+echo "${matches[0]}"
 RS
 
 # 3) Preflight: ensure kube ports are free (6443/10257)
@@ -209,15 +209,52 @@ if command -v crictl >/dev/null 2>&1; then
 fi
 RS
 
-# 4) Run installer
-# $1=install_path
-read -r -d '' RUN_INSTALL_SNIPPET <<'RS' || true
+# 4) Run installer and verify cluster health
+# $1=install_path  $2=expected_k8s_version (optional, e.g., 1.31.4)
+read -r -d '' RUN_INSTALL_AND_VERIFY_SNIPPET <<'RS' || true
 set -euo pipefail
-P="$1"
+P="$1"; EXP_VER="${2-}"
+
 cd "$P" || { echo "[ERROR] Path not found: $P"; exit 2; }
 sed -i 's/\r$//' install_k8s.sh 2>/dev/null || true
+
 echo "[RUN] yes yes | ./install_k8s.sh (in $P)"
+set +e
 yes yes | bash ./install_k8s.sh
+RC=$?
+set -e
+
+# Health check: allow installer RC!=0 as long as cluster becomes Ready
+export KUBECONFIG=/etc/kubernetes/admin.conf
+READY=0
+TRIES=30   # ~5 minutes @10s
+for i in $(seq 1 $TRIES); do
+  if kubectl get nodes >/dev/null 2>&1; then
+    if kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}:{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' \
+        | grep -q ':True$'; then
+      READY=1
+      break
+    fi
+  fi
+  sleep 10
+done
+
+if [[ $READY -eq 1 ]]; then
+  echo "[VERIFY] Node Ready detected."
+  if [[ -n "$EXP_VER" ]]; then
+    if kubectl version --short 2>/dev/null | grep -q "$EXP_VER"; then
+      echo "[VERIFY] Kubernetes version matches expected: $EXP_VER"
+    else
+      echo "[WARN] Kubernetes version does not match expected: $EXP_VER"
+    fi
+  fi
+  kubectl get pods -A || true
+  kubectl get nodes -o wide || true
+  exit 0
+fi
+
+echo "[VERIFY] Cluster not Ready after install (installer rc=$RC)."
+exit 1
 RS
 
 any_failed=0
@@ -263,13 +300,11 @@ RS
   fi
 
   ROOT_BASE="$(normalize_root "$raw_base" "$BASE" "$TAG")"
-  NEW_VER_PATH="$(make_k8s_path "$ROOT_BASE" "$BASE" "$TAG" "$K8S_VER" "$REL_SUFFIX")"
 
   echo ""
   echo "🧩 Host:  $host"
   echo "📁 Root:  $ROOT_BASE (from NEW_BUILD_PATH)"
   echo "🏷️  Tag:   $TAG"
-  echo "📁 Path:  $NEW_VER_PATH"
 
   # Attempt loop
   attempt=1
@@ -277,12 +312,16 @@ RS
     echo "🚀 Install attempt $attempt/$INSTALL_RETRY_COUNT on $host"
 
     # Ensure TRILLIUM present & extracted (waits for tar if fetch is still running)
-    if ! ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$ROOT_BASE" "$BASE" "$TAG" "$BUILD_WAIT_SECS" <<<"$ENSURE_TRILLIUM_EXTRACTED"; then
+    TRIL_DIR="$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$ROOT_BASE" "$BASE" "$TAG" "$BUILD_WAIT_SECS" <<<"$ENSURE_TRILLIUM_EXTRACTED" | tail -n1 || true)"
+    if [[ -z "$TRIL_DIR" ]]; then
       echo "⚠️  TRILLIUM not ready on $host (attempt $attempt)"
       ((attempt++))
       (( attempt <= INSTALL_RETRY_COUNT )) && { echo "⏳ Waiting ${INSTALL_RETRY_DELAY_SECS}s and retrying..."; sleep "$INSTALL_RETRY_DELAY_SECS"; }
       continue
     fi
+
+    NEW_VER_PATH="${TRIL_DIR}/common/tools/install/k8s-v${K8S_VER}"
+    echo "📁 Path:  $NEW_VER_PATH"
 
     # Free ports if needed
     ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<<"$FREE_PORTS_SNIPPET" || true
@@ -299,9 +338,9 @@ RS
       echo "[IP] Skipping ensure; INSTALL_IP_ADDR is empty"
     fi
 
-    # Run installer
-    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$NEW_VER_PATH" <<<"$RUN_INSTALL_SNIPPET"; then
-      echo "✅ Install triggered on $host"
+    # Run installer and verify health
+    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$NEW_VER_PATH" "$K8S_VER" <<<"$RUN_INSTALL_AND_VERIFY_SNIPPET"; then
+      echo "✅ Install verified healthy on $host"
       break
     fi
 
