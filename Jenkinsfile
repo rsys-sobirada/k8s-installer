@@ -7,7 +7,7 @@ pipeline {
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // key for CN reset/install (root@host)
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'                    // fetch: do NOT untar
-    INSTALL_IP_ADDR = '10.10.10.20/24'
+    INSTALL_IP_ADDR  = '10.10.10.20/24'
     INSTALL_IP_IFACE = ''
   }
 
@@ -20,14 +20,15 @@ pipeline {
     string      (name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin', description: 'Base dir to place NEW_VERSION (and extract)')
 
     // Remote fetch (copy directly to CN servers)
-    booleanParam(name: 'FETCH_BUILD', defaultValue: true, description: 'Fetch NEW_VERSION from build host to CN servers')
-    string      (name: 'BUILD_SRC_HOST', defaultValue: '172.26.2.96',     description: 'Build repo host')
-    string      (name: 'BUILD_SRC_USER', defaultValue: 'labadmin',         description: 'Build repo user')
+    booleanParam(name: 'FETCH_BUILD',   defaultValue: true,                  description: 'Fetch NEW_VERSION from build host to CN servers')
+    string      (name: 'BUILD_SRC_HOST', defaultValue: '172.26.2.96',        description: 'Build repo host')
+    string      (name: 'BUILD_SRC_USER', defaultValue: 'labadmin',           description: 'Build repo user')
     string      (name: 'BUILD_SRC_BASE', defaultValue: '/CNBuild/6.3.0_EA2', description: 'Path on build host containing the tar.gz files')
-    // Required Jenkins Credentials (configure in Jenkins > Manage Credentials):
-    // - build-src-creds : Username/Password for the build host (to SCP from)
-    // - cn-pass         : Username/Password for CN servers (to SCP to)
-    // - cn-ssh-key      : SSH private key for CN servers (root@host) used by reset/install
+
+    // 🔐 Passwords from GUI (masked in console)
+    password    (name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (for SCP/SSH from build repo)')
+    string      (name: 'CN_USER',        defaultValue: 'labadmin', description: 'CN server user for SCP (where builds are copied)')
+    password    (name: 'CN_PASS',        defaultValue: '', description: 'CN server password (for SCP to CN)')
   }
 
   stages {
@@ -68,38 +69,36 @@ pipeline {
           when { expression { return params.FETCH_BUILD } }
           steps {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
-              withCredentials([
-                usernamePassword(credentialsId: 'build-src-creds', usernameVariable: 'BUILD_SRC_USER', passwordVariable: 'BUILD_SRC_PASS'),
-                usernamePassword(credentialsId: 'cn-pass',         usernameVariable: 'CN_USER',         passwordVariable: 'CN_PASS'),
-                sshUserPrivateKey(credentialsId: 'cn-ssh-key', keyFileVariable: 'CN_KEY', usernameVariable: 'CN_KEY_USER')
-              ]) {
-                sh '''
-                  set -euo pipefail
-                  # Ensure scripts are clean and executable
-                  sed -i 's/\\r$//' scripts/fetch_build.sh || true
-                  chmod +x scripts/fetch_build.sh
+              sh '''
+                set -euo pipefail
 
-                  # Password-based SCP requires sshpass on the Jenkins agent
-                  if [ -n "${BUILD_SRC_PASS:-}" ] || [ -n "${CN_PASS:-}" ]; then
-                    command -v sshpass >/dev/null 2>&1 || { echo "ERROR: sshpass is required on this agent"; exit 2; }
+                # Ensure scripts are clean and executable
+                sed -i 's/\\r$//' scripts/fetch_build.sh || true
+                chmod +x scripts/fetch_build.sh
+
+                # Password-based SCP requires sshpass on the Jenkins agent
+                if [ -n "${BUILD_SRC_PASS:-}" ] || [ -n "${CN_PASS:-}" ]; then
+                  if ! command -v sshpass >/dev/null 2>&1; then
+                    echo "ERROR: sshpass is required on this agent for password-based SCP/SSH." >&2
+                    exit 2
                   fi
+                fi
 
-                  echo "Targets from ${SERVER_FILE}:"
-                  awk 'NF && $1 !~ /^#/' "${SERVER_FILE}" || true
+                echo "Targets from ${SERVER_FILE}:"
+                awk 'NF && $1 !~ /^#/' "${SERVER_FILE}" || true
 
-                  NEW_VERSION="${NEW_VERSION}" \
-                  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-                  SERVER_FILE="${SERVER_FILE}" \
-                  BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
-                  BUILD_SRC_USER="${BUILD_SRC_USER}" \
-                  BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
-                  BUILD_SRC_PASS="${BUILD_SRC_PASS}" \
-                  CN_USER="${CN_USER}" \
-                  CN_PASS="${CN_PASS}" \
-                  EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
-                  bash -euo pipefail scripts/fetch_build.sh
-                '''
-              }
+                NEW_VERSION="${NEW_VERSION}" \
+                NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+                SERVER_FILE="${SERVER_FILE}" \
+                BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
+                BUILD_SRC_USER="${BUILD_SRC_USER}" \
+                BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
+                BUILD_SRC_PASS="${BUILD_SRC_PASS}" \
+                CN_USER="${CN_USER}" \
+                CN_PASS="${CN_PASS}" \
+                EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
+                bash -euo pipefail scripts/fetch_build.sh
+              '''
             }
           }
         }
