@@ -25,7 +25,7 @@ pipeline {
     string      (name: 'BUILD_SRC_USER', defaultValue: 'labadmin',           description: 'Build repo user')
     string      (name: 'BUILD_SRC_BASE', defaultValue: '/CNBuild/6.3.0_EA2', description: 'Path on build host containing the tar.gz files')
 
-    // 🔐 Only BUILD host password comes from GUI (masked)
+    // 🔐 Only BUILD host password from GUI (masked)
     password    (name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (for SCP/SSH from build repo)')
   }
 
@@ -40,8 +40,8 @@ pipeline {
           when { expression { return params.CLUSTER_RESET } }
           steps {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
-              sh(script: '''
-                set -e
+              sh '''
+                set -eu
                 echo ">>> Cluster reset starting..."
                 sed -i 's/\\r$//' scripts/cluster_reset.sh || true
                 chmod +x scripts/cluster_reset.sh
@@ -58,7 +58,7 @@ pipeline {
                   RETRY_COUNT="3" \
                   RETRY_DELAY_SECS="10" \
                 bash -euo pipefail scripts/cluster_reset.sh
-              ''', shell: '/bin/bash')
+              '''
             }
           }
         }
@@ -67,8 +67,8 @@ pipeline {
           when { expression { return params.FETCH_BUILD } }
           steps {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
-              sh(script: '''
-                set -euo pipefail
+              sh '''
+                set -eu
 
                 # Clean line endings & make executable
                 sed -i 's/\\r$//' scripts/fetch_build.sh || true
@@ -86,7 +86,7 @@ pipeline {
                 echo "Targets from ${SERVER_FILE}:"
                 awk 'NF && $1 !~ /^#/' "${SERVER_FILE}" || true
 
-                # CN login remains key-based as root (same key as reset/install)
+                # CN login remains key-based (root) using SSH_KEY
                 NEW_VERSION="${NEW_VERSION}" \
                 NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
                 SERVER_FILE="${SERVER_FILE}" \
@@ -97,7 +97,7 @@ pipeline {
                 CN_SSH_KEY="${SSH_KEY}" \
                 EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
                 bash -euo pipefail scripts/fetch_build.sh
-              ''', shell: '/bin/bash')
+              '''
             }
           }
         }
@@ -107,8 +107,8 @@ pipeline {
     stage('Cluster install') {
       steps {
         timeout(time: 15, unit: 'MINUTES', activity: true) {
-          sh(script: '''
-            set -e
+          sh '''
+            set -eu
             echo ">>> Cluster install starting..."
             sed -i 's/\\r$//' scripts/cluster_install.sh || true
             chmod +x scripts/cluster_install.sh
@@ -125,7 +125,7 @@ pipeline {
               INSTALL_RETRY_DELAY_SECS="20" \
               BUILD_WAIT_SECS="300" \
             bash -euo pipefail scripts/cluster_install.sh
-          ''', shell: '/bin/bash')
+          '''
         }
       }
     }
