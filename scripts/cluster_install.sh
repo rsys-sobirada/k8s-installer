@@ -1,9 +1,9 @@
 #!/bin/bash
 # scripts/cluster_install.sh
 # Sequential install per server
-# - Always uses NEW_BUILD_PATH as root (normalized to /<BASE>[/<TAG>])
+# - Uses NEW_BUILD_PATH as root (normalized to /<BASE>[/<TAG>])
 # - Pre-check: create /mnt/data{0,1,2} and clear contents
-# - Only untars TRILLIUM_5GCN_CNF_REL_<BASE>.tar.gz (no BINs)
+# - Only untars TRILLIUM_5GCN_CNF_REL_<BASE>*.tar.gz (no BINs)
 # - Preflight: ensure kube ports 6443/10257 are free
 # - Retries end-to-end per host (waits for TRILLIUM tar if fetch runs in parallel)
 # - SSH key auth to root@host
@@ -37,7 +37,7 @@ require NEW_BUILD_PATH  "/home/labadmin"
 : "${REL_SUFFIX:=}"
 : "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
 : "${INSTALL_SERVER_FILE:=server_pci_map.txt}"   # "name:ip" or just "ip"
-: "${INSTALL_IP_ADDR:=10.10.10.20/24}"
+: "${INSTALL_IP_ADDR:=10.10.10.20/24}"           # leave empty to skip plumbing
 : "${INSTALL_IP_IFACE:=}"
 
 # Retries / waits
@@ -83,7 +83,7 @@ echo "NEW_BUILD_PATH:   $NEW_BUILD_PATH"
 echo "BASE version:     $BASE"
 [[ -n "$TAG_IN" ]] && echo "Provided TAG:   $TAG_IN" || echo "Provided TAG:   (none; will detect per host)"
 echo "INSTALL_LIST:     $INSTALL_SERVER_FILE"
-echo "IP to ensure:     $INSTALL_IP_ADDR"
+echo "IP to ensure:     ${INSTALL_IP_ADDR:-<skipped>}"
 [[ -n "$INSTALL_IP_IFACE" ]] && echo "Forced iface:    $INSTALL_IP_IFACE"
 echo "────────────────────────────────────────"
 
@@ -97,56 +97,89 @@ prep /mnt/data0; prep /mnt/data1; prep /mnt/data2
 echo "[MNT] Prepared /mnt/data{0,1,2} (created if missing, contents cleared)"
 RS
 
-# 1) Ensure alias IP exists
+# 1) Ensure alias IP exists (robust: try forced iface, default-route iface, then physical NICs)
 read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
 set -euo pipefail
 IP_CIDR="$1"; FORCE_IFACE="${2-}"
-present(){ ip -4 addr show | grep -q -E "[[:space:]]${IP_CIDR%/*}(/|[[:space:]])"; }
-if present; then echo "[IP] Present: ${IP_CIDR}"; exit 0; fi
-IFACE="$FORCE_IFACE"
-if [[ -z "$IFACE" ]]; then
-  if command -v lshw >/dev/null 2>&1; then
-    IFACE="$(lshw -quiet -c network -businfo 2>/dev/null | awk 'NR>2 && $2 != "" {print $2}' \
-             | grep -E "^(en|eth|ens|eno|em|bond)[0-9]+" | head -n1 || true)"
-  fi
-  if [[ -z "$IFACE" ]]; then
-    IFACE="$(ip -o link | awk -F': ' '{print $2}' | grep -E "^(en|eth|ens|eno|em|bond)" | head -n1 || true)"
-  fi
-  [[ -z "$IFACE" ]] && IFACE="lo"
+
+is_present(){ ip -4 addr show | awk '/inet /{print $2}' | grep -qx "$IP_CIDR"; }
+
+echo "[IP] Ensuring ${IP_CIDR}"
+if is_present; then
+  echo "[IP] Present: ${IP_CIDR}"
+  exit 0
 fi
-ip addr replace "$IP_CIDR" dev "$IFACE" || true
-echo "[IP] Plumbed $IP_CIDR on ${IFACE} (iface may remain DOWN)"
+
+declare -a CAND=()
+if [[ -n "$FORCE_IFACE" ]]; then CAND+=("$FORCE_IFACE"); fi
+DEF_IF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
+if [[ -n "${DEF_IF:-}" ]]; then CAND+=("$DEF_IF"); fi
+while IFS= read -r ifc; do CAND+=("$ifc"); done < <(
+  ip -o link | awk -F': ' '{print $2}' \
+    | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
+    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
+    | sort -u
+)
+
+for IF in "${CAND[@]}"; do
+  [[ -z "$IF" ]] && continue
+  echo "[IP] Trying ${IP_CIDR} on iface ${IF}..."
+  ip link set dev "$IF" up || true
+  if ip addr replace "$IP_CIDR" dev "$IF" 2>"/tmp/ip_err_${IF}.log"; then
+    if ip -4 addr show dev "$IF" | grep -q "$IP_CIDR"; then
+      echo "[IP] OK on ${IF}"
+      exit 0
+    fi
+  fi
+  echo "[IP] Failed on ${IF}: $(tr -d '\n' </tmp/ip_err_${IF}.log)" || true
+done
+
+echo "[IP] ERROR: Could not plumb ${IP_CIDR} on any iface. Candidates tried: ${CAND[*]}"
+exit 2
 RS
 
-# 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>/<TAG>, waiting for tar if needed
-# $1=root_base_dir (normalized), $2=BASE, $3=TAG, $4=REL_SUFFIX, $5=WAIT_SECS
+# 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>/<TAG>, waiting for a tar if needed
+# $1=root_base_dir (normalized), $2=BASE, $3=TAG, $4=WAIT_SECS
 read -r -d '' ENSURE_TRILLIUM_EXTRACTED <<'RS' || true
 set -euo pipefail
-ROOT="$1"; BASE="$2"; TAG="$3"; REL="${4-}"; WAIT="${5:-0}"
+ROOT="$1"; BASE="$2"; TAG="$3"; WAIT="${4:-0}"
 DEST_DIR="$ROOT/$BASE/$TAG"
-TRIL_DIR="$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}${REL}"
-TRIL_TAR="$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz"
 
 mkdir -p "$DEST_DIR"
+shopt -s nullglob
 
-if [[ -d "$TRIL_DIR" ]]; then
-  echo "[TRIL] Already extracted at $TRIL_DIR"; exit 0
+# If already extracted (any suffix) → done
+matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
+if (( ${#matches[@]} )); then
+  echo "[TRIL] Found existing dir: ${matches[0]}"
+  exit 0
 fi
 
-elapsed=0
-interval=3
-while [[ ! -s "$TRIL_TAR" && "$elapsed" -lt "$WAIT" ]]; do
-  echo "[TRIL] Waiting for $TRIL_TAR to appear ... (${elapsed}/${WAIT}s)"
+# Candidate tars: exact + any suffix
+tars=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz" "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*.tar.gz )
+
+# Wait for any tar to appear
+elapsed=0; interval=3; found_tar=""
+while :; do
+  for f in "${tars[@]}"; do
+    if [[ -s "$f" ]]; then found_tar="$f"; break; fi
+  done
+  [[ -n "$found_tar" || $elapsed -ge $WAIT ]] && break
+  echo "[TRIL] Waiting for tar in $DEST_DIR ... (${elapsed}/${WAIT}s)"
   sleep "$interval"; elapsed=$((elapsed+interval))
 done
 
-if [[ ! -s "$TRIL_TAR" ]]; then
-  echo "[ERROR] TRILLIUM tar not found at $TRIL_TAR after ${WAIT}s"; exit 2
+if [[ -z "$found_tar" ]]; then
+  echo "[ERROR] No TRILLIUM tar found in $DEST_DIR after ${WAIT}s"; exit 2
 fi
 
-echo "[TRIL] Extracting $TRIL_TAR into $DEST_DIR ..."
-tar -C "$DEST_DIR" -xzf "$TRIL_TAR"
-[[ -d "$TRIL_DIR" ]] || { echo "[ERROR] Extraction completed but $TRIL_DIR not found"; exit 2; }
+echo "[TRIL] Extracting $(basename "$found_tar") into $DEST_DIR ..."
+tar -C "$DEST_DIR" -xzf "$found_tar"
+
+# Verify again
+matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
+[[ ${#matches[@]} -gt 0 ]] || { echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2; }
+echo "[TRIL] Extracted dir: ${matches[0]}"
 RS
 
 # 3) Preflight: ensure kube ports are free (6443/10257)
@@ -244,7 +277,7 @@ RS
     echo "🚀 Install attempt $attempt/$INSTALL_RETRY_COUNT on $host"
 
     # Ensure TRILLIUM present & extracted (waits for tar if fetch is still running)
-    if ! ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$ROOT_BASE" "$BASE" "$TAG" "$REL_SUFFIX" "$BUILD_WAIT_SECS" <<<"$ENSURE_TRILLIUM_EXTRACTED"; then
+    if ! ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$ROOT_BASE" "$BASE" "$TAG" "$BUILD_WAIT_SECS" <<<"$ENSURE_TRILLIUM_EXTRACTED"; then
       echo "⚠️  TRILLIUM not ready on $host (attempt $attempt)"
       ((attempt++))
       (( attempt <= INSTALL_RETRY_COUNT )) && { echo "⏳ Waiting ${INSTALL_RETRY_DELAY_SECS}s and retrying..."; sleep "$INSTALL_RETRY_DELAY_SECS"; }
@@ -254,12 +287,16 @@ RS
     # Free ports if needed
     ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<<"$FREE_PORTS_SNIPPET" || true
 
-    # Ensure alias IP
-    if ! ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET"; then
-      echo "⚠️  Failed to ensure $INSTALL_IP_ADDR on $host (attempt $attempt)"
-      ((attempt++))
-      (( attempt <= INSTALL_RETRY_COUNT )) && { echo "⏳ Waiting ${INSTALL_RETRY_DELAY_SECS}s and retrying..."; sleep "$INSTALL_RETRY_DELAY_SECS"; }
-      continue
+    # Ensure alias IP (only if configured)
+    if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
+      if ! ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET"; then
+        echo "⚠️  Failed to ensure $INSTALL_IP_ADDR on $host (attempt $attempt)"
+        ((attempt++))
+        (( attempt <= INSTALL_RETRY_COUNT )) && { echo "⏳ Waiting ${INSTALL_RETRY_DELAY_SECS}s and retrying..."; sleep "$INSTALL_RETRY_DELAY_SECS"; }
+        continue
+      fi
+    else
+      echo "[IP] Skipping ensure; INSTALL_IP_ADDR is empty"
     fi
 
     # Run installer
