@@ -8,7 +8,7 @@ pipeline {
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'                    // fetch: do NOT untar
     INSTALL_IP_ADDR  = '10.10.10.20/24'
-    INSTALL_IP_IFACE = ''
+    INSTALL_IP_IFACE = ''                               // may be empty; keep defined
   }
 
   parameters {
@@ -25,7 +25,7 @@ pipeline {
     string      (name: 'BUILD_SRC_USER', defaultValue: 'labadmin',           description: 'Build repo user')
     string      (name: 'BUILD_SRC_BASE', defaultValue: '/CNBuild/6.3.0_EA2', description: 'Path on build host containing the tar.gz files')
 
-    // 🔐 Only BUILD host password from GUI (masked)
+    // 🔐 Only BUILD host password from GUI (masked). May be empty.
     password    (name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (for SCP/SSH from build repo)')
   }
 
@@ -93,7 +93,7 @@ pipeline {
                 BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
                 BUILD_SRC_USER="${BUILD_SRC_USER}" \
                 BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
-                BUILD_SRC_PASS="${BUILD_SRC_PASS}" \
+                BUILD_SRC_PASS="${BUILD_SRC_PASS:-}" \
                 CN_SSH_KEY="${SSH_KEY}" \
                 EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
                 bash -euo pipefail scripts/fetch_build.sh
@@ -119,7 +119,7 @@ pipeline {
               KSPRAY_DIR="kubespray-2.27.0" \
               INSTALL_SERVER_FILE="${SERVER_FILE}" \
               INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
-              INSTALL_IP_IFACE="${INSTALL_IP_IFACE}" \
+              INSTALL_IP_IFACE="${INSTALL_IP_IFACE:-}" \
               SSH_KEY="${SSH_KEY}" \
               INSTALL_RETRY_COUNT="3" \
               INSTALL_RETRY_DELAY_SECS="20" \
