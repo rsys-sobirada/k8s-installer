@@ -1,165 +1,184 @@
 #!/usr/bin/env bash
-# scripts/fetch_build.sh
-# CN login logic matches cluster_reset.sh: SSH key to root (or CN_USER) using SSH_KEY.
-# Always use NEW_BUILD_PATH-derived directory on CN (ignore any per-host override).
+# Fetch build tarballs from BUILD host → copy directly to CN servers
+# - BUILD host: password-based auth via sshpass (BUILD_SRC_PASS)
+# - CN servers: key-based auth (CN_SSH_KEY), default user root
+# - Destination on CN: derived from NEW_BUILD_PATH + /<BASE>[/<TAG>]
+# - No extraction here (EXTRACT_BUILD_TARBALLS is ignored on purpose)
 
 set -euo pipefail
 
-# ---- Required inputs (from Jenkins) ----
-NEW_VERSION="${NEW_VERSION:?NEW_VERSION is required}"            # e.g. 6.3.0_EA2 or 6.3.0
-NEW_BUILD_PATH="${NEW_BUILD_PATH:?NEW_BUILD_PATH is required}"    # e.g. /home/labadmin or /home/labadmin/6.3.0[/EAx]
-SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}"
+# ---------- helpers ----------
+require() { local n="$1" ex="$2"; [[ -n "${!n:-}" ]] || { echo "❌ Missing $n (e.g. $ex)"; exit 2; }; }
 
-# Build source (where tarballs live)
-BUILD_SRC_HOST="${BUILD_SRC_HOST:?BUILD_SRC_HOST is required}"
-BUILD_SRC_USER="${BUILD_SRC_USER:-labadmin}"
-BUILD_SRC_BASE="${BUILD_SRC_BASE:-/repo/builds}"
-BUILD_SRC_PASS="${BUILD_SRC_PASS:-}"                              # if set → sshpass
-BUILD_SRC_KEY="${BUILD_SRC_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
+base_ver() { printf '%s' "${1%%_*}"; }           # 6.3.0_EA2 -> 6.3.0
+ver_tag()  { [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }  # 6.3.0_EA2 -> EA2 ; 6.3.0 -> ""
 
-# CN auth (KEY-BASED like cluster_reset.sh)
-SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
-CN_USER="${CN_USER:-root}"                                        # cluster_reset uses root; override if needed
-CN_PORT="${CN_PORT:-22}"
-
-EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS:-true}"
-
-# ---- Version parsing ----
-BASE_VER="$(printf '%s' "$NEW_VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
-TAG=""; if [[ "$NEW_VERSION" == *_* ]]; then TAG="${NEW_VERSION##*_}"; fi
-
-TRIL_FILE="TRILLIUM_5GCN_CNF_REL_${BASE_VER}.tar.gz"
-BIN_GLOB="*BIN_REL_${BASE_VER}.tar.gz"
-
-# ---- Normalize NEW_BUILD_PATH (…/6.3.0_EA2 → …/6.3.0/EA2) ----
-if [[ -n "$TAG" && "$NEW_BUILD_PATH" == *"/${BASE_VER}_${TAG}"* ]]; then
-  NEW_BUILD_PATH="$(printf '%s' "$NEW_BUILD_PATH" | sed -E "s#/${BASE_VER}_${TAG}(\/|$)#/${BASE_VER}/${TAG}\1#")"
-fi
-
-# ---- Compute final destination dir on CN (ALWAYS from NEW_BUILD_PATH) ----
-DEST_DIR="$NEW_BUILD_PATH"
-case "$DEST_DIR" in
-  *"/${BASE_VER}/"*|*"/${BASE_VER}") : ;;
-  *)
-    if [[ -n "$TAG" ]]; then DEST_DIR="${DEST_DIR%/}/${BASE_VER}/${TAG}"
-    else                       DEST_DIR="${DEST_DIR%/}/${BASE_VER}"
-    fi
-    ;;
-esac
-if [[ -n "$TAG" && "$DEST_DIR" == */"${BASE_VER}" ]]; then DEST_DIR="${DEST_DIR}/${TAG}"; fi
-
-# ---- SSH/SCP helpers ----
-# Build-host side: allow password or key
-if [[ -n "$BUILD_SRC_PASS" ]]; then
-  command -v sshpass >/dev/null 2>&1 || { echo "❌ sshpass required for BUILD_SRC_PASS" >&2; exit 2; }
-  b_ssh=(sshpass -p "$BUILD_SRC_PASS" ssh -o StrictHostKeyChecking=no)
-  b_scp=(sshpass -p "$BUILD_SRC_PASS" scp -q -o StrictHostKeyChecking=no)
-else
-  [[ -f "$BUILD_SRC_KEY" ]] || { echo "❌ Build source key not found: $BUILD_SRC_KEY" >&2; exit 2; }
-  b_ssh=(ssh -i "$BUILD_SRC_KEY" -o StrictHostKeyChecking=no)
-  b_scp=(scp -q -i "$BUILD_SRC_KEY" -o StrictHostKeyChecking=no)
-fi
-REMOTE_BUILD="${BUILD_SRC_USER}@${BUILD_SRC_HOST}"
-
-# CN side: KEY-BASED, like cluster_reset.sh
-[[ -f "$SSH_KEY" ]] || { echo "❌ SSH key not found: $SSH_KEY" >&2; exit 2; }
-chmod 600 "$SSH_KEY" || true
-c_ssh=(ssh -i "$SSH_KEY" -p "$CN_PORT" -o StrictHostKeyChecking=no)
-c_scp=(scp -i "$SSH_KEY" -P "$CN_PORT" -q -o StrictHostKeyChecking=no)
-
-# ---- Locate source dir on build host ----
-ROOT="${BUILD_SRC_BASE%/}"
-SEARCH_DIRS=("$ROOT" "$ROOT/${BASE_VER}" "$ROOT/${NEW_VERSION}")
-FOUND_DIR=""
-for cand in "${SEARCH_DIRS[@]}"; do
-  if "${b_ssh[@]}" "$REMOTE_BUILD" "test -s '$cand/$TRIL_FILE'"; then FOUND_DIR="$cand"; break; fi
-done
-[[ -n "$FOUND_DIR" ]] || { echo "❌ $TRIL_FILE not found under: ${SEARCH_DIRS[*]}" >&2; exit 3; }
-echo "✅ Build source dir: $FOUND_DIR"
-
-# ---- List BINs ----
-readarray -t BIN_LIST < <( "${b_ssh[@]}" "$REMOTE_BUILD" "ls -1 '$FOUND_DIR'/$BIN_GLOB 2>/dev/null || true" )
-echo "ℹ️  BIN files found: ${#BIN_LIST[@]}"
-
-# ---- Cache downloads once on Jenkins; upload to each CN ----
-TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
-download_once() {
-  local src="$1" base; base="$(basename "$src")"
-  if [[ ! -s "$TMPDIR/$base" ]]; then
-    echo "⬇️  Downloading: $base"
-    "${b_scp[@]}" "${REMOTE_BUILD}:${src}" "$TMPDIR/"
-  fi
-}
-upload_to_cn() {
-  local base="$1" host="$2"
-  echo "📥 Uploading: $base -> ${host}:${DEST_DIR}"
-  "${c_scp[@]}" "$TMPDIR/$base" "${CN_USER}@${host}:${DEST_DIR}/"
+normalize_dest() {  # <root> <BASE> <TAG>
+  local root="${1%/}" base="$2" tag="$3"
+  case "$root" in
+    *"/${base}/"*|*"/${base}")  # already contains BASE (and maybe TAG) → keep
+      echo "$root"
+      ;;
+    *)
+      if [[ -n "$tag" ]]; then echo "$root/${base}/${tag}"; else echo "$root/${base}"; fi
+      ;;
+  esac
 }
 
-# ---- Read servers (ignore extra columns; only use host/IP) ----
-[[ -f "$SERVER_FILE" ]] || { echo "❌ SERVER_FILE not found: $SERVER_FILE" >&2; exit 5; }
+bool_yes() { shopt -s nocasematch; [[ "${1:-}" =~ ^(1|y|yes|true)$ ]]; local r=$?; shopt -u nocasematch; return $r; }
+
+# ---------- inputs ----------
+require NEW_VERSION    "6.3.0_EA2"
+require NEW_BUILD_PATH "/home/labadmin"
+require SERVER_FILE    "server_pci_map.txt"
+require BUILD_SRC_HOST "172.26.2.96"
+require BUILD_SRC_USER "labadmin"
+require BUILD_SRC_BASE "/CNBuild/6.3.0_EA2"
+require CN_SSH_KEY     "/var/lib/jenkins/.ssh/jenkins_key"
+
+# BUILD_SRC_PASS is required for password auth
+if [[ -z "${BUILD_SRC_PASS:-}" ]]; then
+  echo "❌ BUILD_SRC_PASS is required (password for ${BUILD_SRC_USER}@${BUILD_SRC_HOST})." >&2
+  exit 2
+fi
+
+[[ -f "$SERVER_FILE" ]] || { echo "❌ $SERVER_FILE not found"; exit 2; }
+[[ -f "$CN_SSH_KEY"  ]] || { echo "❌ CN_SSH_KEY not found: $CN_SSH_KEY"; exit 2; }
+chmod 600 "$CN_SSH_KEY" || true
+
+BASE="$(base_ver "$NEW_VERSION")"
+TAG="$(ver_tag "$NEW_VERSION")"
+TRIL_FILE="TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz"
+BIN_GLOB="*BIN_REL_${BASE}.tar.gz"
+
+# ---------- SSH/SCP command templates ----------
+# Build host (password via sshpass)
+if ! command -v sshpass >/dev/null 2>&1; then
+  echo "❌ sshpass is required on the Jenkins agent for BUILD host password auth." >&2
+  exit 2
+fi
+SSH_SRC=(sshpass -p "$BUILD_SRC_PASS" ssh -o StrictHostKeyChecking=no -o BatchMode=no)
+# scp -3 will copy via local, we can still use sshpass to feed the source-side password
+SCP_3=(sshpass -p "$BUILD_SRC_PASS" scp -3 -o StrictHostKeyChecking=no)
+
+# CN (key-based), default user root unless CN_USER was explicitly set
+CN_USER="${CN_USER:-root}"
+SSH_CN=(ssh -o StrictHostKeyChecking=no -i "$CN_SSH_KEY")
+SCP_CN=(scp -o StrictHostKeyChecking=no -i "$CN_SSH_KEY")
+
+# ---------- sanity/auth checks ----------
 echo "Targets from ${SERVER_FILE}:"
 awk 'NF && $1 !~ /^#/' "$SERVER_FILE" || true
+echo
 
-extract_host() {
-  local line="$1" host=""
-  line="${line%%#*}"; line="$(echo "$line" | xargs)"; [[ -z "$line" ]] && return 1
-  # split on colon/space/tab
-  # shellcheck disable=SC2206
-  local toks=($(echo "$line" | awk -F'[: \t]+' '{for(i=1;i<=NF;i++)print $i}'))
-  # pick first IPv4; else first non-path token
-  for t in "${toks[@]}"; do [[ "$t" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { host="$t"; break; }; done
-  if [[ -z "$host" ]]; then for t in "${toks[@]}"; do [[ "$t" == /* ]] && continue; host="$t"; break; done; fi
-  [[ -n "$host" ]] || return 1
-  printf '%s' "$host"
-}
+# Auth precheck to build host
+if ! "${SSH_SRC[@]}" "${BUILD_SRC_USER}@${BUILD_SRC_HOST}" "echo ok" >/dev/null 2>&1; then
+  echo "❌ Authentication to build host ${BUILD_SRC_USER}@${BUILD_SRC_HOST} failed (wrong user/pass or password auth disabled)." >&2
+  exit 11
+fi
 
-# ---- Process each CN server ----
-while IFS= read -r raw; do
-  host="$(extract_host "$raw")" || continue
+# ---------- locate build source dir on build host ----------
+ROOT="${BUILD_SRC_BASE%/}"
+SEARCH_DIRS=(
+  "$ROOT"
+  "$ROOT/${BASE}"
+  "$ROOT/${NEW_VERSION}"
+)
 
-  echo ""
-  echo "🧩 Target CN: $host"
-  echo "🔑 CN login : ${CN_USER}@${host} with key ${SSH_KEY}"
+FOUND_DIR=""
+for cand in "${SEARCH_DIRS[@]}"; do
+  if "${SSH_SRC[@]}" "${BUILD_SRC_USER}@${BUILD_SRC_HOST}" "test -s '$cand/$TRIL_FILE'"; then
+    FOUND_DIR="$cand"
+    break
+  fi
+done
+
+if [[ -z "$FOUND_DIR" ]]; then
+  echo "❌ $TRIL_FILE not found under: ${SEARCH_DIRS[*]}" >&2
+  exit 3
+fi
+echo "✅ Build source dir: $FOUND_DIR"
+
+# List BINs on build host
+readarray -t BIN_LIST < <(
+  "${SSH_SRC[@]}" "${BUILD_SRC_USER}@${BUILD_SRC_HOST}" "ls -1 '$FOUND_DIR'/$BIN_GLOB 2>/dev/null || true"
+)
+echo "ℹ️  BIN files found: ${#BIN_LIST[@]}"
+echo
+
+# ---------- per-CN host copy ----------
+any_failed=0
+
+# We strictly ignore any per-line path and always derive from NEW_BUILD_PATH
+while IFS= read -r raw || [[ -n "${raw:-}" ]]; do
+  line="$(printf '%s' "${raw:-}" | tr -d '\r')"
+  [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+
+  host_ip=""
+  # Accept "name:ip[:whatever]" or bare IP
+  if [[ "$line" == *:* ]]; then
+    IFS=':' read -r _name ip _maybe <<<"$line"
+    host_ip="$(echo -n "${ip:-}" | xargs)"
+  else
+    host_ip="$(echo -n "$line" | xargs)"
+  fi
+  [[ -z "$host_ip" ]] && { echo "⚠️  Skipping malformed line: $line"; continue; }
+
+  # Destination dir on CN derived from NEW_BUILD_PATH + BASE[/TAG]
+  DEST_DIR="$(normalize_dest "$NEW_BUILD_PATH" "$BASE" "$TAG")"
+
+  echo "🧩 Target CN: $host_ip"
   echo "📁 Dest dir : $DEST_DIR"
 
-  # 1) Ensure destination exists on CN (ALWAYS NEW_BUILD_PATH-based)
-  "${c_ssh[@]}" "${CN_USER}@${host}" "mkdir -p '$DEST_DIR'"
-
-  # 2) Download from build (once)
-  download_once "${FOUND_DIR}/${TRIL_FILE}"
-  for full in "${BIN_LIST[@]}"; do download_once "$full"; done
-
-  # 3) Upload to this CN
-  upload_to_cn "${TRIL_FILE}" "$host"
-  for full in "${BIN_LIST[@]}"; do upload_to_cn "$(basename "$full")" "$host"; done
-
-  # 4) Extract on CN (optional)
-  shopt -s nocasematch
-  if [[ "$EXTRACT_BUILD_TARBALLS" =~ ^(true|yes|1)$ ]]; then
-    echo "📦 Extracting on $host ..."
-    # TRILLIUM
-    if "${c_ssh[@]}" "${CN_USER}@${host}" "test -d '$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE_VER}'"; then
-      echo "ℹ️  TRILLIUM already extracted; skipping."
-    else
-      "${c_ssh[@]}" "${CN_USER}@${host}" "tar -C '$DEST_DIR' -xzf '$DEST_DIR/$TRIL_FILE'"
-    fi
-    # BINs
-    for full in "${BIN_LIST[@]}"; do
-      base="$(basename "$full")"; dir="${base%.tar.gz}"
-      if "${c_ssh[@]}" "${CN_USER}@${host}" "test -d '$DEST_DIR/$dir'"; then
-        echo "ℹ️  $base already extracted; skipping."
-      else
-        "${c_ssh[@]}" "${CN_USER}@${host}" "tar -C '$DEST_DIR' -xzf '$DEST_DIR/$base'"
-      fi
-    done
-  else
-    echo "ℹ️  Extraction disabled."
+  # Create destination dir on CN
+  if ! "${SSH_CN[@]}" "${CN_USER}@${host_ip}" "mkdir -p '$DEST_DIR' && chmod 755 '$DEST_DIR'"; then
+    echo "❌ Failed to create $DEST_DIR on $host_ip"; any_failed=1; echo; continue
   fi
-  shopt -u nocasematch
 
-  echo "✅ Done for $host → $DEST_DIR"
+  # Copy TRILLIUM (remote→remote) via scp -3; fall back to pipe if -3 fails
+  copy_ok=0
+  if "${SCP_3[@]}" "${BUILD_SRC_USER}@${BUILD_SRC_HOST}:${FOUND_DIR}/${TRIL_FILE}" \
+                   "${CN_USER}@${host_ip}:${DEST_DIR}/" >/dev/null 2>&1; then
+    copy_ok=1
+  else
+    # fallback: stream via pipe (more compatible)
+    if "${SSH_SRC[@]}" "${BUILD_SRC_USER}@${BUILD_SRC_HOST}" "cat '$FOUND_DIR/$TRIL_FILE'" \
+        | "${SSH_CN[@]}" "${CN_USER}@${host_ip}" "cat > '$DEST_DIR/$TRIL_FILE'"; then
+      copy_ok=1
+    fi
+  fi
+
+  if [[ $copy_ok -ne 1 ]]; then
+    echo "❌ Failed to copy $TRIL_FILE to $host_ip:$DEST_DIR"; any_failed=1; echo; continue
+  fi
+
+  # Copy BINs (if any) one by one (optional)
+  for full in "${BIN_LIST[@]}"; do
+    base="$(basename "$full")"
+    echo "📥 Copying BIN: $base"
+    if ! "${SCP_3[@]}" "${BUILD_SRC_USER}@${BUILD_SRC_HOST}:${full}" \
+                       "${CN_USER}@${host_ip}:${DEST_DIR}/" >/dev/null 2>&1; then
+      # fallback pipe
+      if ! "${SSH_SRC[@]}" "${BUILD_SRC_USER}@${BUILD_SRC_HOST}" "cat '$full'" \
+          | "${SSH_CN[@]}" "${CN_USER}@${host_ip}" "cat > '$DEST_DIR/$base'"; then
+        echo "⚠️  Failed to copy BIN: $base to $host_ip (continuing)"
+      fi
+    fi
+  done
+
+  # Verify TRILLIUM on CN
+  if ! "${SSH_CN[@]}" "${CN_USER}@${host_ip}" "test -s '$DEST_DIR/$TRIL_FILE'"; then
+    echo "❌ Copy verification failed for $TRIL_FILE on $host_ip:$DEST_DIR"; any_failed=1; echo; continue
+  fi
+
+  # No extraction here — install stage will handle TRILLIUM untar
+  echo "✅ Build files staged on ${host_ip}:${DEST_DIR}"
+  echo
 done < "$SERVER_FILE"
 
-echo ""
-echo "🎉 All CN servers processed successfully."
+# ---------- result ----------
+if [[ $any_failed -ne 0 ]]; then
+  echo "❌ One or more CN targets failed during fetch."
+  exit 1
+fi
+echo "🎉 Fetch stage completed for all CN targets."
