@@ -4,7 +4,7 @@ pipeline {
 
   environment {
     SERVER_FILE = 'server_pci_map.txt'
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // 🔐 CN servers use this key (unchanged)
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // CN servers use this key (root)
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'                    // fetch: do NOT untar
     INSTALL_IP_ADDR  = '10.10.10.20/24'
@@ -25,11 +25,8 @@ pipeline {
     string      (name: 'BUILD_SRC_USER', defaultValue: 'labadmin',           description: 'Build repo user')
     string      (name: 'BUILD_SRC_BASE', defaultValue: '/CNBuild/6.3.0_EA2', description: 'Path on build host containing the tar.gz files')
 
-    // 🔐 Take password ONLY for the BUILD host (GUI-masked)
+    // 🔐 Only BUILD host password comes from GUI (masked)
     password    (name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (for SCP/SSH from build repo)')
-
-    // CN login remains via SSH key (root). If you want a different user, expose it:
-    string      (name: 'CN_USER', defaultValue: 'root', description: 'CN SSH user (key-based). Leave as root unless you changed your host setup.')
   }
 
   stages {
@@ -89,8 +86,7 @@ pipeline {
                 echo "Targets from ${SERVER_FILE}:"
                 awk 'NF && $1 !~ /^#/' "${SERVER_FILE}" || true
 
-                # CN login stays key-based (same key used by reset/install).
-                # fetch_build.sh must detect CN_SSH_KEY when present and use: scp -i "$CN_SSH_KEY" ${CN_USER}@<host>:...
+                # CN login remains key-based as root (same key as reset/install)
                 NEW_VERSION="${NEW_VERSION}" \
                 NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
                 SERVER_FILE="${SERVER_FILE}" \
@@ -98,7 +94,6 @@ pipeline {
                 BUILD_SRC_USER="${BUILD_SRC_USER}" \
                 BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
                 BUILD_SRC_PASS="${BUILD_SRC_PASS}" \
-                CN_USER="${CN_USER}" \
                 CN_SSH_KEY="${SSH_KEY}" \
                 EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
                 bash -euo pipefail scripts/fetch_build.sh
