@@ -15,16 +15,16 @@ pipeline {
     // ▼ New dropdown
     choice(
       name: 'DEPLOYMENT_TYPE',
-      choices: ['Low','Medium','High'].join('\n'),
+      choices: 'Low\nMedium\nHigh',
       description: 'Deployment type'
     )
 
     // Main flow
     choice(name: 'NEW_VERSION',
-           choices: ['6.3.0_EA2','6.3.0','6.3.0_EA1'].join('\n'),
+           choices: '6.3.0_EA2\n6.3.0\n6.3.0_EA1',
            description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)')
     choice(name: 'OLD_VERSION',
-           choices: ['6.3.0_EA1','6.3.0'].join('\n'),
+           choices: '6.3.0_EA1\n6.3.0',
            description: 'Existing bundle (used if CLUSTER_RESET=true)')
 
     booleanParam(name: 'CLUSTER_RESET',  defaultValue: true,        description: 'Run cluster reset first')
@@ -34,13 +34,13 @@ pipeline {
     // Remote fetch (copy directly to CN servers)
     booleanParam(name: 'FETCH_BUILD',   defaultValue: true, description: 'Fetch NEW_VERSION from build host to CN servers')
     choice(name: 'BUILD_SRC_HOST',
-           choices: ['172.26.2.96','172.26.2.95'].join('\n'),
+           choices: '172.26.2.96\n172.26.2.95',
            description: 'Build repo host')
     choice(name: 'BUILD_SRC_USER',
-           choices: ['sobirada','labadmin'].join('\n'),
+           choices: 'sobirada\nlabadmin',
            description: 'Build repo user')
     choice(name: 'BUILD_SRC_BASE',
-           choices: ['/CNBuild/6.3.0_EA2','/CNBuild/6.3.0','/CNBuild/6.3.0_EA1'].join('\n'),
+           choices: '/CNBuild/6.3.0_EA2\n/CNBuild/6.3.0\n/CNBuild/6.3.0_EA1',
            description: 'Path on build host containing the tar.gz files')
 
     // Only BUILD host password from GUI (masked). May be empty.
@@ -48,7 +48,7 @@ pipeline {
 
     // Optional: pick interface for plumbing the alias IP
     choice(name: 'INSTALL_IP_IFACE',
-           choices: ['', 'ens160', 'eth0', 'enp0s3'].join('\n'),
+           choices: '\nens160\neth0\nenp0s3',
            description: 'Interface to add 10.10.10.20/24 (leave blank to auto-detect)')
   }
 
