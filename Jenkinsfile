@@ -21,10 +21,10 @@ pipeline {
 
     // Main flow
     choice(name: 'NEW_VERSION',
-           choices: '6.3.0_EA2\n6.3.0\n6.3.0_EA1',
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
            description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)')
     choice(name: 'OLD_VERSION',
-           choices: '6.3.0_EA1\n6.3.0',
+           choices: '6.2.0_EA6\n6.3.0'\n6.3.0_EA1\n6.3.0_EA2,
            description: 'Existing bundle (used if CLUSTER_RESET=true)')
 
     booleanParam(name: 'CLUSTER_RESET',  defaultValue: true,        description: 'Run cluster reset first')
