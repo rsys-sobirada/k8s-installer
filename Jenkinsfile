@@ -4,7 +4,7 @@ pipeline {
 
   environment {
     SERVER_FILE = 'server_pci_map.txt'
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // key for CN reset/install (root@host)
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // 🔐 CN servers use this key (unchanged)
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'                    // fetch: do NOT untar
     INSTALL_IP_ADDR  = '10.10.10.20/24'
@@ -25,10 +25,11 @@ pipeline {
     string      (name: 'BUILD_SRC_USER', defaultValue: 'labadmin',           description: 'Build repo user')
     string      (name: 'BUILD_SRC_BASE', defaultValue: '/CNBuild/6.3.0_EA2', description: 'Path on build host containing the tar.gz files')
 
-    // 🔐 Passwords from GUI (masked in console)
+    // 🔐 Take password ONLY for the BUILD host (GUI-masked)
     password    (name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (for SCP/SSH from build repo)')
-    string      (name: 'CN_USER',        defaultValue: 'labadmin', description: 'CN server user for SCP (where builds are copied)')
-    password    (name: 'CN_PASS',        defaultValue: '', description: 'CN server password (for SCP to CN)')
+
+    // CN login remains via SSH key (root). If you want a different user, expose it:
+    string      (name: 'CN_USER', defaultValue: 'root', description: 'CN SSH user (key-based). Leave as root unless you changed your host setup.')
   }
 
   stages {
@@ -72,14 +73,15 @@ pipeline {
               sh '''
                 set -euo pipefail
 
-                # Ensure scripts are clean and executable
+                # Clean line endings & make executable
                 sed -i 's/\\r$//' scripts/fetch_build.sh || true
                 chmod +x scripts/fetch_build.sh
 
-                # Password-based SCP requires sshpass on the Jenkins agent
-                if [ -n "${BUILD_SRC_PASS:-}" ] || [ -n "${CN_PASS:-}" ]; then
+                # We ONLY use password auth for the BUILD host.
+                # -> Jenkins agent must have sshpass if BUILD_SRC_PASS is provided.
+                if [ -n "${BUILD_SRC_PASS:-}" ]; then
                   if ! command -v sshpass >/dev/null 2>&1; then
-                    echo "ERROR: sshpass is required on this agent for password-based SCP/SSH." >&2
+                    echo "ERROR: sshpass is required on this agent for password-based SCP/SSH to BUILD_SRC_HOST." >&2
                     exit 2
                   fi
                 fi
@@ -87,6 +89,8 @@ pipeline {
                 echo "Targets from ${SERVER_FILE}:"
                 awk 'NF && $1 !~ /^#/' "${SERVER_FILE}" || true
 
+                # CN login stays key-based (same key used by reset/install).
+                # fetch_build.sh must detect CN_SSH_KEY when present and use: scp -i "$CN_SSH_KEY" ${CN_USER}@<host>:...
                 NEW_VERSION="${NEW_VERSION}" \
                 NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
                 SERVER_FILE="${SERVER_FILE}" \
@@ -95,7 +99,7 @@ pipeline {
                 BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
                 BUILD_SRC_PASS="${BUILD_SRC_PASS}" \
                 CN_USER="${CN_USER}" \
-                CN_PASS="${CN_PASS}" \
+                CN_SSH_KEY="${SSH_KEY}" \
                 EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
                 bash -euo pipefail scripts/fetch_build.sh
               '''
