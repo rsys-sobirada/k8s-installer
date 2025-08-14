@@ -40,7 +40,7 @@ pipeline {
           when { expression { return params.CLUSTER_RESET } }
           steps {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
-              sh '''
+              sh(script: '''
                 set -e
                 echo ">>> Cluster reset starting..."
                 sed -i 's/\\r$//' scripts/cluster_reset.sh || true
@@ -58,7 +58,7 @@ pipeline {
                   RETRY_COUNT="3" \
                   RETRY_DELAY_SECS="10" \
                 bash -euo pipefail scripts/cluster_reset.sh
-              '''
+              ''', shell: '/bin/bash')
             }
           }
         }
@@ -67,7 +67,7 @@ pipeline {
           when { expression { return params.FETCH_BUILD } }
           steps {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
-              sh '''
+              sh(script: '''
                 set -euo pipefail
 
                 # Clean line endings & make executable
@@ -97,7 +97,7 @@ pipeline {
                 CN_SSH_KEY="${SSH_KEY}" \
                 EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
                 bash -euo pipefail scripts/fetch_build.sh
-              '''
+              ''', shell: '/bin/bash')
             }
           }
         }
@@ -107,7 +107,7 @@ pipeline {
     stage('Cluster install') {
       steps {
         timeout(time: 15, unit: 'MINUTES', activity: true) {
-          sh '''
+          sh(script: '''
             set -e
             echo ">>> Cluster install starting..."
             sed -i 's/\\r$//' scripts/cluster_install.sh || true
@@ -125,7 +125,7 @@ pipeline {
               INSTALL_RETRY_DELAY_SECS="20" \
               BUILD_WAIT_SECS="300" \
             bash -euo pipefail scripts/cluster_install.sh
-          '''
+          ''', shell: '/bin/bash')
         }
       }
     }
