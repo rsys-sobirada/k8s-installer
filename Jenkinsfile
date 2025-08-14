@@ -12,21 +12,44 @@ pipeline {
   }
 
   parameters {
+    // ▼ New dropdown
+    choice(
+      name: 'DEPLOYMENT_TYPE',
+      choices: ['Low','Medium','High'].join('\n'),
+      description: 'Deployment type'
+    )
+
     // Main flow
-    string      (name: 'NEW_VERSION',    defaultValue: '6.3.0_EA2', description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)')
-    string      (name: 'OLD_VERSION',    defaultValue: '6.3.0_EA1', description: 'Existing bundle (used if CLUSTER_RESET=true)')
+    choice(name: 'NEW_VERSION',
+           choices: ['6.3.0_EA2','6.3.0','6.3.0_EA1'].join('\n'),
+           description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)')
+    choice(name: 'OLD_VERSION',
+           choices: ['6.3.0_EA1','6.3.0'].join('\n'),
+           description: 'Existing bundle (used if CLUSTER_RESET=true)')
+
     booleanParam(name: 'CLUSTER_RESET',  defaultValue: true,        description: 'Run cluster reset first')
     string      (name: 'OLD_BUILD_PATH', defaultValue: '/home/labadmin', description: 'Base dir of OLD_VERSION (for reset)')
     string      (name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin', description: 'Base dir to place NEW_VERSION (and extract)')
 
     // Remote fetch (copy directly to CN servers)
-    booleanParam(name: 'FETCH_BUILD',   defaultValue: true,                  description: 'Fetch NEW_VERSION from build host to CN servers')
-    string      (name: 'BUILD_SRC_HOST', defaultValue: '172.26.2.96',        description: 'Build repo host')
-    string      (name: 'BUILD_SRC_USER', defaultValue: 'labadmin',           description: 'Build repo user')
-    string      (name: 'BUILD_SRC_BASE', defaultValue: '/CNBuild/6.3.0_EA2', description: 'Path on build host containing the tar.gz files')
+    booleanParam(name: 'FETCH_BUILD',   defaultValue: true, description: 'Fetch NEW_VERSION from build host to CN servers')
+    choice(name: 'BUILD_SRC_HOST',
+           choices: ['172.26.2.96','172.26.2.95'].join('\n'),
+           description: 'Build repo host')
+    choice(name: 'BUILD_SRC_USER',
+           choices: ['sobirada','labadmin'].join('\n'),
+           description: 'Build repo user')
+    choice(name: 'BUILD_SRC_BASE',
+           choices: ['/CNBuild/6.3.0_EA2','/CNBuild/6.3.0','/CNBuild/6.3.0_EA1'].join('\n'),
+           description: 'Path on build host containing the tar.gz files')
 
-    // 🔐 Only BUILD host password from GUI (masked). May be empty.
-    password    (name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (for SCP/SSH from build repo)')
+    // Only BUILD host password from GUI (masked). May be empty.
+    password(name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (for SCP/SSH from build repo)')
+
+    // Optional: pick interface for plumbing the alias IP
+    choice(name: 'INSTALL_IP_IFACE',
+           choices: ['', 'ens160', 'eth0', 'enp0s3'].join('\n'),
+           description: 'Interface to add 10.10.10.20/24 (leave blank to auto-detect)')
   }
 
   stages {
@@ -69,13 +92,10 @@ pipeline {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
               sh '''
                 set -eu
-
-                # Clean line endings & make executable
                 sed -i 's/\\r$//' scripts/fetch_build.sh || true
                 chmod +x scripts/fetch_build.sh
 
                 # We ONLY use password auth for the BUILD host.
-                # -> Jenkins agent must have sshpass if BUILD_SRC_PASS is provided.
                 if [ -n "${BUILD_SRC_PASS:-}" ]; then
                   if ! command -v sshpass >/dev/null 2>&1; then
                     echo "ERROR: sshpass is required on this agent for password-based SCP/SSH to BUILD_SRC_HOST." >&2
