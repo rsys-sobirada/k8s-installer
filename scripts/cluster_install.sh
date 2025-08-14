@@ -54,7 +54,7 @@ SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o 
 BASE="$(base_ver "$NEW_VERSION")"
 TAG_IN="$(ver_tag "$NEW_VERSION")"
 
-# ---- Abort trap (after SSH_OPTS/SSH_KEY are set) ----
+# ---- Abort trap ----
 declare -a HOSTS_TOUCHED=()
 ABORTING=0
 on_abort() {
@@ -138,7 +138,7 @@ interval=3
 while [[ ! -s "$TRIL_TAR" && "$elapsed" -lt "$WAIT" ]]; do
   echo "[TRIL] Waiting for $TRIL_TAR to appear ... (${elapsed}/${WAIT}s)"
   sleep "$interval"; elapsed=$((elapsed+interval))
-enddone
+done
 
 if [[ ! -s "$TRIL_TAR" ]]; then
   echo "[ERROR] TRILLIUM tar not found at $TRIL_TAR after ${WAIT}s"; exit 2
