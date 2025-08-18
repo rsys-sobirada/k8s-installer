@@ -7,24 +7,27 @@ pipeline {
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // CN servers use this key (root)
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'                    // fetch: do NOT untar
+
+    // Default install IP—user can override via parameter below
     INSTALL_IP_ADDR  = '10.10.10.20/24'
-    INSTALL_IP_IFACE = ''                               // may be empty; keep defined
   }
 
   parameters {
-    // ▼ New dropdown
+    // Deployment knob (kept as-is)
     choice(
       name: 'DEPLOYMENT_TYPE',
       choices: 'Low\nMedium\nHigh',
       description: 'Deployment type'
     )
 
-    // Main flow
+    // Version selection
     choice(name: 'NEW_VERSION',
            choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
            description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)')
+
+    // NOTE: fixed quoting on OLD_VERSION choices
     choice(name: 'OLD_VERSION',
-           choices: '6.2.0_EA6\n6.3.0'\n6.3.0_EA1\n6.3.0_EA2,
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
            description: 'Existing bundle (used if CLUSTER_RESET=true)')
 
     booleanParam(name: 'CLUSTER_RESET',  defaultValue: true,        description: 'Run cluster reset first')
@@ -46,10 +49,8 @@ pipeline {
     // Only BUILD host password from GUI (masked). May be empty.
     password(name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (for SCP/SSH from build repo)')
 
-    // Optional: pick interface for plumbing the alias IP
-    choice(name: 'INSTALL_IP_IFACE',
-           choices: '\nens160\neth0\nenp0s3',
-           description: 'Interface to add 10.10.10.20/24 (leave blank to auto-detect)')
+    // Optional override for the alias IP (CIDR). Leave blank to use default.
+    string(name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24', description: 'Alias IP/CIDR to plumb on CN servers')
   }
 
   stages {
@@ -139,7 +140,6 @@ pipeline {
               KSPRAY_DIR="kubespray-2.27.0" \
               INSTALL_SERVER_FILE="${SERVER_FILE}" \
               INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
-              INSTALL_IP_IFACE="${INSTALL_IP_IFACE:-}" \
               SSH_KEY="${SSH_KEY}" \
               INSTALL_RETRY_COUNT="3" \
               INSTALL_RETRY_DELAY_SECS="20" \
