@@ -1,7 +1,6 @@
-// ---------- Parameters (Active Choices enabled) ----------
+// ---------- Parameters (Active Choices corrected) ----------
 properties([
   parameters([
-    // Installation mode controls: reset gating + OLD_BUILD_PATH visibility
     choice(
       name: 'INSTALL_MODE',
       choices: 'Upgrade_with_cluster_reset\nUpgrade_without_cluster_reset\nFresh_installation',
@@ -16,27 +15,33 @@ properties([
            choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
            description: 'Existing bundle (used for Upgrade_* modes)'),
 
-    // ▼ Conditionally visible OLD_BUILD_PATH using Active Choices
-    [$class: 'DynamicReferenceParameter',
+    // ▼ Conditionally visible OLD_BUILD_PATH text box (Active Choices)
+    [
+      $class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
       description: 'Base dir of OLD_VERSION (shown only for Upgrade modes)',
       referencedParameters: 'INSTALL_MODE',
+      omitValueField: true, // hide the default text box that AC renders
       script: [
         $class: 'GroovyScript',
-        sandbox: true,
-        script: '''
+        // SecureGroovyScript payloads:
+        script: [
+          script: '''
 def mode = INSTALL_MODE ?: ''
 if (mode == 'Fresh_installation') {
-  return "" // hide the field
+  return "" // hide entirely
 }
-// Render a plain text input named "value" so Jenkins captures it as the parameter value
+// Render a plain text input named "value" so Jenkins captures it
 return """<input class='setting-input' name='value' type='text' value='/home/labadmin'/>"""
-'''
-      ],
-      fallbackScript: [
-        $class: 'GroovyScript',
-        sandbox: true,
-        script: 'return ""'
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [
+          script: 'return ""',
+          sandbox: true,
+          classpath: []
+        ]
       ]
     ],
 
@@ -44,7 +49,6 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
            defaultValue: '/home/labadmin',
            description: 'Base dir to place NEW_VERSION (and extract)'),
 
-    // Remote fetch (copy directly to CN servers)
     booleanParam(name: 'FETCH_BUILD',   defaultValue: true, description: 'Fetch NEW_VERSION from build host to CN servers'),
     choice(name: 'BUILD_SRC_HOST',
            choices: '172.26.2.96\n172.26.2.95',
@@ -57,7 +61,6 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
            description: 'Path on build host containing the tar.gz files'),
     password(name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (optional; only for repo host)'),
 
-    // Alias IP (CIDR) to plumb on CN servers (auto-detect interface on host)
     string(name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24',
            description: 'Alias IP/CIDR to plumb on CN servers (interface auto-detected)')
   ])
