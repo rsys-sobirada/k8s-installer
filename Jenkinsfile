@@ -18,9 +18,9 @@ properties([
       omitValueField: true,
       script: [
         $class: 'GroovyScript',
-        script: [ // SecureGroovyScript
+        script: [
           script: '''
-def mode = INSTALL_MODE ?: ''
+def mode = (INSTALL_MODE ?: "").toString()
 if (mode == 'Fresh_installation') return ""
 return """<input class='setting-input' name='value' type='text' value='/home/labadmin'/>"""
 ''',
@@ -59,6 +59,9 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
            defaultValue: true,
            description: 'Fetch NEW_VERSION from build host to CN servers'),
 
+    // ---- Helper: robust bool check for FETCH_BUILD (used by all 4 fields) ----
+    // NOTE: we inline the same snippet in each field so they are self-contained.
+
     // ---- The 4 build-source fields, now conditional on FETCH_BUILD (names preserved) ----
     [
       $class: 'DynamicReferenceParameter',
@@ -71,7 +74,9 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
         $class: 'GroovyScript',
         script: [
           script: '''
-if (!FETCH_BUILD?.toBoolean()) return ""
+def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
+def enabled = ['true','on','1','yes','y'].contains(fb)
+if (!enabled) return ""
 return """<select class='setting-input' name='value'>
            <option value="172.26.2.96">172.26.2.96</option>
            <option value="172.26.2.95">172.26.2.95</option>
@@ -95,7 +100,9 @@ return """<select class='setting-input' name='value'>
         $class: 'GroovyScript',
         script: [
           script: '''
-if (!FETCH_BUILD?.toBoolean()) return ""
+def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
+def enabled = ['true','on','1','yes','y'].contains(fb)
+if (!enabled) return ""
 return """<select class='setting-input' name='value'>
            <option value="sobirada">sobirada</option>
            <option value="labadmin">labadmin</option>
@@ -119,7 +126,9 @@ return """<select class='setting-input' name='value'>
         $class: 'GroovyScript',
         script: [
           script: '''
-if (!FETCH_BUILD?.toBoolean()) return ""
+def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
+def enabled = ['true','on','1','yes','y'].contains(fb)
+if (!enabled) return ""
 return """<select class='setting-input' name='value'>
            <option value="/CNBuild/6.3.0_EA2">/CNBuild/6.3.0_EA2</option>
            <option value="/CNBuild/6.3.0">/CNBuild/6.3.0</option>
@@ -144,7 +153,9 @@ return """<select class='setting-input' name='value'>
         $class: 'GroovyScript',
         script: [
           script: '''
-if (!FETCH_BUILD?.toBoolean()) return ""
+def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
+def enabled = ['true','on','1','yes','y'].contains(fb)
+if (!enabled) return ""
 return """<input type='password' class='setting-input' name='value' value=''/>"""
 ''',
           sandbox: true,
