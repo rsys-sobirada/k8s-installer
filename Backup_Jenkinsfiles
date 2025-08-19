@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${INSTALL_SERVER_FILE:?missing}"
+: "${SSH_KEY:?missing}"
+: "${INSTALL_IP_ADDR:?missing}"   # e.g. 10.10.10.20/24
+
+log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
+
+ensure_alias_ip_on_host() {
+  local host="$1"
+  local ipcidr="$2"
+
+  log "[$host] Ensuring alias $ipcidr is present"
+
+  ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@${host}" bash -euo pipefail -s -- "$ipcidr" <<'EOSSH'
+set -euo pipefail
+IPCIDR="$1"
+
+have_ip() {
+  ip -o -4 addr show | awk '{print $4}' | grep -Fxq "$IPCIDR"
+}
+
+pick_iface() {
+  # Prefer the default route interface
+  local dflt
+  dflt="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}' || true)"
+  if [[ -n "$dflt" ]]; then
+    echo "$dflt"; return 0
+  fi
+  # Else first UP non-lo interface
+  ip -o link show up | awk -F': ' '$2!="lo"{print $2; exit}'
+}
+
+if have_ip; then
+  echo "Alias $IPCIDR already present; skipping."
+  exit 0
+fi
+
+IFACE="$(pick_iface)"
+if [[ -z "${IFACE:-}" ]]; then
+  echo "ERROR: No suitable interface found to plumb $IPCIDR" >&2
+  exit 1
+fi
+
+# Add the address; tolerate it already existing due to race or prior runs
+if ip addr add "$IPCIDR" dev "$IFACE" label "${IFACE}:cn10" 2>/dev/null; then
+  echo "Added $IPCIDR on $IFACE (label ${IFACE}:cn10)"
+else
+  # If failure wasn’t “File exists”, show diagnostics then re-check
+  if ! ip -o -4 addr show dev "$IFACE" | awk '{print $4}' | grep -Fxq "$IPCIDR"; then
+    echo "WARN: ip add failed; interface addresses:" >&2
+    ip -o -4 addr show dev "$IFACE" >&2 || true
+    # Retry once (brief backoff)
+    sleep 1
+    ip addr add "$IPCIDR" dev "$IFACE" label "${IFACE}:cn10" || {
+      echo "ERROR: Could not add $IPCIDR on $IFACE" >&2
+      exit 1
+    }
+  fi
+fi
+
+# Make it survive simple network restarts? (Optional; distro-specific—left to your role)
+# For now, we keep it as a runtime alias.
+
+# Show final state
+ip -o -4 addr show dev "$IFACE" | sed 's/^/FINAL: /'
+EOSSH
+}
+
+# --- Main ---
+# Expect INSTALL_SERVER_FILE in "host [pci...]" format, we read only first column (host/IP)
+log "Reading targets from ${INSTALL_SERVER_FILE}"
+mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/{print $1}' "$INSTALL_SERVER_FILE")
+
+for h in "${HOSTS[@]}"; do
+  # Retry wrapper (same style as the rest of your script)
+  for attempt in $(seq 1 "${INSTALL_RETRY_COUNT:-3}"); do
+    if ensure_alias_ip_on_host "$h" "$INSTALL_IP_ADDR"; then
+      log "[$h] Alias ensured"
+      break
+    else
+      log "[$h] Attempt $attempt failed; retrying in ${INSTALL_RETRY_DELAY_SECS:-20}s..."
+      sleep "${INSTALL_RETRY_DELAY_SECS:-20}"
+    fi
+
+    if [[ "$attempt" -eq "${INSTALL_RETRY_COUNT:-3}" ]]; then
+      log "[$h] ERROR: Could not ensure alias after ${INSTALL_RETRY_COUNT:-3} attempts"
+      exit 1
+    fi
+  done
+done
+
+# ... continue with the rest of your cluster install logic (kubespray, etc.)
