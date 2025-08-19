@@ -1,28 +1,30 @@
-// ---------- Add Active Choices parameters (only the new ones) ----------
+// ---------- Parameters (Active Choices + all existing) ----------
 properties([
   parameters([
-    // 3-mode install selector (replaces CLUSTER_RESET)
+    // New 3-mode selector
     choice(
       name: 'INSTALL_MODE',
       choices: 'Upgrade_with_cluster_reset\nUpgrade_without_cluster_reset\nFresh_installation',
       description: 'Select installation mode'
     ),
 
-    // Conditionally visible OLD_BUILD_PATH (shown only for Upgrade modes)
+    // Conditionally visible OLD_BUILD_PATH text box (for Upgrade modes only)
     [
       $class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
       description: 'Base dir of OLD_VERSION (shown only for Upgrade modes)',
       referencedParameters: 'INSTALL_MODE',
-      omitValueField: true, // hide default AC field; we render our own input
+      choiceType: 'ET_FORMATTED_HTML',   // << important so the HTML <input> renders
+      omitValueField: true,              // hide the default AC value box
       script: [
         $class: 'GroovyScript',
-        script: [ // SecureGroovyScript payload
+        script: [
           script: '''
 def mode = INSTALL_MODE ?: ''
 if (mode == 'Fresh_installation') {
   return "" // hide entirely
 }
+// Render a plain text input named "value" so Jenkins stores it as the parameter value
 return """<input class='setting-input' name='value' type='text' value='/home/labadmin'/>"""
 ''',
           sandbox: true,
@@ -34,58 +36,58 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
           classpath: []
         ]
       ]
-    ]
+    ],
+
+    // ------- All your existing parameters (unchanged) -------
+    choice(
+      name: 'DEPLOYMENT_TYPE',
+      choices: 'Low\nMedium\nHigh',
+      description: 'Deployment type'
+    ),
+    choice(name: 'NEW_VERSION',
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+           description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'),
+    choice(name: 'OLD_VERSION',
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+           description: 'Existing bundle (used if upgrading)'),
+    string(name: 'NEW_BUILD_PATH',
+           defaultValue: '/home/labadmin',
+           description: 'Base dir to place NEW_VERSION (and extract)'),
+    booleanParam(name: 'FETCH_BUILD',
+           defaultValue: true,
+           description: 'Fetch NEW_VERSION from build host to CN servers'),
+    choice(name: 'BUILD_SRC_HOST',
+           choices: '172.26.2.96\n172.26.2.95',
+           description: 'Build repo host'),
+    choice(name: 'BUILD_SRC_USER',
+           choices: 'sobirada\nlabadmin',
+           description: 'Build repo user'),
+    choice(name: 'BUILD_SRC_BASE',
+           choices: '/CNBuild/6.3.0_EA2\n/CNBuild/6.3.0\n/CNBuild/6.3.0_EA1',
+           description: 'Path on build host containing the tar.gz files'),
+    password(name: 'BUILD_SRC_PASS',
+           defaultValue: '',
+           description: 'Build host password (for SCP/SSH from build repo)'),
+    string(name: 'INSTALL_IP_ADDR',
+           defaultValue: '10.10.10.20/24',
+           description: 'Alias IP/CIDR to plumb on CN servers')
   ])
 ])
 
-// ---------------------------- Your pipeline ----------------------------
+// ---------------------------- Pipeline ----------------------------
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
 
   environment {
     SERVER_FILE = 'server_pci_map.txt'
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // CN servers use this key (root)
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'
     K8S_VER     = '1.31.4'
-    EXTRACT_BUILD_TARBALLS = 'false'                    // fetch: do NOT untar
-    INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; can be overridden below
+    EXTRACT_BUILD_TARBALLS = 'false'
+    INSTALL_IP_ADDR  = '10.10.10.20/24'
   }
 
-  parameters {
-    // ▼ All your existing params remain unchanged
-    choice(
-      name: 'DEPLOYMENT_TYPE',
-      choices: 'Low\nMedium\nHigh',
-      description: 'Deployment type'
-    )
-
-    choice(name: 'NEW_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
-           description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)')
-
-    choice(name: 'OLD_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
-           description: 'Existing bundle (used if upgrading)')
-
-    // ❌ Removed: CLUSTER_RESET (now controlled by INSTALL_MODE)
-    // ❌ Removed: OLD_BUILD_PATH (now OLD_BUILD_PATH_UI from Active Choices)
-
-    string      (name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin', description: 'Base dir to place NEW_VERSION (and extract)')
-
-    booleanParam(name: 'FETCH_BUILD',   defaultValue: true, description: 'Fetch NEW_VERSION from build host to CN servers')
-    choice(name: 'BUILD_SRC_HOST',
-           choices: '172.26.2.96\n172.26.2.95',
-           description: 'Build repo host')
-    choice(name: 'BUILD_SRC_USER',
-           choices: 'sobirada\nlabadmin',
-           description: 'Build repo user')
-    choice(name: 'BUILD_SRC_BASE',
-           choices: '/CNBuild/6.3.0_EA2\n/CNBuild/6.3.0\n/CNBuild/6.3.0_EA1',
-           description: 'Path on build host containing the tar.gz files')
-
-    password(name: 'BUILD_SRC_PASS', defaultValue: '', description: 'Build host password (for SCP/SSH from build repo)')
-    string  (name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24', description: 'Alias IP/CIDR to plumb on CN servers')
-  }
+  // IMPORTANT: remove the old `parameters {}` block from here
 
   stages {
     stage('Checkout') {
@@ -95,7 +97,7 @@ pipeline {
     stage('Validate inputs') {
       steps {
         script {
-          // OLD_BUILD_PATH_UI is required for both upgrade modes, ignored for Fresh_installation
+          // Require path only for upgrade modes
           if (params.INSTALL_MODE != 'Fresh_installation' && !params.OLD_BUILD_PATH_UI?.trim()) {
             error "OLD_BUILD_PATH is required for ${params.INSTALL_MODE}"
           }
@@ -143,7 +145,6 @@ pipeline {
                 sed -i 's/\\r$//' scripts/fetch_build.sh || true
                 chmod +x scripts/fetch_build.sh
 
-                # We ONLY use password auth for the BUILD host.
                 if [ -n "${BUILD_SRC_PASS:-}" ]; then
                   if ! command -v sshpass >/dev/null 2>&1; then
                     echo "ERROR: sshpass is required on this agent for password-based SCP/SSH to BUILD_SRC_HOST." >&2
