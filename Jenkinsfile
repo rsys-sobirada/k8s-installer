@@ -1,14 +1,14 @@
-// ===== Parameters (Active Choices + all existing names preserved) =====
+// ================== Parameters (Active Choices + existing names preserved) ==================
 properties([
   parameters([
-    // ---- New 3-mode install selector (replaces the old CLUSTER_RESET toggle) ----
+    // ---- 3-mode selector (controls reset & OLD_BUILD_PATH visibility) ----
     choice(
       name: 'INSTALL_MODE',
       choices: 'Upgrade_with_cluster_reset\nUpgrade_without_cluster_reset\nFresh_installation',
       description: 'Select installation mode'
     ),
 
-    // OLD_BUILD_PATH input appears only for Upgrade_* modes
+    // OLD_BUILD_PATH shown only for Upgrade_* modes
     [
       $class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
@@ -18,7 +18,7 @@ properties([
       omitValueField: true,
       script: [
         $class: 'GroovyScript',
-        script: [
+        script: [ // SecureGroovyScript
           script: '''
 def mode = INSTALL_MODE ?: ''
 if (mode == 'Fresh_installation') return ""
@@ -59,7 +59,7 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
            defaultValue: true,
            description: 'Fetch NEW_VERSION from build host to CN servers'),
 
-    // ---- The 4 build-source fields, shown ONLY if FETCH_BUILD == true (names preserved) ----
+    // ---- The 4 build-source fields, now conditional on FETCH_BUILD (names preserved) ----
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_HOST',
@@ -154,14 +154,13 @@ return """<input type='password' class='setting-input' name='value' value=''/>""
       ]
     ],
 
-    // IP for alias (same name)
     string(name: 'INSTALL_IP_ADDR',
            defaultValue: '10.10.10.20/24',
            description: 'Alias IP/CIDR to plumb on CN servers')
   ])
 ])
 
-// =============================== Pipeline ===============================
+// =================================== Pipeline ===================================
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
@@ -171,10 +170,10 @@ pipeline {
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // CN servers use this key (root)
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'                    // fetch: do NOT untar
-    INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; can be overridden
+    INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; overridden by param in stage env
   }
 
-  // (No parameters {} block here — all params are above in properties([...]).)
+  // IMPORTANT: do NOT add another `parameters {}` block here
 
   stages {
     stage('Checkout') {
@@ -184,7 +183,7 @@ pipeline {
     stage('Validate inputs') {
       steps {
         script {
-          // Require OLD_BUILD_PATH_UI only for upgrade modes; ignore for fresh install
+          // OLD_BUILD_PATH required only for upgrade modes
           if (params.INSTALL_MODE != 'Fresh_installation' && !params.OLD_BUILD_PATH_UI?.trim()) {
             error "OLD_BUILD_PATH is required for ${params.INSTALL_MODE}"
           }
