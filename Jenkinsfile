@@ -1,30 +1,27 @@
-// ---------- Parameters (Active Choices + all existing) ----------
+// ===== Parameters (Active Choices + all existing names preserved) =====
 properties([
   parameters([
-    // New 3-mode selector
+    // ---- New 3-mode install selector (replaces the old CLUSTER_RESET toggle) ----
     choice(
       name: 'INSTALL_MODE',
       choices: 'Upgrade_with_cluster_reset\nUpgrade_without_cluster_reset\nFresh_installation',
       description: 'Select installation mode'
     ),
 
-    // Conditionally visible OLD_BUILD_PATH text box (for Upgrade modes only)
+    // OLD_BUILD_PATH input appears only for Upgrade_* modes
     [
       $class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
       description: 'Base dir of OLD_VERSION (shown only for Upgrade modes)',
       referencedParameters: 'INSTALL_MODE',
-      choiceType: 'ET_FORMATTED_HTML',   // << important so the HTML <input> renders
-      omitValueField: true,              // hide the default AC value box
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
       script: [
         $class: 'GroovyScript',
         script: [
           script: '''
 def mode = INSTALL_MODE ?: ''
-if (mode == 'Fresh_installation') {
-  return "" // hide entirely
-}
-// Render a plain text input named "value" so Jenkins stores it as the parameter value
+if (mode == 'Fresh_installation') return ""
 return """<input class='setting-input' name='value' type='text' value='/home/labadmin'/>"""
 ''',
           sandbox: true,
@@ -38,56 +35,146 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
       ]
     ],
 
-    // ------- All your existing parameters (unchanged) -------
+    // ---------------- Your existing parameters (names/choices unchanged) ----------------
     choice(
       name: 'DEPLOYMENT_TYPE',
       choices: 'Low\nMedium\nHigh',
       description: 'Deployment type'
     ),
+
     choice(name: 'NEW_VERSION',
            choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
            description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'),
+
     choice(name: 'OLD_VERSION',
            choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
            description: 'Existing bundle (used if upgrading)'),
+
     string(name: 'NEW_BUILD_PATH',
            defaultValue: '/home/labadmin',
            description: 'Base dir to place NEW_VERSION (and extract)'),
+
+    // Keep FETCH_BUILD as a normal boolean param
     booleanParam(name: 'FETCH_BUILD',
            defaultValue: true,
            description: 'Fetch NEW_VERSION from build host to CN servers'),
-    choice(name: 'BUILD_SRC_HOST',
-           choices: '172.26.2.96\n172.26.2.95',
-           description: 'Build repo host'),
-    choice(name: 'BUILD_SRC_USER',
-           choices: 'sobirada\nlabadmin',
-           description: 'Build repo user'),
-    choice(name: 'BUILD_SRC_BASE',
-           choices: '/CNBuild/6.3.0_EA2\n/CNBuild/6.3.0\n/CNBuild/6.3.0_EA1',
-           description: 'Path on build host containing the tar.gz files'),
-    password(name: 'BUILD_SRC_PASS',
-           defaultValue: '',
-           description: 'Build host password (for SCP/SSH from build repo)'),
+
+    // ---- The 4 build-source fields, shown ONLY if FETCH_BUILD == true (names preserved) ----
+    [
+      $class: 'DynamicReferenceParameter',
+      name: 'BUILD_SRC_HOST',
+      description: 'Build repo host',
+      referencedParameters: 'FETCH_BUILD',
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
+if (!FETCH_BUILD?.toBoolean()) return ""
+return """<select class='setting-input' name='value'>
+           <option value="172.26.2.96">172.26.2.96</option>
+           <option value="172.26.2.95">172.26.2.95</option>
+         </select>"""
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
+    ],
+
+    [
+      $class: 'DynamicReferenceParameter',
+      name: 'BUILD_SRC_USER',
+      description: 'Build repo user',
+      referencedParameters: 'FETCH_BUILD',
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
+if (!FETCH_BUILD?.toBoolean()) return ""
+return """<select class='setting-input' name='value'>
+           <option value="sobirada">sobirada</option>
+           <option value="labadmin">labadmin</option>
+         </select>"""
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
+    ],
+
+    [
+      $class: 'DynamicReferenceParameter',
+      name: 'BUILD_SRC_BASE',
+      description: 'Path on build host containing the tar.gz files',
+      referencedParameters: 'FETCH_BUILD',
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
+if (!FETCH_BUILD?.toBoolean()) return ""
+return """<select class='setting-input' name='value'>
+           <option value="/CNBuild/6.3.0_EA2">/CNBuild/6.3.0_EA2</option>
+           <option value="/CNBuild/6.3.0">/CNBuild/6.3.0</option>
+           <option value="/CNBuild/6.3.0_EA1">/CNBuild/6.3.0_EA1</option>
+         </select>"""
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
+    ],
+
+    [
+      $class: 'DynamicReferenceParameter',
+      name: 'BUILD_SRC_PASS',
+      description: 'Build host password (for SCP/SSH from build repo)',
+      referencedParameters: 'FETCH_BUILD',
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
+if (!FETCH_BUILD?.toBoolean()) return ""
+return """<input type='password' class='setting-input' name='value' value=''/>"""
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
+    ],
+
+    // IP for alias (same name)
     string(name: 'INSTALL_IP_ADDR',
            defaultValue: '10.10.10.20/24',
            description: 'Alias IP/CIDR to plumb on CN servers')
   ])
 ])
 
-// ---------------------------- Pipeline ----------------------------
+// =============================== Pipeline ===============================
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
 
   environment {
     SERVER_FILE = 'server_pci_map.txt'
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // CN servers use this key (root)
     K8S_VER     = '1.31.4'
-    EXTRACT_BUILD_TARBALLS = 'false'
-    INSTALL_IP_ADDR  = '10.10.10.20/24'
+    EXTRACT_BUILD_TARBALLS = 'false'                    // fetch: do NOT untar
+    INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; can be overridden
   }
 
-  // IMPORTANT: remove the old `parameters {}` block from here
+  // (No parameters {} block here — all params are above in properties([...]).)
 
   stages {
     stage('Checkout') {
@@ -97,7 +184,7 @@ pipeline {
     stage('Validate inputs') {
       steps {
         script {
-          // Require path only for upgrade modes
+          // Require OLD_BUILD_PATH_UI only for upgrade modes; ignore for fresh install
           if (params.INSTALL_MODE != 'Fresh_installation' && !params.OLD_BUILD_PATH_UI?.trim()) {
             error "OLD_BUILD_PATH is required for ${params.INSTALL_MODE}"
           }
@@ -145,6 +232,7 @@ pipeline {
                 sed -i 's/\\r$//' scripts/fetch_build.sh || true
                 chmod +x scripts/fetch_build.sh
 
+                # We ONLY use password auth for the BUILD host.
                 if [ -n "${BUILD_SRC_PASS:-}" ]; then
                   if ! command -v sshpass >/dev/null 2>&1; then
                     echo "ERROR: sshpass is required on this agent for password-based SCP/SSH to BUILD_SRC_HOST." >&2
