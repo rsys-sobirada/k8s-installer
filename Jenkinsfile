@@ -169,7 +169,7 @@ return """<input type='password' class='setting-input' name='value' value=''/>""
            defaultValue: '10.10.10.20/24',
            description: 'Alias IP/CIDR to plumb on CN servers'),
 
-    // --- Optional: CN SSH bootstrap for new servers (kept at the end to not disturb your order) ---
+    // -------- OPTIONAL bootstrap controls (appended; does not disturb your order) --------
     booleanParam(
       name: 'CN_BOOTSTRAP',
       defaultValue: false,
@@ -193,7 +193,7 @@ pipeline {
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // CN servers use this key (root)
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'                    // fetch: do NOT untar
-    INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; overridden by param in stage env
+    INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; overridden by param
   }
 
   stages {
@@ -383,7 +383,6 @@ exit $rc
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 
-# pick first target host from SERVER_FILE; supports "name:ip:..." or "ip"
 HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
 if [[ -z "${HOST}" ]]; then
   echo "[cluster-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
