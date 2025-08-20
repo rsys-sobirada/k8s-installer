@@ -18,7 +18,7 @@ properties([
       omitValueField: true,
       script: [
         $class: 'GroovyScript',
-        script: [ // SecureGroovyScript
+        script: [
           script: '''
 def mode = (INSTALL_MODE ?: "").toString()
 if (mode == 'Fresh_installation') return ""
@@ -54,34 +54,12 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
            defaultValue: '/home/labadmin',
            description: 'Base dir to place NEW_VERSION (and extract)'),
 
-    // Keep FETCH_BUILD as a normal boolean param
+    // Fetch toggle
     booleanParam(name: 'FETCH_BUILD',
            defaultValue: true,
            description: 'Fetch NEW_VERSION from build host to CN servers'),
 
-    // ---- TEMP: quick sanity check to show what AC "sees" for FETCH_BUILD ----
-    [
-      $class: 'DynamicReferenceParameter',
-      name: 'DEBUG_FETCH_SEEN',
-      description: 'What AC sees for FETCH_BUILD (temporary)',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def fbRaw = (FETCH_BUILD ?: "").toString()
-def fb = fbRaw.trim().toLowerCase()
-return "<b>FETCH_BUILD seen by AC:</b> '" + fb.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;") + "'"
-''',
-          sandbox: true, classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
-
-    // ---- The 4 build-source fields, conditional on FETCH_BUILD (names preserved) ----
+    // ---- Conditional build-source fields (visible only if FETCH_BUILD truthy) ----
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_HOST',
@@ -161,6 +139,7 @@ return """<select class='setting-input' name='value'>
       ]
     ],
 
+    // MASKED password field, conditional on FETCH_BUILD (still Active Choices, but masked)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_PASS',
@@ -176,7 +155,7 @@ def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
 return """<input type='password' class='setting-input' name='value' value=''/>"""
-''',
+""",
           sandbox: true,
           classpath: []
         ],
