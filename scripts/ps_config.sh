@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- required env (passed from Jenkins stage) ---
+# --- required env (exported by Jenkins stage) ---
 : "${SERVER_FILE:?missing}"
 : "${SSH_KEY:?missing}"
 : "${NEW_VERSION:?missing}"           # e.g. 6.3.0_EA2 or 6.3.0
@@ -21,7 +21,7 @@ esac
 
 echo "[ps_config] Using TARGET_IP=${ip_only}, capacitySetup=${cap}"
 
-# read first field as host/ip; tolerate name:ip:...
+# Parse hosts from SERVER_FILE (supports "name:ip:..." or just "ip/name")
 mapfile -t HOSTS < <(awk '
   NF && $1 !~ /^#/ {
     if (index($0,":")>0) { n=split($0,a,":"); print a[2] } else { print $1 }
@@ -55,7 +55,7 @@ fi
 
 echo "[remote] PS_ROOT=${PS_ROOT}"
 
-# find the yaml
+# find the yaml (support two common names)
 YAML=""
 for f in "${PS_ROOT}/global-values.yaml" "${PS_ROOT}/global-value.yaml"; do
   if [[ -f "$f" ]]; then YAML="$f"; break; fi
@@ -69,9 +69,9 @@ echo "[remote] YAML=${YAML}"
 cp -a "${YAML}" "${YAML}.bak"
 
 # update scalars (preserve indentation)
-sed -i -E "s|^(\\s*elasticHost:\\s*).*$|\\1${TARGET_IP}|"               "${YAML}"
-sed -i -E "s|^(\\s*capacitySetup:\\s*).*$|\\1\"${CAP}\"|"              "${YAML}"
-sed -i -E "s|^(\\s*ingressExtFQDN:\\s*).*$|\\1${TARGET_IP}.nip.io|"    "${YAML}"
+sed -i -E "s|^(\s*elasticHost:\s*).*$|\1${TARGET_IP}|"            "${YAML}"
+sed -i -E "s|^(\s*capacitySetup:\s*).*$|\1\"${CAP}\"|"           "${YAML}"
+sed -i -E "s|^(\s*ingressExtFQDN:\s*).*$|\1${TARGET_IP}.nip.io|" "${YAML}"
 
 # update metallb.L2Pool first list entry to "<IP>/32"
 awk -v ip="${TARGET_IP}" '
@@ -108,7 +108,7 @@ EOSSH
   echo "[ps_config][$host] done"
 }
 
-# iterate with simple retry
+# iterate hosts with simple retry
 for h in "${HOSTS[@]}"; do
   ok=0
   for attempt in 1 2 3; do
