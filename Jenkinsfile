@@ -18,7 +18,7 @@ properties([
       omitValueField: true,
       script: [
         $class: 'GroovyScript',
-        script: [
+        script: [ // SecureGroovyScript
           script: '''
 def mode = (INSTALL_MODE ?: "").toString()
 if (mode == 'Fresh_installation') return ""
@@ -59,10 +59,29 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
            defaultValue: true,
            description: 'Fetch NEW_VERSION from build host to CN servers'),
 
-    // ---- Helper: robust bool check for FETCH_BUILD (used by all 4 fields) ----
-    // NOTE: we inline the same snippet in each field so they are self-contained.
+    // ---- TEMP: quick sanity check to show what AC "sees" for FETCH_BUILD ----
+    [
+      $class: 'DynamicReferenceParameter',
+      name: 'DEBUG_FETCH_SEEN',
+      description: 'What AC sees for FETCH_BUILD (temporary)',
+      referencedParameters: 'FETCH_BUILD',
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
+def fbRaw = (FETCH_BUILD ?: "").toString()
+def fb = fbRaw.trim().toLowerCase()
+return "<b>FETCH_BUILD seen by AC:</b> '" + fb.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;") + "'"
+''',
+          sandbox: true, classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
+    ],
 
-    // ---- The 4 build-source fields, now conditional on FETCH_BUILD (names preserved) ----
+    // ---- The 4 build-source fields, conditional on FETCH_BUILD (names preserved) ----
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_HOST',
