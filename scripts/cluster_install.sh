@@ -3,7 +3,7 @@
 # Sequential install per server
 # - Uses NEW_BUILD_PATH as root (normalized to /<BASE>[/<TAG>])
 # - Pre-check: create /mnt/data{0,1,2} and clear contents
-# - Only untars TRILLIUM_5GCN_CNF_REL_<BASE>*.tar.gz (no BINs)
+# - Only untars TRILLIUM_5GCN_CNF_REL_<BASE>.tar.gz (no BINs)
 # - Preflight: ensure kube ports 6443/10257 are free
 # - Retries end-to-end per host (waits for TRILLIUM tar if fetch runs in parallel)
 # - SSH key auth to root@host
@@ -133,14 +133,19 @@ echo "[IP] ERROR: Could not plumb ${IP_CIDR} on any iface. Candidates tried: ${C
 exit 2
 RS
 
-# 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>/<TAG>, waiting for a tar if needed
+# 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>[/<TAG>], waiting for the exact tar if needed.
 #    On success, ECHO the actual TRILLIUM directory path to stdout (caller captures it).
 # $1=root_base_dir (normalized), $2=BASE, $3=TAG, $4=WAIT_SECS
 read -r -d '' ENSURE_TRILLIUM_EXTRACTED <<'RS' || true
 set -euo pipefail
 ROOT="$1"; BASE="$2"; TAG="$3"; WAIT="${4:-0}"
-DEST_DIR="$ROOT/$BASE/$TAG"
 
+# Build destination dir safely (no trailing slash when TAG is empty)
+if [[ -n "$TAG" ]]; then
+  DEST_DIR="$ROOT/$BASE/$TAG"
+else
+  DEST_DIR="$ROOT/$BASE"
+fi
 mkdir -p "$DEST_DIR"
 shopt -s nullglob
 
@@ -148,37 +153,36 @@ shopt -s nullglob
 matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
 if (( ${#matches[@]} )); then
   echo "[TRIL] Found existing dir: ${matches[0]}"
-  # print path for caller
   echo "${matches[0]}"
   exit 0
 fi
 
-# Candidate tars: exact + any suffix
-tars=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz" "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*.tar.gz )
+# We ONLY accept the exact tarball name (no wildcards)
+tarball="$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz"
 
-# Wait for any tar to appear
-elapsed=0; interval=3; found_tar=""
-while :; do
-  for f in "${tars[@]}"; do
-    if [[ -s "$f" ]]; then found_tar="$f"; break; fi
-  done
-  [[ -n "$found_tar" || $elapsed -ge $WAIT ]] && break
-  echo "[TRIL] Waiting for tar in $DEST_DIR ... (${elapsed}/${WAIT}s)"
+# Wait for the tarball to appear (if fetch running in parallel)
+elapsed=0; interval=3
+while [[ ! -s "$tarball" && $elapsed -lt $WAIT ]]; do
+  echo "[TRIL] Waiting for $tarball ... (${elapsed}/${WAIT}s)"
   sleep "$interval"; elapsed=$((elapsed+interval))
 done
 
-if [[ -z "$found_tar" ]]; then
-  echo "[ERROR] No TRILLIUM tar found in $DEST_DIR after ${WAIT}s"; exit 2
+if [[ ! -s "$tarball" ]]; then
+  echo "[ERROR] Required tarball not found: $tarball (waited ${WAIT}s)"
+  exit 2
 fi
 
-echo "[TRIL] Extracting $(basename "$found_tar") into $DEST_DIR ..."
-tar -C "$DEST_DIR" -xzf "$found_tar"
+# Minimal tool sanity
+command -v tar >/dev/null 2>&1 || { echo "[ERROR] tar not found on host"; exit 2; }
+command -v gzip >/dev/null 2>&1 || { echo "[WARN] gzip not found; continuing (tar -xzf may still work)"; }
+
+echo "[TRIL] Extracting $(basename "$tarball") into $DEST_DIR ..."
+tar -C "$DEST_DIR" -xzf "$tarball"
 
 # Verify again
 matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
 [[ ${#matches[@]} -gt 0 ]] || { echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2; }
 echo "[TRIL] Extracted dir: ${matches[0]}"
-# print path for caller
 echo "${matches[0]}"
 RS
 
@@ -299,7 +303,12 @@ RS
     )" || TAG="EA1"
   fi
 
-  ROOT_BASE="$(normalize_root "$raw_base" "$BASE" "$TAG")"
+  # Build final root including tag (or base-only if no tag)
+  if [[ -n "$TAG" ]]; then
+    ROOT_BASE="$(normalize_root "$raw_base" "$BASE" "$TAG")"
+  else
+    ROOT_BASE="$(normalize_root "$raw_base" "$BASE")"
+  fi
 
   echo ""
   echo "🧩 Host:  $host"
@@ -311,7 +320,7 @@ RS
   while (( attempt <= INSTALL_RETRY_COUNT )); do
     echo "🚀 Install attempt $attempt/$INSTALL_RETRY_COUNT on $host"
 
-    # Ensure TRILLIUM present & extracted (waits for tar if fetch is still running)
+    # Ensure TRILLIUM present & extracted (waits for exact tar if fetch is still running)
     TRIL_DIR="$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$ROOT_BASE" "$BASE" "$TAG" "$BUILD_WAIT_SECS" <<<"$ENSURE_TRILLIUM_EXTRACTED" | tail -n1 || true)"
     if [[ -z "$TRIL_DIR" ]]; then
       echo "⚠️  TRILLIUM not ready on $host (attempt $attempt)"
