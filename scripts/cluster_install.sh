@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # scripts/cluster_install.sh
 # Sequential install per server
 # - Uses NEW_BUILD_PATH as root (normalized to /<BASE>[/<TAG>])
@@ -8,7 +8,7 @@
 # - Retries end-to-end per host (waits for TRILLIUM tar if fetch runs in parallel)
 # - SSH key auth to root@host
 # - Success judged by kubectl health, not installer RC
-# - Abort trap: kills remote activity and frees kube ports on pipeline abort
+# - Abort trap: kills remote activity on pipeline abort
 
 set -euo pipefail
 
@@ -36,9 +36,9 @@ require NEW_BUILD_PATH  "/home/labadmin"
 : "${INSTALL_IP_IFACE:=}"
 
 # Retries / waits
-: "${INSTALL_RETRY_COUNT:=3}"           # attempts per host
-: "${INSTALL_RETRY_DELAY_SECS:=20}"     # delay between attempts
-: "${BUILD_WAIT_SECS:=300}"             # wait for TRILLIUM tar (fetch may be parallel)
+: "${INSTALL_RETRY_COUNT:=3}"
+: "${INSTALL_RETRY_DELAY_SECS:=20}"
+: "${BUILD_WAIT_SECS:=300}"
 
 [[ -f "$SSH_KEY" ]] || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
 chmod 600 "$SSH_KEY" || true
@@ -92,7 +92,7 @@ prep /mnt/data0; prep /mnt/data1; prep /mnt/data2
 echo "[MNT] Prepared /mnt/data{0,1,2} (created if missing, contents cleared)"
 RS
 
-# 1) Ensure alias IP exists (robust: try forced iface, default-route iface, then physical NICs)
+# 1) Ensure alias IP exists (try forced iface, then default-route, then candidates)
 read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
 set -euo pipefail
 IP_CIDR="$1"; FORCE_IFACE="${2-}"
@@ -133,14 +133,13 @@ echo "[IP] ERROR: Could not plumb ${IP_CIDR} on any iface. Candidates tried: ${C
 exit 2
 RS
 
-# 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>[/<TAG>], waiting for the exact tar if needed.
-#    On success, ECHO the actual TRILLIUM directory path to stdout (caller captures it).
+# 2) Ensure ONLY TRILLIUM extracted; echo extracted directory
 # $1=root_base_dir (normalized), $2=BASE, $3=TAG, $4=WAIT_SECS
 read -r -d '' ENSURE_TRILLIUM_EXTRACTED <<'RS' || true
 set -euo pipefail
-ROOT="$1"; BASE="$2"; TAG="$3"; WAIT="${4:-0}"
+ROOT="$1"; BASE="$2"; TAG="${3:-}"; WAIT="${4:-0}"
 
-# Build destination dir safely (no trailing slash when TAG is empty)
+# Build destination dir (handle empty TAG)
 if [[ -n "$TAG" ]]; then
   DEST_DIR="$ROOT/$BASE/$TAG"
 else
@@ -149,18 +148,20 @@ fi
 mkdir -p "$DEST_DIR"
 shopt -s nullglob
 
-# If already extracted (any suffix) → done
-matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
-if (( ${#matches[@]} )); then
-  echo "[TRIL] Found existing dir: ${matches[0]}"
-  echo "${matches[0]}"
+# Already extracted? (directories only)
+dir_matches=()
+for f in "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*; do
+  [[ -d "$f" ]] && dir_matches+=("$f")
+done
+if (( ${#dir_matches[@]} )); then
+  echo "[TRIL] Found existing dir: ${dir_matches[0]}"
+  echo "${dir_matches[0]}"
   exit 0
 fi
 
-# We ONLY accept the exact tarball name (no wildcards)
+# Exact tarball name only
 tarball="$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz"
 
-# Wait for the tarball to appear (if fetch running in parallel)
 elapsed=0; interval=3
 while [[ ! -s "$tarball" && $elapsed -lt $WAIT ]]; do
   echo "[TRIL] Waiting for $tarball ... (${elapsed}/${WAIT}s)"
@@ -172,18 +173,20 @@ if [[ ! -s "$tarball" ]]; then
   exit 2
 fi
 
-# Minimal tool sanity
 command -v tar >/dev/null 2>&1 || { echo "[ERROR] tar not found on host"; exit 2; }
-command -v gzip >/dev/null 2>&1 || { echo "[WARN] gzip not found; continuing (tar -xzf may still work)"; }
 
 echo "[TRIL] Extracting $(basename "$tarball") into $DEST_DIR ..."
 tar -C "$DEST_DIR" -xzf "$tarball"
 
-# Verify again
-matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
-[[ ${#matches[@]} -gt 0 ]] || { echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2; }
-echo "[TRIL] Extracted dir: ${matches[0]}"
-echo "${matches[0]}"
+# Verify extracted directory exists (directories only)
+dir_matches=()
+for f in "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*; do
+  [[ -d "$f" ]] && dir_matches+=("$f")
+done
+[[ ${#dir_matches[@]} -gt 0 ]] || { echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2; }
+
+echo "[TRIL] Extracted dir: ${dir_matches[0]}"
+echo "${dir_matches[0]}"
 RS
 
 # 3) Preflight: ensure kube ports are free (6443/10257)
@@ -303,7 +306,6 @@ RS
     )" || TAG="EA1"
   fi
 
-  # Build final root including tag (or base-only if no tag)
   if [[ -n "$TAG" ]]; then
     ROOT_BASE="$(normalize_root "$raw_base" "$BASE" "$TAG")"
   else
@@ -313,14 +315,14 @@ RS
   echo ""
   echo "🧩 Host:  $host"
   echo "📁 Root:  $ROOT_BASE (from NEW_BUILD_PATH)"
-  echo "🏷️  Tag:   $TAG"
+  echo "🏷️  Tag:   ${TAG:-<none>}"
 
   # Attempt loop
   attempt=1
   while (( attempt <= INSTALL_RETRY_COUNT )); do
     echo "🚀 Install attempt $attempt/$INSTALL_RETRY_COUNT on $host"
 
-    # Ensure TRILLIUM present & extracted (waits for exact tar if fetch is still running)
+    # Ensure TRILLIUM present & extracted (waits for tar if fetch is still running)
     TRIL_DIR="$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$ROOT_BASE" "$BASE" "$TAG" "$BUILD_WAIT_SECS" <<<"$ENSURE_TRILLIUM_EXTRACTED" | tail -n1 || true)"
     if [[ -z "$TRIL_DIR" ]]; then
       echo "⚠️  TRILLIUM not ready on $host (attempt $attempt)"
