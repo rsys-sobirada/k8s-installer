@@ -3,7 +3,7 @@
 # - BUILD host: password-based auth via sshpass (BUILD_SRC_PASS)
 # - CN servers: key-based auth (CN_SSH_KEY), default user root
 # - Destination on CN: derived from NEW_BUILD_PATH + /<BASE>[/<TAG>]
-# - No extraction here (EXTRACT_BUILD_TARBALLS is ignored on purpose)
+# - Extraction: controlled by EXTRACT_BUILD_TARBALLS (true/yes/y/1)
 
 set -euo pipefail
 
@@ -35,6 +35,9 @@ require BUILD_SRC_HOST "172.26.2.96"
 require BUILD_SRC_USER "labadmin"
 require BUILD_SRC_BASE "/CNBuild/6.3.0_EA2"
 require CN_SSH_KEY     "/var/lib/jenkins/.ssh/jenkins_key"
+
+# Default extraction toggle (existing env wins if set)
+EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS:-false}"
 
 # BUILD_SRC_PASS is required for password auth
 if [[ -z "${BUILD_SRC_PASS:-}" ]]; then
@@ -171,7 +174,26 @@ while IFS= read -r raw || [[ -n "${raw:-}" ]]; do
     echo "❌ Copy verification failed for $TRIL_FILE on $host_ip:$DEST_DIR"; any_failed=1; echo; continue
   fi
 
-  # No extraction here — install stage will handle TRILLIUM untar
+  # --------- NEW: Optional extraction on CN (controlled by EXTRACT_BUILD_TARBALLS) ---------
+  if bool_yes "$EXTRACT_BUILD_TARBALLS"; then
+    echo "🗜️  Extracting $TRIL_FILE on ${host_ip}:${DEST_DIR}"
+    # Extract into DEST_DIR; tolerate re-run if directory already exists
+    if ! "${SSH_CN[@]}" "${CN_USER}@${host_ip}" "cd '$DEST_DIR' && tar -xvzf '$TRIL_FILE'"; then
+      echo "❌ Failed to extract $TRIL_FILE on $host_ip"; any_failed=1; echo; continue
+    fi
+
+    # Quick post-check: directory should exist after untar
+    TRIL_DIR="TRILLIUM_5GCN_CNF_REL_${BASE}"
+    if ! "${SSH_CN[@]}" "${CN_USER}@${host_ip}" "test -d '$DEST_DIR/$TRIL_DIR'"; then
+      echo "⚠️  Extraction completed but '$TRIL_DIR' directory not found on $host_ip (proceeding)"
+    else
+      echo "✅ Extracted into $DEST_DIR/$TRIL_DIR on $host_ip"
+    fi
+  else
+    echo "ℹ️  Skipping extraction (EXTRACT_BUILD_TARBALLS=$EXTRACT_BUILD_TARBALLS)."
+  fi
+  # ----------------------------------------------------------------------
+
   echo "✅ Build files staged on ${host_ip}:${DEST_DIR}"
   echo
 done < "$SERVER_FILE"
