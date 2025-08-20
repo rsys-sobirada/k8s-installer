@@ -167,7 +167,19 @@ return """<input type='password' class='setting-input' name='value' value=''/>""
     // 12) Alias IP/CIDR
     string(name: 'INSTALL_IP_ADDR',
            defaultValue: '10.10.10.20/24',
-           description: 'Alias IP/CIDR to plumb on CN servers')
+           description: 'Alias IP/CIDR to plumb on CN servers'),
+
+    // --- Optional: CN SSH bootstrap for new servers (kept at the end to not disturb your order) ---
+    booleanParam(
+      name: 'CN_BOOTSTRAP',
+      defaultValue: false,
+      description: 'If true, push Jenkins SSH key to CN hosts before fetch (needs CN_BOOTSTRAP_PASS)'
+    ),
+    password(
+      name: 'CN_BOOTSTRAP_PASS',
+      defaultValue: '',
+      description: 'One-time CN root password, used only when CN_BOOTSTRAP=true'
+    )
   ])
 ])
 
@@ -184,8 +196,6 @@ pipeline {
     INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; overridden by param in stage env
   }
 
-  // NOTE: no parameters{} block here — using properties([...]) above.
-
   stages {
     stage('Checkout') {
       steps { checkout scm }
@@ -197,6 +207,80 @@ pipeline {
           if (params.INSTALL_MODE != 'Fresh_installation' && !params.OLD_BUILD_PATH_UI?.trim()) {
             error "OLD_BUILD_PATH is required for ${params.INSTALL_MODE}"
           }
+        }
+      }
+    }
+
+    // ---------- Optional: bootstrap SSH keys on new CN servers ----------
+    stage('CN SSH bootstrap (optional)') {
+      when { expression { return params.CN_BOOTSTRAP } }
+      steps {
+        timeout(time: 10, unit: 'MINUTES', activity: true) {
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${CN_BOOTSTRAP_PASS:-}" ]]; then
+  echo "[bootstrap] CN_BOOTSTRAP is true but CN_BOOTSTRAP_PASS is empty; nothing to do."
+  exit 0
+fi
+
+if ! command -v sshpass >/dev/null 2>&1; then
+  echo "[bootstrap] ERROR: sshpass is required on this Jenkins agent to perform password-based bootstrap." >&2
+  exit 2
+fi
+
+# Ensure we have a public key to install on CN hosts.
+if [[ ! -s "${SSH_KEY}.pub" ]]; then
+  echo "[bootstrap] ${SSH_KEY}.pub not found; generating from private key..."
+  ssh-keygen -y -f "${SSH_KEY}" > "${SSH_KEY}.pub"
+fi
+PUBKEY_CONTENT="$(cat "${SSH_KEY}.pub")"
+
+# Parse first column as host; allow lines like "name:ip:..." or just "ip"
+mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/ {
+  if (index($0,":")>0) { n=split($0,a,":"); print a[2] } else { print $1 }
+}' "${SERVER_FILE}")
+
+if ((${#HOSTS[@]}==0)); then
+  echo "[bootstrap] ERROR: No hosts parsed from ${SERVER_FILE}" >&2
+  exit 1
+fi
+
+bootstrap_host() {
+  local host="$1"
+  echo "[bootstrap][$host] Testing key-based SSH..."
+  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true 2>/dev/null; then
+    echo "[bootstrap][$host] Key-based SSH already works."
+    return 0
+  fi
+
+  echo "[bootstrap][$host] Key-based SSH failed; attempting password bootstrap..."
+  sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no "root@${host}" bash -lc '
+    set -euo pipefail
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+  '
+
+  sshpass -p "${CN_BOOTSTRAP_PASS}" bash -c "printf %s '${PUBKEY_CONTENT}' | ssh -o StrictHostKeyChecking=no root@${host} 'cat >> /root/.ssh/authorized_keys'"
+
+  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true 2>/dev/null; then
+    echo "[bootstrap][$host] ✅ Key-based SSH enabled."
+    return 0
+  else
+    echo "[bootstrap][$host] ❌ Still cannot SSH with key; check root login policies or passwords." >&2
+    return 1
+  fi
+}
+
+rc=0
+for h in "${HOSTS[@]}"; do
+  if ! bootstrap_host "$h"; then rc=1; fi
+done
+
+exit $rc
+'''
         }
       }
     }
@@ -292,119 +376,131 @@ pipeline {
       }
     }
 
-    // ---------- Health check after cluster install (bash shebang) ----------
+    // ---------- Health check after cluster install (run kubectl on CN host) ----------
     stage('Cluster health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 
-NOT_OK=0
-while read -r ns name ready status rest; do
-  x="${ready%%/*}"; y="${ready##*/}"
-  if [[ "$status" != "Running" || "$x" != "$y" ]]; then
-    echo "[cluster-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
-    NOT_OK=1
-  fi
-done < <(kubectl get pods -A --no-headers)
-
-if [[ "$NOT_OK" -eq 0 ]]; then
-  echo "[cluster-health] ✅ All pods Running & Ready."
-  exit 0
+# pick first target host from SERVER_FILE; supports "name:ip:..." or "ip"
+HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
+if [[ -z "${HOST}" ]]; then
+  echo "[cluster-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
+  exit 2
 fi
+echo "[cluster-health] Using host ${HOST} for kubectl checks"
 
-echo "[cluster-health] Pods not healthy, waiting 300s and retrying..."
-sleep 300
+ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
+  set -euo pipefail
+  check() {
+    local notok=0
+    while read -r ns name ready status rest; do
+      x="${ready%%/*}"; y="${ready##*/}"
+      if [[ "$status" != "Running" || "$x" != "$y" ]]; then
+        echo "[cluster-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
+        notok=1
+      fi
+    done < <(kubectl get pods -A --no-headers)
+    return $notok
+  }
 
-NOT_OK=0
-while read -r ns name ready status rest; do
-  x="${ready%%/*}"; y="${ready##*/}"
-  if [[ "$status" != "Running" || "$x" != "$y" ]]; then
-    echo "[cluster-health] (retry) $ns/$name still not healthy (READY=$ready STATUS=$status)"
-    NOT_OK=1
+  if check; then
+    echo "[cluster-health] ✅ All pods Running & Ready."
+    exit 0
   fi
-done < <(kubectl get pods -A --no-headers)
 
-if [[ "$NOT_OK" -ne 0 ]]; then
-  echo "[cluster-health] ❌ Pods still not healthy after 5 minutes."
-  kubectl get pods -A
-  exit 1
-fi
+  echo "[cluster-health] Pods not healthy, waiting 300s and retrying..."
+  sleep 300
 
-echo "[cluster-health] ✅ Healthy after retry."
+  if check; then
+    echo "[cluster-health] ✅ Healthy after retry."
+    exit 0
+  else
+    echo "[cluster-health] ❌ Pods still not healthy after 5 minutes."
+    kubectl get pods -A
+    exit 1
+  fi
+'
 '''
         }
       }
     }
 
-    // ---------- PS config & install (separate script) ----------
+    // ---------- PS config & install (separate script; force bash) ----------
     stage('PS config & install') {
       steps {
         timeout(time: 30, unit: 'MINUTES', activity: true) {
-          sh '''
-            set -euo pipefail
-            sed -i 's/\r$//' scripts/ps_config.sh || true
-            chmod +x scripts/ps_config.sh
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
 
-            env \
-              SERVER_FILE="${SERVER_FILE}" \
-              SSH_KEY="${SSH_KEY}" \
-              NEW_VERSION="${NEW_VERSION}" \
-              NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-              INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
-              DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-            bash -euo pipefail scripts/ps_config.sh
-          '''
+sed -i 's/\r$//' scripts/ps_config.sh || true
+chmod +x scripts/ps_config.sh
+
+env \
+  SERVER_FILE="${SERVER_FILE}" \
+  SSH_KEY="${SSH_KEY}" \
+  NEW_VERSION="${NEW_VERSION}" \
+  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+  INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
+  DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+bash -euo pipefail scripts/ps_config.sh
+'''
         }
       }
     }
 
-    // ---------- Health check after PS install (bash shebang) ----------
+    // ---------- Health check after PS install (run kubectl on CN host) ----------
     stage('PS health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 
-NOT_OK=0
-while read -r ns name ready status rest; do
-  x="${ready%%/*}"; y="${ready##*/}"
-  if [[ "$status" != "Running" || "$x" != "$y" ]]; then
-    echo "[ps-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
-    NOT_OK=1
-  fi
-done < <(kubectl get pods -A --no-headers)
-
-if [[ "$NOT_OK" -eq 0 ]]; then
-  echo "[ps-health] ✅ All pods Running & Ready."
-  exit 0
+HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
+if [[ -z "${HOST}" ]]; then
+  echo "[ps-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
+  exit 2
 fi
+echo "[ps-health] Using host ${HOST} for kubectl checks"
 
-echo "[ps-health] Pods not healthy, waiting 300s and retrying..."
-sleep 300
+ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
+  set -euo pipefail
+  check() {
+    local notok=0
+    while read -r ns name ready status rest; do
+      x="${ready%%/*}"; y="${ready##*/}"
+      if [[ "$status" != "Running" || "$x" != "$y" ]]; then
+        echo "[ps-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
+        notok=1
+      fi
+    done < <(kubectl get pods -A --no-headers)
+    return $notok
+  }
 
-NOT_OK=0
-while read -r ns name ready status rest; do
-  x="${ready%%/*}"; y="${ready##*/}"
-  if [[ "$status" != "Running" || "$x" != "$y" ]]; then
-    echo "[ps-health] (retry) $ns/$name still not healthy (READY=$ready STATUS=$status)"
-    NOT_OK=1
+  if check; then
+    echo "[ps-health] ✅ All pods Running & Ready."
+    exit 0
   fi
-done < <(kubectl get pods -A --no-headers)
 
-if [[ "$NOT_OK" -ne 0 ]]; then
-  echo "[ps-health] ❌ Pods still not healthy after 5 minutes."
-  kubectl get pods -A
-  exit 1
-fi
+  echo "[ps-health] Pods not healthy, waiting 300s and retrying..."
+  sleep 300
 
-echo "[ps-health] ✅ Healthy after retry."
+  if check; then
+    echo "[ps-health] ✅ Healthy after retry."
+    exit 0
+  else
+    echo "[ps-health] ❌ Pods still not healthy after 5 minutes."
+    kubectl get pods -A
+    exit 1
+  fi
+'
 '''
         }
       }
     }
 
-    // (You can add CS/NF stages next using the same pattern.)
+    // (Add CS/NF stages next using the same pattern.)
   }
 
   post {
