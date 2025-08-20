@@ -139,7 +139,7 @@ return """<select class='setting-input' name='value'>
       ]
     ],
 
-    // MASKED password field, conditional on FETCH_BUILD (still Active Choices, but masked)
+    // MASKED password field, conditional on FETCH_BUILD
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_PASS',
@@ -155,7 +155,7 @@ def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
 return """<input type='password' class='setting-input' name='value' value=''/>"""
-""",
+''',
           sandbox: true,
           classpath: []
         ],
@@ -211,7 +211,7 @@ pipeline {
               sh '''
                 set -eu
                 echo ">>> Cluster reset starting (INSTALL_MODE=Upgrade_with_cluster_reset)"
-                sed -i 's/\\r$//' scripts/cluster_reset.sh || true
+                sed -i 's/\r$//' scripts/cluster_reset.sh || true
                 chmod +x scripts/cluster_reset.sh
                 env \
                   CLUSTER_RESET=true \
@@ -237,7 +237,7 @@ pipeline {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
               sh '''
                 set -eu
-                sed -i 's/\\r$//' scripts/fetch_build.sh || true
+                sed -i 's/\r$//' scripts/fetch_build.sh || true
                 chmod +x scripts/fetch_build.sh
 
                 # We ONLY use password auth for the BUILD host.
@@ -274,7 +274,7 @@ pipeline {
           sh '''
             set -eu
             echo ">>> Cluster install starting (mode: ${INSTALL_MODE})"
-            sed -i 's/\\r$//' scripts/cluster_install.sh || true
+            sed -i 's/\r$//' scripts/cluster_install.sh || true
             chmod +x scripts/cluster_install.sh
             env \
               NEW_VERSION="${NEW_VERSION}" \
