@@ -1,14 +1,21 @@
 // ================== Parameters (Active Choices + existing names preserved) ==================
 properties([
   parameters([
-    // ---- 3-mode selector (controls reset & OLD_BUILD_PATH visibility) ----
+    // 1) Deployment type
+    choice(
+      name: 'DEPLOYMENT_TYPE',
+      choices: 'Low\nMedium\nHigh',
+      description: 'Deployment type'
+    ),
+
+    // 2) Install mode (controls OLD_BUILD_PATH visibility)
     choice(
       name: 'INSTALL_MODE',
       choices: 'Upgrade_with_cluster_reset\nUpgrade_without_cluster_reset\nFresh_installation',
       description: 'Select installation mode'
     ),
 
-    // OLD_BUILD_PATH shown only for Upgrade_* modes
+    // 3) OLD_BUILD_PATH shown only for Upgrade_* modes
     [
       $class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
@@ -35,31 +42,27 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
       ]
     ],
 
-    // ---------------- Your existing parameters (names/choices unchanged) ----------------
-    choice(
-      name: 'DEPLOYMENT_TYPE',
-      choices: 'Low\nMedium\nHigh',
-      description: 'Deployment type'
-    ),
-
-    choice(name: 'NEW_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
-           description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'),
-
-    choice(name: 'OLD_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
-           description: 'Existing bundle (used if upgrading)'),
-
+    // 4) New build path
     string(name: 'NEW_BUILD_PATH',
            defaultValue: '/home/labadmin',
            description: 'Base dir to place NEW_VERSION (and extract)'),
 
-    // Fetch toggle
+    // 5) New version
+    choice(name: 'NEW_VERSION',
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+           description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'),
+
+    // 6) Old version
+    choice(name: 'OLD_VERSION',
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+           description: 'Existing bundle (used if upgrading)'),
+
+    // 7) Fetch toggle
     booleanParam(name: 'FETCH_BUILD',
            defaultValue: true,
            description: 'Fetch NEW_VERSION from build host to CN servers'),
 
-    // ---- Conditional build-source fields (visible only if FETCH_BUILD truthy) ----
+    // 8) Host (visible only if FETCH_BUILD truthy)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_HOST',
@@ -86,6 +89,7 @@ return """<select class='setting-input' name='value'>
       ]
     ],
 
+    // 9) User (visible only if FETCH_BUILD truthy)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_USER',
@@ -112,6 +116,7 @@ return """<select class='setting-input' name='value'>
       ]
     ],
 
+    // 10) Base path (visible only if FETCH_BUILD truthy)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_BASE',
@@ -139,7 +144,7 @@ return """<select class='setting-input' name='value'>
       ]
     ],
 
-    // MASKED password field, conditional on FETCH_BUILD
+    // 11) Password (masked; visible only if FETCH_BUILD truthy)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_PASS',
@@ -163,6 +168,7 @@ return """<input type='password' class='setting-input' name='value' value=''/>""
       ]
     ],
 
+    // 12) Alias IP/CIDR
     string(name: 'INSTALL_IP_ADDR',
            defaultValue: '10.10.10.20/24',
            description: 'Alias IP/CIDR to plumb on CN servers')
