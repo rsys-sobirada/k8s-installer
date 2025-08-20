@@ -1,4 +1,4 @@
-// ================== Parameters (Active Choices + existing names preserved) ==================
+// ================== Parameters (Active Choices, ordered exactly as requested) ==================
 properties([
   parameters([
     // 1) Deployment type
@@ -34,11 +34,7 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
           sandbox: true,
           classpath: []
         ],
-        fallbackScript: [
-          script: 'return ""',
-          sandbox: true,
-          classpath: []
-        ]
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
       ]
     ],
 
@@ -144,7 +140,9 @@ return """<select class='setting-input' name='value'>
       ]
     ],
 
-    // 11) Password (masked; visible only if FETCH_BUILD truthy)
+    // 11) Password (masked-looking; visible only if FETCH_BUILD truthy)
+    // NOTE: Active Choices cannot render the native "blue" password widget.
+    // This remains conditional & masked in the browser; avoid echoing the value in logs.
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_PASS',
@@ -198,7 +196,6 @@ pipeline {
     stage('Validate inputs') {
       steps {
         script {
-          // OLD_BUILD_PATH required only for upgrade modes
           if (params.INSTALL_MODE != 'Fresh_installation' && !params.OLD_BUILD_PATH_UI?.trim()) {
             error "OLD_BUILD_PATH is required for ${params.INSTALL_MODE}"
           }
@@ -209,9 +206,7 @@ pipeline {
     stage('Reset &/or Fetch (parallel)') {
       parallel {
         stage('Cluster reset (auto from INSTALL_MODE)') {
-          when {
-            expression { return params.INSTALL_MODE == 'Upgrade_with_cluster_reset' }
-          }
+          when { expression { return params.INSTALL_MODE == 'Upgrade_with_cluster_reset' } }
           steps {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
               sh '''
@@ -298,6 +293,119 @@ pipeline {
         }
       }
     }
+
+    // ---------- Health check after cluster install ----------
+    stage('Cluster health check') {
+      steps {
+        timeout(time: 10, unit: 'MINUTES', activity: true) {
+          sh '''
+            set -euo pipefail
+            # First check
+            NOT_OK=0
+            while read -r ns name ready status rest; do
+              x="${ready%%/*}"; y="${ready##*/}"
+              if [ "$status" != "Running" ] || [ "$x" != "$y" ]; then
+                echo "[cluster-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
+                NOT_OK=1
+              fi
+            done < <(kubectl get pods -A --no-headers)
+
+            if [ "$NOT_OK" -eq 0 ]; then
+              echo "[cluster-health] ✅ All pods Running & Ready."
+              exit 0
+            fi
+
+            echo "[cluster-health] Pods not healthy, waiting 300s and retrying..."
+            sleep 300
+
+            NOT_OK=0
+            while read -r ns name ready status rest; do
+              x="${ready%%/*}"; y="${ready##*/}"
+              if [ "$status" != "Running" ] || [ "$x" != "$y" ]; then
+                echo "[cluster-health] (retry) $ns/$name still not healthy (READY=$ready STATUS=$status)"
+                NOT_OK=1
+              fi
+            done < <(kubectl get pods -A --no-headers)
+
+            if [ "$NOT_OK" -ne 0 ]; then
+              echo "[cluster-health] ❌ Pods still not healthy after 5 minutes."
+              kubectl get pods -A
+              exit 1
+            fi
+
+            echo "[cluster-health] ✅ Healthy after retry."
+          '''
+        }
+      }
+    }
+
+    // ---------- PS config & install ----------
+    stage('PS config & install') {
+      steps {
+        timeout(time: 30, unit: 'MINUTES', activity: true) {
+          sh '''
+            set -euo pipefail
+            sed -i 's/\r$//' scripts/ps_config.sh || true
+            chmod +x scripts/ps_config.sh
+
+            env \
+              SERVER_FILE="${SERVER_FILE}" \
+              SSH_KEY="${SSH_KEY}" \
+              NEW_VERSION="${NEW_VERSION}" \
+              NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+              INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
+              DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+            bash -euo pipefail scripts/ps_config.sh
+          '''
+        }
+      }
+    }
+
+    // ---------- Health check after PS install ----------
+    stage('PS health check') {
+      steps {
+        timeout(time: 10, unit: 'MINUTES', activity: true) {
+          sh '''
+            set -euo pipefail
+            NOT_OK=0
+            while read -r ns name ready status rest; do
+              x="${ready%%/*}"; y="${ready##*/}"
+              if [ "$status" != "Running" ] || [ "$x" != "$y" ]; then
+                echo "[ps-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
+                NOT_OK=1
+              fi
+            done < <(kubectl get pods -A --no-headers)
+
+            if [ "$NOT_OK" -eq 0 ]; then
+              echo "[ps-health] ✅ All pods Running & Ready."
+              exit 0
+            fi
+
+            echo "[ps-health] Pods not healthy, waiting 300s and retrying..."
+            sleep 300
+
+            NOT_OK=0
+            while read -r ns name ready status rest; do
+              x="${ready%%/*}"; y="${ready##*/}"
+              if [ "$status" != "Running" ] || [ "$x" != "$y" ]; then
+                echo "[ps-health] (retry) $ns/$name still not healthy (READY=$ready STATUS=$status)"
+                NOT_OK=1
+              fi
+            done < <(kubectl get pods -A --no-headers)
+
+            if [ "$NOT_OK" -ne 0 ]; then
+              echo "[ps-health] ❌ Pods still not healthy after 5 minutes."
+              kubectl get pods -A
+              exit 1
+            fi
+
+            echo "[ps-health] ✅ Healthy after retry."
+          '''
+        }
+      }
+    }
+
+    // (Next: add CS / NF stages after these health checks as needed)
   }
 
   post {
