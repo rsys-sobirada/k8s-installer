@@ -2,14 +2,12 @@
 # scripts/cluster_install.sh
 # Sequential install per server
 # - Uses NEW_BUILD_PATH as root (normalized to /<BASE>[/<TAG>])
-# - Pre-check: create /mnt/data{0,1,2} and clear contents
-# - Only untars TRILLIUM_5GCN_CNF_REL_<BASE>.tar.gz (no BINs)
+# - Ensures ONLY TRILLIUM_5GCN_CNF_REL_<BASE>*.tar.gz is extracted (no BINs)
 # - Preflight: ensure kube ports 6443/10257 are free
-# - Retries end-to-end per host (waits for TRILLIUM tar if fetch runs in parallel)
-# - SSH key auth to root@host
-# - If SSH fails on Fresh_installation and CN_ROOT_PASS provided, auto-bootstrap ssh keys (sshpass + ssh-copy-id)
+# - Retries end-to-end per host (and waits for TRILLIUM tar if fetch runs in parallel)
+# - SSH key auth to root@host (with optional bootstrap on Fresh_installation)
 # - Success judged by kubectl health, not installer RC
-# - Abort trap: kills remote activity on pipeline abort
+# - Abort trap: stops remote activity on pipeline abort
 
 set -euo pipefail
 
@@ -35,14 +33,12 @@ require NEW_BUILD_PATH  "/home/labadmin"
 : "${INSTALL_SERVER_FILE:=server_pci_map.txt}"   # "name:ip" or just "ip"
 : "${INSTALL_IP_ADDR:=10.10.10.20/24}"           # leave empty to skip plumbing
 : "${INSTALL_IP_IFACE:=}"
-: "${INSTALL_MODE:=}"                             # Fresh_installation / Upgrade_*
-: "${CN_ROOT_USER:=root}"
-: "${CN_ROOT_PASS:=}"                             # if provided + Fresh_installation, we can auto-bootstrap ssh keys
+: "${INSTALL_MODE:=Fresh_installation}"           # Fresh_installation | Upgrade_without_cluster_reset | Upgrade_with_cluster_reset
 
 # Retries / waits
-: "${INSTALL_RETRY_COUNT:=3}"
-: "${INSTALL_RETRY_DELAY_SECS:=20}"
-: "${BUILD_WAIT_SECS:=300}"
+: "${INSTALL_RETRY_COUNT:=3}"           # attempts per host
+: "${INSTALL_RETRY_DELAY_SECS:=20}"     # delay between attempts
+: "${BUILD_WAIT_SECS:=300}"             # wait for TRILLIUM tar (fetch may be parallel)
 
 [[ -f "$SSH_KEY" ]] || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
 chmod 600 "$SSH_KEY" || true
@@ -53,85 +49,15 @@ SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o 
 BASE="$(base_ver "$NEW_VERSION")"
 TAG_IN="$(ver_tag "$NEW_VERSION")"
 
-# ---- ssh bootstrap (for Fresh_installation when password is provided) ----
-bootstrap_ssh_if_needed() {
-  local host="$1"
-
-  # Only on Fresh installation and only if we have a password to use
-  [[ "${INSTALL_MODE}" == "Fresh_installation" ]] || return 0
-  [[ -n "${CN_ROOT_PASS}" ]] || return 0
-
-  # Prefer IP from INSTALL_IP_ADDR (strip CIDR), else fall back to "host"
-  local alias_ip=""
-  if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
-    alias_ip="${INSTALL_IP_ADDR%%/*}"   # e.g., 10.10.10.20 from 10.10.10.20/24
-  fi
-  local target_ip="${alias_ip:-$host}"
-
-  # If we can already SSH with key to the target IP, nothing to do
-  if ssh $SSH_OPTS -i "$SSH_KEY" -o ConnectTimeout=5 "${CN_ROOT_USER}@${target_ip}" "echo ok" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  echo "[SSH-BOOTSTRAP] Setting up key-based access on ${target_ip} for ${CN_ROOT_USER} (Fresh_installation)"
-
-  # Need sshpass + ssh-copy-id on Jenkins agent
-  if ! command -v sshpass >/dev/null 2>&1; then
-    echo "❌ sshpass not found on Jenkins agent; cannot bootstrap SSH keys." >&2
-    return 1
-  fi
-  if ! command -v ssh-copy-id >/dev/null 2>&1; then
-    echo "❌ ssh-copy-id not found on Jenkins agent; cannot bootstrap SSH keys." >&2
-    return 1
-  fi
-
-  # Ensure local keypair exists
-  mkdir -p ~/.ssh
-  chmod 700 ~/.ssh || true
-  if [[ ! -s ~/.ssh/id_rsa ]]; then
-    ssh-keygen -q -t rsa -N '' -f ~/.ssh/id_rsa
-  fi
-
-  # We’ll try to install both ~/.ssh/id_rsa.pub and ${SSH_KEY}.pub if present
-  local publist=()
-  [[ -s ~/.ssh/id_rsa.pub ]] && publist+=("~/.ssh/id_rsa.pub")
-  [[ -s "${SSH_KEY}.pub"    ]] && publist+=("${SSH_KEY}.pub")
-
-  # Remove old known_hosts entry for the target IP
-  ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${target_ip}" >/dev/null 2>&1 || true
-
-  # Copy keys using password
-  for pub in "${publist[@]}"; do
-    echo "[SSH-BOOTSTRAP] Installing public key $(basename "$pub") on ${target_ip}"
-    if ! SSH_ASKPASS=/bin/false sshpass -p "${CN_ROOT_PASS}" \
-        ssh-copy-id -i "${pub/#\~/$HOME}" \
-        -o StrictHostKeyChecking=no -o PreferredAuthentications=password \
-        "${CN_ROOT_USER}@${target_ip}" >/dev/null 2>&1; then
-      echo "⚠️  ssh-copy-id failed for key $(basename "$pub") on ${target_ip} (continuing)"
-    fi
-  done
-
-  # Fallback: append id_rsa.pub directly
-  if ! ssh $SSH_OPTS -i "$SSH_KEY" -o ConnectTimeout=5 "${CN_ROOT_USER}@${target_ip}" "echo ok" >/dev/null 2>&1; then
-    echo "[SSH-BOOTSTRAP] Fallback: append local id_rsa.pub via sshpass"
-    sshpass -p "${CN_ROOT_PASS}" ssh -o StrictHostKeyChecking=no "${CN_ROOT_USER}@${target_ip}" \
-      "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
-      < ~/.ssh/id_rsa.pub || true
-  fi
-
-  # Restart sshd on the target (as per your steps)
-  sshpass -p "${CN_ROOT_PASS}" ssh -o StrictHostKeyChecking=no "${CN_ROOT_USER}@${target_ip}" "systemctl restart sshd" >/dev/null 2>&1 || true
-
-  # Final test using the pipeline SSH key
-  if ssh $SSH_OPTS -i "$SSH_KEY" -o ConnectTimeout=5 "${CN_ROOT_USER}@${target_ip}" "echo ok" >/dev/null 2>&1; then
-    echo "[SSH-BOOTSTRAP] ✅ Key-based access confirmed on ${target_ip}"
-    return 0
-  else
-    echo "[SSH-BOOTSTRAP] ❌ Still cannot SSH to ${target_ip} with key after bootstrap."
-    return 1
-  fi
-}
-
+echo "NEW_VERSION:      $NEW_VERSION"
+echo "NEW_BUILD_PATH:   $NEW_BUILD_PATH"
+echo "BASE version:     $BASE"
+[[ -n "$TAG_IN" ]] && echo "Provided TAG:   $TAG_IN" || echo "Provided TAG:   (none; will detect per host)"
+echo "INSTALL_LIST:     $INSTALL_SERVER_FILE"
+echo "IP to ensure:     ${INSTALL_IP_ADDR:-<skipped>}"
+echo "Install mode:     ${INSTALL_MODE}"
+[[ -n "$INSTALL_IP_IFACE" ]] && echo "Forced iface:    $INSTALL_IP_IFACE"
+echo "────────────────────────────────────────"
 
 # ---- Abort trap ----
 declare -a HOSTS_TOUCHED=()
@@ -142,7 +68,7 @@ on_abort() {
   echo ""
   echo "⚠️  Abort received — stopping remote actions on touched hosts..."
   for host in "${HOSTS_TOUCHED[@]}"; do
-    ssh $SSH_OPTS -i "$SSH_KEY" "${CN_ROOT_USER}@${host}" bash -s <<'RS'
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<'RS'
 set -euo pipefail
 pkill -f 'install_k8s\.sh|ansible-playbook|kubeadm|kubespray' 2>/dev/null || true
 systemctl stop kubelet || true
@@ -157,17 +83,65 @@ RS
 }
 trap on_abort INT TERM HUP QUIT
 
-echo "NEW_VERSION:      $NEW_VERSION"
-echo "NEW_BUILD_PATH:   $NEW_BUILD_PATH"
-echo "BASE version:     $BASE"
-[[ -n "$TAG_IN" ]] && echo "Provided TAG:   $TAG_IN" || echo "Provided TAG:   (none; will detect per host)"
-echo "INSTALL_LIST:     $INSTALL_SERVER_FILE"
-echo "IP to ensure:     ${INSTALL_IP_ADDR:-<skipped>}"
-[[ -n "${INSTALL_MODE:-}" ]] && echo "Install mode:     ${INSTALL_MODE}"
-[[ -n "$INSTALL_IP_IFACE" ]] && echo "Forced iface:    $INSTALL_IP_IFACE"
-echo "────────────────────────────────────────"
+# ---- SSH bootstrap for Fresh_installation (uses INSTALL_IP_ADDR IP) ----
+bootstrap_ssh_if_needed() {
+  local host="$1"
 
-# ---- remote snippets (unchanged core) ----
+  # Only for Fresh installations and only if we have a password to use
+  [[ "${INSTALL_MODE:-}" == "Fresh_installation" ]] || return 0
+  [[ -n "${CN_ROOT_PASS:-}" ]] || return 0
+
+  local ip_from_cidr=""
+  if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
+    ip_from_cidr="${INSTALL_IP_ADDR%%/*}"   # e.g. 10.10.10.20 from 10.10.10.20/24
+  fi
+  local target_ip="${ip_from_cidr:-$host}"
+  local user="${CN_ROOT_USER:-root}"
+
+  # Already OK with key?
+  if ssh $SSH_OPTS -i "$SSH_KEY" -o ConnectTimeout=5 "${user}@${target_ip}" "echo ok" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[SSH-BOOTSTRAP] Fresh_installation: setting up key access on ${target_ip} for ${user}"
+
+  # Tools needed on Jenkins agent
+  command -v sshpass >/dev/null 2>&1 || { echo "❌ sshpass missing"; return 1; }
+  command -v ssh-copy-id >/dev/null 2>&1 || { echo "❌ ssh-copy-id missing"; return 1; }
+
+  # Ensure a local key exists
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  [[ -s "$HOME/.ssh/id_rsa" ]] || ssh-keygen -q -t rsa -N '' -f "$HOME/.ssh/id_rsa"
+
+  # 1) copy id to target using password
+  SSH_ASKPASS=/bin/false sshpass -p "${CN_ROOT_PASS}" ssh-copy-id -i "$HOME/.ssh/id_rsa.pub" \
+    -o StrictHostKeyChecking=no -o PreferredAuthentications=password \
+    "${user}@${target_ip}" >/dev/null 2>&1 || true
+
+  # 2) ensure authorized_keys contains it (fallback append)
+  sshpass -p "${CN_ROOT_PASS}" ssh -o StrictHostKeyChecking=no "${user}@${target_ip}" \
+    "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
+    < "$HOME/.ssh/id_rsa.pub" || true
+
+  # 3) purge known_hosts entry for that IP on the Jenkins side
+  ssh-keygen -f "$HOME/.ssh/known_hosts" -R "${target_ip}" >/dev/null 2>&1 || true
+
+  # 4) restart sshd on the target
+  sshpass -p "${CN_ROOT_PASS}" ssh -o StrictHostKeyChecking=no "${user}@${target_ip}" "systemctl restart sshd" >/dev/null 2>&1 || true
+
+  # Final check with the pipeline key
+  if ssh $SSH_OPTS -i "$SSH_KEY" -o ConnectTimeout=5 "${user}@${target_ip}" "echo ok" >/dev/null 2>&1; then
+    echo "[SSH-BOOTSTRAP] ✅ Key-based access confirmed on ${target_ip}"
+    return 0
+  else
+    echo "[SSH-BOOTSTRAP] ❌ Still cannot SSH to ${target_ip} with key after bootstrap."
+    return 1
+  fi
+}
+
+# ---- remote snippets ----
+
+# 0) Prepare /mnt/data{0,1,2}
 read -r -d '' PREPARE_MNT_SNIPPET <<'RS' || true
 set -euo pipefail
 prep(){ local d="$1"; mkdir -p "$d"; if [ -d "$d" ]; then find "$d" -mindepth 1 -maxdepth 1 -exec rm -rf {} +; fi; }
@@ -175,12 +149,19 @@ prep /mnt/data0; prep /mnt/data1; prep /mnt/data2
 echo "[MNT] Prepared /mnt/data{0,1,2} (created if missing, contents cleared)"
 RS
 
+# 1) Ensure alias IP exists (robust: try forced iface, default-route iface, then physical NICs)
 read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
 set -euo pipefail
 IP_CIDR="$1"; FORCE_IFACE="${2-}"
+
 is_present(){ ip -4 addr show | awk '/inet /{print $2}' | grep -qx "$IP_CIDR"; }
+
 echo "[IP] Ensuring ${IP_CIDR}"
-if is_present; then echo "[IP] Present: ${IP_CIDR}"; exit 0; fi
+if is_present; then
+  echo "[IP] Present: ${IP_CIDR}"
+  exit 0
+fi
+
 declare -a CAND=()
 if [[ -n "$FORCE_IFACE" ]]; then CAND+=("$FORCE_IFACE"); fi
 DEF_IF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
@@ -191,6 +172,7 @@ while IFS= read -r ifc; do CAND+=("$ifc"); done < <(
     | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
     | sort -u
 )
+
 for IF in "${CAND[@]}"; do
   [[ -z "$IF" ]] && continue
   echo "[IP] Trying ${IP_CIDR} on iface ${IF}..."
@@ -203,48 +185,57 @@ for IF in "${CAND[@]}"; do
   fi
   echo "[IP] Failed on ${IF}: $(tr -d '\n' </tmp/ip_err_${IF}.log)" || true
 done
+
 echo "[IP] ERROR: Could not plumb ${IP_CIDR} on any iface. Candidates tried: ${CAND[*]}"
 exit 2
 RS
 
+# 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>/<TAG>; echo extracted dir
+# $1=root_base_dir (normalized), $2=BASE, $3=TAG, $4=WAIT_SECS
 read -r -d '' ENSURE_TRILLIUM_EXTRACTED <<'RS' || true
 set -euo pipefail
-ROOT="$1"; BASE="$2"; TAG="${3:-}"; WAIT="${4:-0}"
-if [[ -n "$TAG" ]]; then
-  DEST_DIR="$ROOT/$BASE/$TAG"
-else
-  DEST_DIR="$ROOT/$BASE"
-fi
+ROOT="$1"; BASE="$2"; TAG="$3"; WAIT="${4:-0}"
+DEST_DIR="$ROOT/$BASE/$TAG"
+
 mkdir -p "$DEST_DIR"
 shopt -s nullglob
-dir_matches=()
-for f in "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*; do
-  [[ -d "$f" ]] && dir_matches+=("$f")
-done
-if (( ${#dir_matches[@]} )); then
-  echo "[TRIL] Found existing dir: ${dir_matches[0]}"; echo "${dir_matches[0]}"; exit 0
+
+# If already extracted (any suffix) → done
+matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
+if (( ${#matches[@]} )); then
+  echo "[TRIL] Found existing dir: ${matches[0]}"
+  echo "${matches[0]}"; exit 0
 fi
-tarball="$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz"
-elapsed=0; interval=3
-while [[ ! -s "$tarball" && $elapsed -lt $WAIT ]]; do
-  echo "[TRIL] Waiting for $tarball ... (${elapsed}/${WAIT}s)"
+
+# Candidate tars: exact + any suffix
+tars=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz" "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*.tar.gz )
+
+# Wait for any tar to appear
+elapsed=0; interval=3; found_tar=""
+while :; do
+  for f in "${tars[@]}"; do
+    if [[ -s "$f" ]]; then found_tar="$f"; break; fi
+  done
+  [[ -n "$found_tar" || $elapsed -ge $WAIT ]] && break
+  echo "[TRIL] Waiting for tar in $DEST_DIR ... (${elapsed}/${WAIT}s)"
   sleep "$interval"; elapsed=$((elapsed+interval))
-end
-if [[ ! -s "$tarball" ]]; then
-  echo "[ERROR] Required tarball not found: $tarball (waited ${WAIT}s)"; exit 2
-fi
-command -v tar >/dev/null 2>&1 || { echo "[ERROR] tar not found on host"; exit 2; }
-echo "[TRIL] Extracting $(basename "$tarball") into $DEST_DIR ..."
-tar -C "$DEST_DIR" -xzf "$tarball"
-dir_matches=()
-for f in "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*; do
-  [[ -d "$f" ]] && dir_matches+=("$f")
 done
-[[ ${#dir_matches[@]} -gt 0 ]] || { echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2; }
-echo "[TRIL] Extracted dir: ${dir_matches[0]}"
-echo "${dir_matches[0]}"
+
+if [[ -z "$found_tar" ]]; then
+  echo "[ERROR] No TRILLIUM tar found in $DEST_DIR after ${WAIT}s"; exit 2
+fi
+
+echo "[TRIL] Extracting $(basename "$found_tar") into $DEST_DIR ..."
+tar -C "$DEST_DIR" -xzf "$found_tar"
+
+# Verify again
+matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
+[[ ${#matches[@]} -gt 0 ]] || { echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2; }
+echo "[TRIL] Extracted dir: ${matches[0]}"
+echo "${matches[0]}"
 RS
 
+# 3) Preflight: ensure kube ports are free (6443/10257)
 read -r -d '' FREE_PORTS_SNIPPET <<'RS' || true
 set -euo pipefail
 needs_free(){ ss -ltn | egrep -q ":(6443|10257)\s"; }
@@ -259,6 +250,7 @@ if needs_free; then
 fi
 RS
 
+# 3b) Stronger cleanup between retries (includes kubeadm reset)
 read -r -d '' RESET_KUBE_SNIPPET <<'RS' || true
 set -euo pipefail
 systemctl stop kubelet || true
@@ -270,26 +262,36 @@ if command -v crictl >/dev/null 2>&1; then
 fi
 RS
 
+# 4) Run installer and verify cluster health
+# $1=install_path  $2=expected_k8s_version (optional, e.g., 1.31.4)
 read -r -d '' RUN_INSTALL_AND_VERIFY_SNIPPET <<'RS' || true
 set -euo pipefail
 P="$1"; EXP_VER="${2-}"
+
 cd "$P" || { echo "[ERROR] Path not found: $P"; exit 2; }
 sed -i 's/\r$//' install_k8s.sh 2>/dev/null || true
+
 echo "[RUN] yes yes | ./install_k8s.sh (in $P)"
 set +e
 yes yes | bash ./install_k8s.sh
 RC=$?
 set -e
+
+# Health check: allow installer RC!=0 as long as cluster becomes Ready
 export KUBECONFIG=/etc/kubernetes/admin.conf
-READY=0; TRIES=30
+READY=0
+TRIES=30   # ~5 minutes @10s
 for i in $(seq 1 $TRIES); do
   if kubectl get nodes >/dev/null 2>&1; then
-    if kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}:{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' | grep -q ':True$'; then
-      READY=1; break
+    if kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}:{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' \
+        | grep -q ':True$'; then
+      READY=1
+      break
     fi
   fi
   sleep 10
 done
+
 if [[ $READY -eq 1 ]]; then
   echo "[VERIFY] Node Ready detected."
   if [[ -n "$EXP_VER" ]]; then
@@ -303,6 +305,7 @@ if [[ $READY -eq 1 ]]; then
   kubectl get nodes -o wide || true
   exit 0
 fi
+
 echo "[VERIFY] Cluster not Ready after install (installer rc=$RC)."
 exit 1
 RS
@@ -324,17 +327,13 @@ while IFS= read -r raw || [[ -n "${raw:-}" ]]; do
 
   HOSTS_TOUCHED+=("$host")
 
-  # Try a quick SSH to see if key-based auth already works; if not, bootstrap when allowed
-  if ! ssh $SSH_OPTS -i "$SSH_KEY" -o ConnectTimeout=5 "${CN_ROOT_USER}@${host}" "echo ok" >/dev/null 2>&1; then
-    if ! bootstrap_ssh_if_needed "$host"; then
-      echo "❌ Cannot establish SSH key auth to ${host}; skipping host."
-      any_failed=1
-      continue
-    fi
-  fi
+  # Bootstrap SSH (Fresh_installation): uses INSTALL_IP_ADDR's IP
+  bootstrap_ssh_if_needed "$host" || {
+    echo "⚠️  SSH bootstrap failed for $host — continuing to installer retry logic"
+  }
 
-  # Prep /mnt on every host
-  ssh $SSH_OPTS -i "$SSH_KEY" "${CN_ROOT_USER}@${host}" bash -s <<<"$PREPARE_MNT_SNIPPET"
+  # Prep /mnt on every host (once before attempts)
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<<"$PREPARE_MNT_SNIPPET"
 
   # Normalize ROOT from NEW_BUILD_PATH
   raw_base="$NEW_BUILD_PATH"
@@ -343,7 +342,7 @@ while IFS= read -r raw || [[ -n "${raw:-}" ]]; do
   # Determine TAG (once; then reuse across attempts)
   TAG="$TAG_IN"
   if [[ -z "$TAG" ]]; then
-    TAG="$(ssh $SSH_OPTS -i "$SSH_KEY" "${CN_ROOT_USER}@${host}" bash -s -- "$ROOT_BASE" "$BASE" <<'RS'
+    TAG="$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$ROOT_BASE" "$BASE" <<'RS'
 set -euo pipefail
 BDIR="$1"; BASE="$2"
 shopt -s nullglob
@@ -358,16 +357,12 @@ RS
     )" || TAG="EA1"
   fi
 
-  if [[ -n "$TAG" ]]; then
-    ROOT_BASE="$(normalize_root "$raw_base" "$BASE" "$TAG")"
-  else
-    ROOT_BASE="$(normalize_root "$raw_base" "$BASE")"
-  fi
+  ROOT_BASE="$(normalize_root "$raw_base" "$BASE" "$TAG")"
 
   echo ""
   echo "🧩 Host:  $host"
   echo "📁 Root:  $ROOT_BASE (from NEW_BUILD_PATH)"
-  echo "🏷️  Tag:   ${TAG:-<none>}"
+  echo "🏷️  Tag:   $TAG"
 
   # Attempt loop
   attempt=1
@@ -375,7 +370,7 @@ RS
     echo "🚀 Install attempt $attempt/$INSTALL_RETRY_COUNT on $host"
 
     # Ensure TRILLIUM present & extracted (waits for tar if fetch is still running)
-    TRIL_DIR="$(ssh $SSH_OPTS -i "$SSH_KEY" "${CN_ROOT_USER}@${host}" bash -s -- "$ROOT_BASE" "$BASE" "$TAG" "$BUILD_WAIT_SECS" <<<"$ENSURE_TRILLIUM_EXTRACTED" | tail -n1 || true)"
+    TRIL_DIR="$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$ROOT_BASE" "$BASE" "$TAG" "$BUILD_WAIT_SECS" <<<"$ENSURE_TRILLIUM_EXTRACTED" | tail -n1 || true)"
     if [[ -z "$TRIL_DIR" ]]; then
       echo "⚠️  TRILLIUM not ready on $host (attempt $attempt)"
       ((attempt++))
@@ -387,11 +382,11 @@ RS
     echo "📁 Path:  $NEW_VER_PATH"
 
     # Free ports if needed
-    ssh $SSH_OPTS -i "$SSH_KEY" "${CN_ROOT_USER}@${host}" bash -s <<<"$FREE_PORTS_SNIPPET" || true
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<<"$FREE_PORTS_SNIPPET" || true
 
     # Ensure alias IP (only if configured)
     if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
-      if ! ssh $SSH_OPTS -i "$SSH_KEY" "${CN_ROOT_USER}@${host}" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET"; then
+      if ! ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET"; then
         echo "⚠️  Failed to ensure $INSTALL_IP_ADDR on $host (attempt $attempt)"
         ((attempt++))
         (( attempt <= INSTALL_RETRY_COUNT )) && { echo "⏳ Waiting ${INSTALL_RETRY_DELAY_SECS}s and retrying..."; sleep "$INSTALL_RETRY_DELAY_SECS"; }
@@ -402,7 +397,7 @@ RS
     fi
 
     # Run installer and verify health
-    if ssh $SSH_OPTS -i "$SSH_KEY" "${CN_ROOT_USER}@${host}" bash -s -- "$NEW_VER_PATH" "$K8S_VER" <<<"$RUN_INSTALL_AND_VERIFY_SNIPPET"; then
+    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$NEW_VER_PATH" "$K8S_VER" <<<"$RUN_INSTALL_AND_VERIFY_SNIPPET"; then
       echo "✅ Install verified healthy on $host"
       break
     fi
@@ -411,7 +406,7 @@ RS
     ((attempt++))
     if (( attempt <= INSTALL_RETRY_COUNT )); then
       echo "🧹 Performing stronger cleanup (kubeadm reset) before retry..."
-      ssh $SSH_OPTS -i "$SSH_KEY" "${CN_ROOT_USER}@${host}" bash -s <<<"$RESET_KUBE_SNIPPET" || true
+      ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<<"$RESET_KUBE_SNIPPET" || true
       echo "⏳ Waiting ${INSTALL_RETRY_DELAY_SECS}s and retrying..."
       sleep "$INSTALL_RETRY_DELAY_SECS"
     fi
