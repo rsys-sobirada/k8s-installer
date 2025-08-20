@@ -1,4 +1,4 @@
-// ================== Parameters (Active Choices, ordered exactly as requested) ==================
+// ================== Parameters (Active Choices, ordered as requested) ==================
 properties([
   parameters([
     // 1) Deployment type
@@ -140,9 +140,7 @@ return """<select class='setting-input' name='value'>
       ]
     ],
 
-    // 11) Password (masked-looking; visible only if FETCH_BUILD truthy)
-    // NOTE: Active Choices cannot render the native "blue" password widget.
-    // This remains conditional & masked in the browser; avoid echoing the value in logs.
+    // 11) Password (Active Choices; conditional; visually masked)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_PASS',
@@ -186,7 +184,7 @@ pipeline {
     INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; overridden by param in stage env
   }
 
-  // IMPORTANT: do NOT add another `parameters {}` block here
+  // NOTE: no parameters{} block here — using properties([...]) above.
 
   stages {
     stage('Checkout') {
@@ -294,52 +292,52 @@ pipeline {
       }
     }
 
-    // ---------- Health check after cluster install ----------
+    // ---------- Health check after cluster install (bash shebang) ----------
     stage('Cluster health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
-          sh '''
-            set -euo pipefail
-            # First check
-            NOT_OK=0
-            while read -r ns name ready status rest; do
-              x="${ready%%/*}"; y="${ready##*/}"
-              if [ "$status" != "Running" ] || [ "$x" != "$y" ]; then
-                echo "[cluster-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
-                NOT_OK=1
-              fi
-            done < <(kubectl get pods -A --no-headers)
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
 
-            if [ "$NOT_OK" -eq 0 ]; then
-              echo "[cluster-health] ✅ All pods Running & Ready."
-              exit 0
-            fi
+NOT_OK=0
+while read -r ns name ready status rest; do
+  x="${ready%%/*}"; y="${ready##*/}"
+  if [[ "$status" != "Running" || "$x" != "$y" ]]; then
+    echo "[cluster-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
+    NOT_OK=1
+  fi
+done < <(kubectl get pods -A --no-headers)
 
-            echo "[cluster-health] Pods not healthy, waiting 300s and retrying..."
-            sleep 300
+if [[ "$NOT_OK" -eq 0 ]]; then
+  echo "[cluster-health] ✅ All pods Running & Ready."
+  exit 0
+fi
 
-            NOT_OK=0
-            while read -r ns name ready status rest; do
-              x="${ready%%/*}"; y="${ready##*/}"
-              if [ "$status" != "Running" ] || [ "$x" != "$y" ]; then
-                echo "[cluster-health] (retry) $ns/$name still not healthy (READY=$ready STATUS=$status)"
-                NOT_OK=1
-              fi
-            done < <(kubectl get pods -A --no-headers)
+echo "[cluster-health] Pods not healthy, waiting 300s and retrying..."
+sleep 300
 
-            if [ "$NOT_OK" -ne 0 ]; then
-              echo "[cluster-health] ❌ Pods still not healthy after 5 minutes."
-              kubectl get pods -A
-              exit 1
-            fi
+NOT_OK=0
+while read -r ns name ready status rest; do
+  x="${ready%%/*}"; y="${ready##*/}"
+  if [[ "$status" != "Running" || "$x" != "$y" ]]; then
+    echo "[cluster-health] (retry) $ns/$name still not healthy (READY=$ready STATUS=$status)"
+    NOT_OK=1
+  fi
+done < <(kubectl get pods -A --no-headers)
 
-            echo "[cluster-health] ✅ Healthy after retry."
-          '''
+if [[ "$NOT_OK" -ne 0 ]]; then
+  echo "[cluster-health] ❌ Pods still not healthy after 5 minutes."
+  kubectl get pods -A
+  exit 1
+fi
+
+echo "[cluster-health] ✅ Healthy after retry."
+'''
         }
       }
     }
 
-    // ---------- PS config & install ----------
+    // ---------- PS config & install (separate script) ----------
     stage('PS config & install') {
       steps {
         timeout(time: 30, unit: 'MINUTES', activity: true) {
@@ -361,51 +359,52 @@ pipeline {
       }
     }
 
-    // ---------- Health check after PS install ----------
+    // ---------- Health check after PS install (bash shebang) ----------
     stage('PS health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
-          sh '''
-            set -euo pipefail
-            NOT_OK=0
-            while read -r ns name ready status rest; do
-              x="${ready%%/*}"; y="${ready##*/}"
-              if [ "$status" != "Running" ] || [ "$x" != "$y" ]; then
-                echo "[ps-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
-                NOT_OK=1
-              fi
-            done < <(kubectl get pods -A --no-headers)
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
 
-            if [ "$NOT_OK" -eq 0 ]; then
-              echo "[ps-health] ✅ All pods Running & Ready."
-              exit 0
-            fi
+NOT_OK=0
+while read -r ns name ready status rest; do
+  x="${ready%%/*}"; y="${ready##*/}"
+  if [[ "$status" != "Running" || "$x" != "$y" ]]; then
+    echo "[ps-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
+    NOT_OK=1
+  fi
+done < <(kubectl get pods -A --no-headers)
 
-            echo "[ps-health] Pods not healthy, waiting 300s and retrying..."
-            sleep 300
+if [[ "$NOT_OK" -eq 0 ]]; then
+  echo "[ps-health] ✅ All pods Running & Ready."
+  exit 0
+fi
 
-            NOT_OK=0
-            while read -r ns name ready status rest; do
-              x="${ready%%/*}"; y="${ready##*/}"
-              if [ "$status" != "Running" ] || [ "$x" != "$y" ]; then
-                echo "[ps-health] (retry) $ns/$name still not healthy (READY=$ready STATUS=$status)"
-                NOT_OK=1
-              fi
-            done < <(kubectl get pods -A --no-headers)
+echo "[ps-health] Pods not healthy, waiting 300s and retrying..."
+sleep 300
 
-            if [ "$NOT_OK" -ne 0 ]; then
-              echo "[ps-health] ❌ Pods still not healthy after 5 minutes."
-              kubectl get pods -A
-              exit 1
-            fi
+NOT_OK=0
+while read -r ns name ready status rest; do
+  x="${ready%%/*}"; y="${ready##*/}"
+  if [[ "$status" != "Running" || "$x" != "$y" ]]; then
+    echo "[ps-health] (retry) $ns/$name still not healthy (READY=$ready STATUS=$status)"
+    NOT_OK=1
+  fi
+done < <(kubectl get pods -A --no-headers)
 
-            echo "[ps-health] ✅ Healthy after retry."
-          '''
+if [[ "$NOT_OK" -ne 0 ]]; then
+  echo "[ps-health] ❌ Pods still not healthy after 5 minutes."
+  kubectl get pods -A
+  exit 1
+fi
+
+echo "[ps-health] ✅ Healthy after retry."
+'''
         }
       }
     }
 
-    // (Next: add CS / NF stages after these health checks as needed)
+    // (You can add CS/NF stages next using the same pattern.)
   }
 
   post {
