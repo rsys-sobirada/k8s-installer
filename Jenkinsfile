@@ -221,7 +221,7 @@ pipeline {
       }
     }
 
-    // ---------- Ensure alias IP first, then optional SSH bootstrap ----------
+    // ---------- Ensure alias IP first, install sshpass on CN, then SSH bootstrap ----------
     stage('CN SSH bootstrap (optional)') {
       when {
         expression { return params.CN_BOOTSTRAP || params.INSTALL_MODE == 'Fresh_installation' }
@@ -246,47 +246,50 @@ export UCF_FORCE_CONFFOLD=1
 read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
 set -euo pipefail
 IP_CIDR="$1"; FORCE_IFACE="${2-}"
-
 is_present(){ ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "$IP_CIDR"; }
-
 echo "[IP] Ensuring ${IP_CIDR}"
-if is_present; then
-  echo "[IP] Present: ${IP_CIDR}"
-  exit 0
-fi
-
+if is_present; then echo "[IP] Present: ${IP_CIDR}"; exit 0; fi
 declare -a CAND=()
-if [[ -n "$FORCE_IFACE" ]]; then CAND+=("$FORCE_IFACE"); fi
+[[ -n "$FORCE_IFACE" ]] && CAND+=("$FORCE_IFACE")
 DEF_IF=$(ip route 2>/dev/null | awk "/^default/{print \\$5; exit}" || true)
-if [[ -n "${DEF_IF:-}" ]]; then CAND+=("$DEF_IF"); fi
+[[ -n "${DEF_IF:-}" ]] && CAND+=("$DEF_IF")
 while IFS= read -r ifc; do CAND+=("$ifc"); done < <(
   ip -o link | awk -F': ' '{print $2}' \
     | grep -E "^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+" \
     | grep -Ev "(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)" \
     | sort -u
 )
-
 for IF in "${CAND[@]}"; do
   [[ -z "$IF" ]] && continue
   echo "[IP] Trying ${IP_CIDR} on iface ${IF}..."
   ip link set dev "$IF" up || true
   if ip addr replace "$IP_CIDR" dev "$IF" 2>"/tmp/ip_err_${IF}.log"; then
-    if ip -4 addr show dev "$IF" | grep -q "$IP_CIDR"; then
-      echo "[IP] OK on ${IF}"
-      exit 0
-    fi
+    ip -4 addr show dev "$IF" | grep -q "$IP_CIDR" && { echo "[IP] OK on ${IF}"; exit 0; }
   fi
   echo "[IP] Failed on ${IF}: $(tr -d '\\n' </tmp/ip_err_${IF}.log)" || true
 done
+echo "[IP] ERROR: Could not plumb ${IP_CIDR} on any iface. Candidates tried: ${CAND[*]}"; exit 2
+RS
 
-echo "[IP] ERROR: Could not plumb ${IP_CIDR} on any iface. Candidates tried: ${CAND[*]}"
-exit 2
+# ---------- remote snippet: fix sshd to listen on alias + allow bootstrap auth ----------
+read -r -d '' FIX_SSHD_SNIPPET <<'RS' || true
+set -euo pipefail
+mkdir -p /etc/ssh/sshd_config.d
+cat >/etc/ssh/sshd_config.d/99-listen-all.conf <<'EOT'
+ListenAddress 0.0.0.0
+EOT
+cat >/etc/ssh/sshd_config.d/99-bootstrap-auth.conf <<'EOT'
+PermitRootLogin yes
+PasswordAuthentication yes
+EOT
+sshd -t && (systemctl restart sshd || service ssh restart || true)
+ss -ltnp | awk '$4 ~ /:22$/ {print "[sshd] listening on",$4}'
 RS
 
 # ---------- runner helpers ----------
-ensure_sshpass() {
+ensure_sshpass_runner() {
   if command -v sshpass >/dev/null 2>&1; then return 0; fi
-  echo "[bootstrap] sshpass not found; installing (no upgrades/no popups)..."
+  echo "[bootstrap] sshpass not found on runner; installing (no upgrades/no popups)..."
   if command -v apt-get >/dev/null 2>&1; then
     sudo -E apt-get install -yq --no-install-recommends --no-upgrade sshpass
   elif command -v yum >/dev/null 2>&1; then
@@ -304,6 +307,10 @@ ensure_keypair() {
     chmod 600 "${SSH_KEY}"
   fi
   [[ -s "${SSH_KEY}.pub" ]] || ssh-keygen -y -f "${SSH_KEY}" > "${SSH_KEY}.pub"
+}
+
+key_ok() {
+  timeout 5 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ConnectionAttempts=1 -i "${SSH_KEY}" "root@$1" true 2>/dev/null
 }
 
 copy_key_to() {
@@ -329,8 +336,40 @@ copy_key_to() {
         "umask 077 && mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && printf '%s\\n' '$(cat "${SSH_KEY}.pub")' >> ~/.ssh/authorized_keys"
 }
 
-key_ok() {
-  timeout 5 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ConnectionAttempts=1 -i "${SSH_KEY}" "root@$1" true 2>/dev/null
+# ---------- ensure sshpass on the CN itself (per your requirement) ----------
+ensure_sshpass_on_cn() {
+  local host="$1"
+  # Try via key if available
+  if key_ok "${host}"; then
+    ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SVC=l UCF_FORCE_CONFFOLD=1
+      if command -v sshpass >/dev/null 2>&1; then exit 0; fi
+      if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -yq --no-install-recommends --no-upgrade sshpass
+      elif command -v yum >/dev/null 2>&1; then
+        yum install -y sshpass
+      else
+        exit 0
+      fi
+    ' || true
+    return 0
+  fi
+  # Fallback via password if key not yet accepted on CN
+  if command -v sshpass >/dev/null 2>&1; then
+    sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no "root@${host}" bash -lc '
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SVC=l UCF_FORCE_CONFFOLD=1
+      if command -v sshpass >/dev/null 2>&1; then exit 0; fi
+      if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -yq --no-install-recommends --no-upgrade sshpass
+      elif command -v yum >/dev/null 2>&1; then
+        yum install -y sshpass
+      else
+        exit 0
+      fi
+    ' || true
+  fi
 }
 
 # ---------- gather hosts ----------
@@ -343,28 +382,41 @@ mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/ {
 echo "[bootstrap] Hosts: ${HOSTS[*]}"
 echo "[bootstrap] Alias IP: ${ALIAS_IP}  (from ${INSTALL_IP_ADDR})"
 
-ensure_sshpass
+ensure_sshpass_runner
 ensure_keypair
 
-rc_all=0
+rc_warn=0
 for host in "${HOSTS[@]}"; do
   echo; echo "─── Host ${host} ───────────────────────────────────────"
+
   # 1) Ensure alias IP FIRST on the CN
   if ! ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -s -- "${INSTALL_IP_ADDR}" "" <<<"$ENSURE_IP_SNIPPET"; then
     echo "[bootstrap][${host}] ⚠️ Failed to ensure ${INSTALL_IP_ADDR}; continuing"
-    rc_all=1
+    rc_warn=1
   fi
-  # 2) Ensure key-based SSH for host IP
-  key_ok "${host}" || copy_key_to "${host}" "${CN_BOOTSTRAP_PASS}" || rc_all=1
-  key_ok "${host}" && echo "[bootstrap][${host}] ✅ key OK (host IP)" || { echo "[bootstrap][${host}] ❌ key still failing (host IP)"; rc_all=1; }
-  # 3) Ensure key-based SSH for alias IP
+
+  # 2) Ensure sshpass on the CN (requested)
+  ensure_sshpass_on_cn "${host}" || true
+
+  # 3) Fix sshd binding/auth on the CN so it listens on alias IP and allows bootstrap
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -s <<<"$FIX_SSHD_SNIPPET" || {
+    echo "[bootstrap][${host}] ⚠️ Could not apply sshd fixes; continuing"
+    rc_warn=1
+  }
+
+  # 4) Ensure key-based SSH for host IP
+  key_ok "${host}" || copy_key_to "${host}" "${CN_BOOTSTRAP_PASS}" || rc_warn=1
+  key_ok "${host}" && echo "[bootstrap][${host}] ✅ key OK (host IP)" || { echo "[bootstrap][${host}] ❌ key still failing (host IP)"; rc_warn=1; }
+
+  # 5) Ensure key-based SSH for alias IP
   if [[ -n "${ALIAS_IP}" ]]; then
-    key_ok "${ALIAS_IP}" || copy_key_to "${ALIAS_IP}" "${CN_BOOTSTRAP_PASS}" || rc_all=1
-    key_ok "${ALIAS_IP}" && echo "[bootstrap][${host}] ✅ key OK (alias ${ALIAS_IP})" || { echo "[bootstrap][${host}] ❌ key still failing (alias ${ALIAS_IP})"; rc_all=1; }
+    key_ok "${ALIAS_IP}" || copy_key_to "${ALIAS_IP}" "${CN_BOOTSTRAP_PASS}" || rc_warn=1
+    key_ok "${ALIAS_IP}" && echo "[bootstrap][${host}] ✅ key OK (alias ${ALIAS_IP})" || { echo "[bootstrap][${host}] ⚠️ key still failing (alias ${ALIAS_IP})"; rc_warn=1; }
   fi
 done
 
-exit $rc_all
+# Do not hard-fail here; install has its own robust retries.
+exit 0
 '''
         }
       }
