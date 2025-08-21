@@ -367,6 +367,7 @@ exit $rc
               INSTALL_SERVER_FILE="${SERVER_FILE}" \
               INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
               SSH_KEY="${SSH_KEY}" \
+              INSTALL_MODE="${INSTALL_MODE}" \
               INSTALL_RETRY_COUNT="3" \
               INSTALL_RETRY_DELAY_SECS="20" \
               BUILD_WAIT_SECS="300" \
