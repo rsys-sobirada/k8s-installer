@@ -287,6 +287,26 @@ if sshd -t; then systemctl restart sshd || service ssh restart || true; fi
 ss -ltnp | awk '$4 ~ /:22$/ {print "[CN][sshd] listening on",$4}'
 RS
 
+# ---------- remote snippet: send gratuitous ARP for alias ----------
+read -r -d '' SEND_GARP_SNIPPET <<'RS' || true
+set -euo pipefail
+ALIAS="$1"
+IFACE="$(ip -o addr show to "$ALIAS/32" | awk "{print \\$2}" | head -n1 || true)"
+echo "[CN][arp] announcing ${ALIAS} on iface ${IFACE:-<unknown>}"
+# best effort: install arping if available
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get install -yq --no-install-recommends --no-upgrade iputils-arping >/dev/null 2>&1 || true
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y iputils >/dev/null 2>&1 || true
+fi
+if command -v arping >/dev/null 2>&1 && [[ -n "${IFACE:-}" ]]; then
+  arping -c 3 -U -I "$IFACE" "$ALIAS" || true
+else
+  # fallback: flap address to trigger announcements
+  [[ -n "${IFACE:-}" ]] && { ip addr del "${ALIAS}/32" dev "$IFACE" 2>/dev/null || true; ip addr add "${ALIAS}/32" dev "$IFACE" || true; }
+fi
+RS
+
 # ---------- runner helpers ----------
 ensure_sshpass_runner() {
   if command -v sshpass >/dev/null 2>&1; then return 0; fi
@@ -357,7 +377,6 @@ ensure_sshpass_on_cn() {
       fi
     ' || true
   else
-    # password path on CN (runner must have sshpass)
     sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no "root@${host}" bash -lc '
       set -euo pipefail
       export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SVC=l UCF_FORCE_CONFFOLD=1
@@ -375,7 +394,7 @@ ensure_sshpass_on_cn() {
   fi
   # verify & print on runner
   if timeout 5 ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" 'command -v sshpass >/dev/null 2>&1 && echo "[CN] sshpass present" || echo "[CN] sshpass MISSING"' 2>/dev/null; then
-    : # printed by CN
+    : 
   else
     echo "[CN][${host}] sshpass verification skipped (no key yet)"
   fi
@@ -404,14 +423,19 @@ for host in "${HOSTS[@]}"; do
     rc_warn=1
   fi
 
-  # 2) Install sshpass on CN (FORCED, with clear logs)
+  # 2) Install sshpass on CN
   ensure_sshpass_on_cn "${host}" || true
 
-  # 3) Fix sshd binding/auth on the CN so it listens on alias IP and allows bootstrap
+  # 3) Fix sshd on CN (listen all + allow password)
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -s <<<"$FIX_SSHD_SNIPPET" || {
     echo "[bootstrap][${host}] ⚠️ Could not apply sshd fixes; continuing"
     rc_warn=1
   }
+
+  # 3b) Send gratuitous ARP for alias
+  if [[ -n "${ALIAS_IP}" ]]; then
+    ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -s -- "${ALIAS_IP}" <<<"$SEND_GARP_SNIPPET" || true
+  fi
 
   # 4) Ensure key-based SSH for host IP
   key_ok "${host}" || copy_key_to "${host}" "${CN_BOOTSTRAP_PASS}" || rc_warn=1
@@ -421,13 +445,18 @@ for host in "${HOSTS[@]}"; do
     echo "[bootstrap][${host}] ❌ key still failing (host IP)"; rc_warn=1
   fi
 
-  # 5) Ensure key-based SSH for alias IP
+  # 5) Try alias IP only if port 22 is reachable from runner (avoid long timeouts)
   if [[ -n "${ALIAS_IP}" ]]; then
-    key_ok "${ALIAS_IP}" || copy_key_to "${ALIAS_IP}" "${CN_BOOTSTRAP_PASS}" || rc_warn=1
-    if key_ok "${ALIAS_IP}"; then
-      echo "[bootstrap][${host}] ✅ key OK (alias ${ALIAS_IP})"
+    if timeout 3 bash -lc "</dev/tcp/${ALIAS_IP}/22" 2>/dev/null; then
+      key_ok "${ALIAS_IP}" || copy_key_to "${ALIAS_IP}" "${CN_BOOTSTRAP_PASS}" || rc_warn=1
+      if key_ok "${ALIAS_IP}"; then
+        echo "[bootstrap][${host}] ✅ key OK (alias ${ALIAS_IP})"
+      else
+        echo "[bootstrap][${host}] ❌ key still failing (alias ${ALIAS_IP})"
+        rc_warn=1
+      fi
     else
-      echo "[bootstrap][${host}] ❌ key still failing (alias ${ALIAS_IP})"
+      echo "[bootstrap][${host}] ⚠️ alias ${ALIAS_IP}:22 not reachable from runner; skipping alias ssh-copy-id (host IP is OK)"
       rc_warn=1
     fi
   fi
@@ -439,6 +468,7 @@ exit 0
     }
   }
 }
+
 
 
     stage('Reset &/or Fetch (parallel)') {
