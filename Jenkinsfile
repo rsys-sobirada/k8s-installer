@@ -39,24 +39,32 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
     ],
 
     // 4) New build path
-    string(name: 'NEW_BUILD_PATH',
-           defaultValue: '/home/labadmin',
-           description: 'Base dir to place NEW_VERSION (and extract)'),
+    string(
+      name: 'NEW_BUILD_PATH',
+      defaultValue: '/home/labadmin',
+      description: 'Base dir to place NEW_VERSION (and extract)'
+    ),
 
     // 5) New version
-    choice(name: 'NEW_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
-           description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'),
+    choice(
+      name: 'NEW_VERSION',
+      choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+      description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'
+    ),
 
     // 6) Old version
-    choice(name: 'OLD_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
-           description: 'Existing bundle (used if upgrading)'),
+    choice(
+      name: 'OLD_VERSION',
+      choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+      description: 'Existing bundle (used if upgrading)'
+    ),
 
     // 7) Fetch toggle
-    booleanParam(name: 'FETCH_BUILD',
-           defaultValue: true,
-           description: 'Fetch NEW_VERSION from build host to CN servers'),
+    booleanParam(
+      name: 'FETCH_BUILD',
+      defaultValue: true,
+      description: 'Fetch NEW_VERSION from build host to CN servers'
+    ),
 
     // 8) Host (visible only if FETCH_BUILD truthy)
     [
@@ -165,9 +173,11 @@ return """<input type='password' class='setting-input' name='value' value=''/>""
     ],
 
     // 12) Alias IP/CIDR
-    string(name: 'INSTALL_IP_ADDR',
-           defaultValue: '10.10.10.20/24',
-           description: 'Alias IP/CIDR to plumb on CN servers'),
+    string(
+      name: 'INSTALL_IP_ADDR',
+      defaultValue: '10.10.10.20/24',
+      description: 'Alias IP/CIDR to plumb on CN servers'
+    ),
 
     // -------- OPTIONAL bootstrap controls (appended; does not disturb your order) --------
     booleanParam(
@@ -211,75 +221,150 @@ pipeline {
       }
     }
 
-    // ---------- Optional: bootstrap SSH keys on new CN servers ----------
+    // ---------- Ensure alias IP first, then optional SSH bootstrap ----------
     stage('CN SSH bootstrap (optional)') {
-      when { expression { return params.CN_BOOTSTRAP } }
+      when {
+        expression { return params.CN_BOOTSTRAP || params.INSTALL_MODE == 'Fresh_installation' }
+      }
       steps {
-        timeout(time: 10, unit: 'MINUTES', activity: true) {
+        timeout(time: 15, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${CN_BOOTSTRAP_PASS:-}" ]]; then
-  echo "[bootstrap] CN_BOOTSTRAP is true but CN_BOOTSTRAP_PASS is empty; nothing to do."
+: "${SERVER_FILE:?missing SERVER_FILE}"
+: "${SSH_KEY:?missing SSH_KEY}"
+: "${INSTALL_IP_ADDR:?missing INSTALL_IP_ADDR}"
+ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
+CN_BOOTSTRAP_PASS="${CN_BOOTSTRAP_PASS:-root123}"
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SVC=l
+export UCF_FORCE_CONFFOLD=1
+
+# ---------- remote snippet: ensure alias IP ----------
+read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
+set -euo pipefail
+IP_CIDR="$1"; FORCE_IFACE="${2-}"
+
+is_present(){ ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "$IP_CIDR"; }
+
+echo "[IP] Ensuring ${IP_CIDR}"
+if is_present; then
+  echo "[IP] Present: ${IP_CIDR}"
   exit 0
 fi
 
-if ! command -v sshpass >/dev/null 2>&1; then
-  echo "[bootstrap] ERROR: sshpass is required on this Jenkins agent to perform password-based bootstrap." >&2
-  exit 2
-fi
+declare -a CAND=()
+if [[ -n "$FORCE_IFACE" ]]; then CAND+=("$FORCE_IFACE"); fi
+DEF_IF=$(ip route 2>/dev/null | awk "/^default/{print \\$5; exit}" || true)
+if [[ -n "${DEF_IF:-}" ]]; then CAND+=("$DEF_IF"); fi
+while IFS= read -r ifc; do CAND+=("$ifc"); done < <(
+  ip -o link | awk -F': ' '{print $2}' \
+    | grep -E "^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+" \
+    | grep -Ev "(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)" \
+    | sort -u
+)
 
-# Ensure we have a public key to install on CN hosts.
-if [[ ! -s "${SSH_KEY}.pub" ]]; then
-  echo "[bootstrap] ${SSH_KEY}.pub not found; generating from private key..."
-  ssh-keygen -y -f "${SSH_KEY}" > "${SSH_KEY}.pub"
-fi
-PUBKEY_CONTENT="$(cat "${SSH_KEY}.pub")"
+for IF in "${CAND[@]}"; do
+  [[ -z "$IF" ]] && continue
+  echo "[IP] Trying ${IP_CIDR} on iface ${IF}..."
+  ip link set dev "$IF" up || true
+  if ip addr replace "$IP_CIDR" dev "$IF" 2>"/tmp/ip_err_${IF}.log"; then
+    if ip -4 addr show dev "$IF" | grep -q "$IP_CIDR"; then
+      echo "[IP] OK on ${IF}"
+      exit 0
+    fi
+  fi
+  echo "[IP] Failed on ${IF}: $(tr -d '\\n' </tmp/ip_err_${IF}.log)" || true
+done
 
-# Parse first column as host; allow lines like "name:ip:..." or just "ip"
+echo "[IP] ERROR: Could not plumb ${IP_CIDR} on any iface. Candidates tried: ${CAND[*]}"
+exit 2
+RS
+
+# ---------- runner helpers ----------
+ensure_sshpass() {
+  if command -v sshpass >/dev/null 2>&1; then return 0; fi
+  echo "[bootstrap] sshpass not found; installing (no upgrades/no popups)..."
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo -E apt-get install -yq --no-install-recommends --no-upgrade sshpass
+  elif command -v yum >/dev/null 2>&1; then
+    sudo -E yum install -y sshpass
+  else
+    echo "[bootstrap] ❌ Unknown package manager on runner"; exit 1
+  fi
+}
+
+ensure_keypair() {
+  if [[ ! -s "${SSH_KEY}" ]]; then
+    echo "[bootstrap] SSH private key not found → generating: ${SSH_KEY}"
+    mkdir -p "$(dirname "${SSH_KEY}")"
+    ssh-keygen -q -t rsa -N '' -f "${SSH_KEY}"
+    chmod 600 "${SSH_KEY}"
+  fi
+  [[ -s "${SSH_KEY}.pub" ]] || ssh-keygen -y -f "${SSH_KEY}" > "${SSH_KEY}.pub"
+}
+
+copy_key_to() {
+  local tgt="$1" pass="$2"
+  ssh-keygen -q -R "${tgt}" >/dev/null 2>&1 || true
+  echo "[bootstrap] ssh-copy-id → ${tgt}"
+  if timeout 5 sshpass -p "$pass" ssh-copy-id \
+        -i "${SSH_KEY}.pub" \
+        -o StrictHostKeyChecking=no \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no \
+        -o ConnectTimeout=5 -o ConnectionAttempts=1 \
+        "root@${tgt}" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "[bootstrap] ssh-copy-id failed/timed out; fallback append → ${tgt}"
+  timeout 5 sshpass -p "$pass" ssh \
+        -o StrictHostKeyChecking=no \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no \
+        -o ConnectTimeout=5 -o ConnectionAttempts=1 \
+        "root@${tgt}" \
+        "umask 077 && mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && printf '%s\\n' '$(cat "${SSH_KEY}.pub")' >> ~/.ssh/authorized_keys"
+}
+
+key_ok() {
+  timeout 5 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ConnectionAttempts=1 -i "${SSH_KEY}" "root@$1" true 2>/dev/null
+}
+
+# ---------- gather hosts ----------
 mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/ {
   if (index($0,":")>0) { n=split($0,a,":"); print a[2] } else { print $1 }
 }' "${SERVER_FILE}")
 
-if ((${#HOSTS[@]}==0)); then
-  echo "[bootstrap] ERROR: No hosts parsed from ${SERVER_FILE}" >&2
-  exit 1
-fi
+((${#HOSTS[@]})) || { echo "[bootstrap] ❌ No hosts parsed from ${SERVER_FILE}"; exit 2; }
 
-bootstrap_host() {
-  local host="$1"
-  echo "[bootstrap][$host] Testing key-based SSH..."
-  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true 2>/dev/null; then
-    echo "[bootstrap][$host] Key-based SSH already works."
-    return 0
+echo "[bootstrap] Hosts: ${HOSTS[*]}"
+echo "[bootstrap] Alias IP: ${ALIAS_IP}  (from ${INSTALL_IP_ADDR})"
+
+ensure_sshpass
+ensure_keypair
+
+rc_all=0
+for host in "${HOSTS[@]}"; do
+  echo; echo "─── Host ${host} ───────────────────────────────────────"
+  # 1) Ensure alias IP FIRST on the CN
+  if ! ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -s -- "${INSTALL_IP_ADDR}" "" <<<"$ENSURE_IP_SNIPPET"; then
+    echo "[bootstrap][${host}] ⚠️ Failed to ensure ${INSTALL_IP_ADDR}; continuing"
+    rc_all=1
   fi
-
-  echo "[bootstrap][$host] Key-based SSH failed; attempting password bootstrap..."
-  sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no "root@${host}" bash -lc '
-    set -euo pipefail
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-    touch /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-  '
-
-  sshpass -p "${CN_BOOTSTRAP_PASS}" bash -c "printf %s '${PUBKEY_CONTENT}' | ssh -o StrictHostKeyChecking=no root@${host} 'cat >> /root/.ssh/authorized_keys'"
-
-  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true 2>/dev/null; then
-    echo "[bootstrap][$host] ✅ Key-based SSH enabled."
-    return 0
-  else
-    echo "[bootstrap][$host] ❌ Still cannot SSH with key; check root login policies or passwords." >&2
-    return 1
+  # 2) Ensure key-based SSH for host IP
+  key_ok "${host}" || copy_key_to "${host}" "${CN_BOOTSTRAP_PASS}" || rc_all=1
+  key_ok "${host}" && echo "[bootstrap][${host}] ✅ key OK (host IP)" || { echo "[bootstrap][${host}] ❌ key still failing (host IP)"; rc_all=1; }
+  # 3) Ensure key-based SSH for alias IP
+  if [[ -n "${ALIAS_IP}" ]]; then
+    key_ok "${ALIAS_IP}" || copy_key_to "${ALIAS_IP}" "${CN_BOOTSTRAP_PASS}" || rc_all=1
+    key_ok "${ALIAS_IP}" && echo "[bootstrap][${host}] ✅ key OK (alias ${ALIAS_IP})" || { echo "[bootstrap][${host}] ❌ key still failing (alias ${ALIAS_IP})"; rc_all=1; }
   fi
-}
-
-rc=0
-for h in "${HOSTS[@]}"; do
-  if ! bootstrap_host "$h"; then rc=1; fi
 done
 
-exit $rc
+exit $rc_all
 '''
         }
       }
@@ -377,7 +462,7 @@ exit $rc
       }
     }
 
-    // ---------- Health check after cluster install (run kubectl on CN host) ----------
+    // ---------- Health check after cluster install ----------
     stage('Cluster health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
@@ -427,7 +512,7 @@ ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
       }
     }
 
-    // ---------- PS config & install (separate script; force bash) ----------
+    // ---------- PS config & install ----------
     stage('PS config & install') {
       steps {
         timeout(time: 30, unit: 'MINUTES', activity: true) {
@@ -450,7 +535,7 @@ bash -euo pipefail scripts/ps_config.sh
       }
     }
 
-    // ---------- Health check after PS install (run kubectl on CN host) ----------
+    // ---------- PS health check ----------
     stage('PS health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
