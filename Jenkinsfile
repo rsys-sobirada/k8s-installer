@@ -222,13 +222,13 @@ pipeline {
     }
 
     // ---------- Ensure alias IP first, install sshpass on CN, then SSH bootstrap ----------
-    stage('CN SSH bootstrap (optional)') {
-      when {
-        expression { return params.CN_BOOTSTRAP || params.INSTALL_MODE == 'Fresh_installation' }
-      }
-      steps {
-        timeout(time: 15, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
+stage('CN SSH bootstrap (optional)') {
+  when {
+    expression { return params.CN_BOOTSTRAP || params.INSTALL_MODE == 'Fresh_installation' }
+  }
+  steps {
+    timeout(time: 15, unit: 'MINUTES', activity: true) {
+      sh '''#!/usr/bin/env bash
 set -euo pipefail
 
 : "${SERVER_FILE:?missing SERVER_FILE}"
@@ -282,26 +282,27 @@ cat >/etc/ssh/sshd_config.d/99-bootstrap-auth.conf <<'EOT'
 PermitRootLogin yes
 PasswordAuthentication yes
 EOT
-sshd -t && (systemctl restart sshd || service ssh restart || true)
-ss -ltnp | awk '$4 ~ /:22$/ {print "[sshd] listening on",$4}'
+echo "[CN][sshd] applying bootstrap config (listen on all, allow pass+root) ..."
+if sshd -t; then systemctl restart sshd || service ssh restart || true; fi
+ss -ltnp | awk '$4 ~ /:22$/ {print "[CN][sshd] listening on",$4}'
 RS
 
 # ---------- runner helpers ----------
 ensure_sshpass_runner() {
   if command -v sshpass >/dev/null 2>&1; then return 0; fi
-  echo "[bootstrap] sshpass not found on runner; installing (no upgrades/no popups)..."
+  echo "[runner] sshpass not found; installing on runner (no upgrades/no popups)..."
   if command -v apt-get >/dev/null 2>&1; then
     sudo -E apt-get install -yq --no-install-recommends --no-upgrade sshpass
   elif command -v yum >/dev/null 2>&1; then
     sudo -E yum install -y sshpass
   else
-    echo "[bootstrap] ❌ Unknown package manager on runner"; exit 1
+    echo "[runner] ❌ Unknown package manager on runner"; exit 1
   fi
 }
 
 ensure_keypair() {
   if [[ ! -s "${SSH_KEY}" ]]; then
-    echo "[bootstrap] SSH private key not found → generating: ${SSH_KEY}"
+    echo "[runner] SSH private key not found → generating: ${SSH_KEY}"
     mkdir -p "$(dirname "${SSH_KEY}")"
     ssh-keygen -q -t rsa -N '' -f "${SSH_KEY}"
     chmod 600 "${SSH_KEY}"
@@ -317,7 +318,7 @@ copy_key_to() {
   local tgt="$1" pass="$2"
   ssh-keygen -q -R "${tgt}" >/dev/null 2>&1 || true
   echo "[bootstrap] ssh-copy-id → ${tgt}"
-  if timeout 5 sshpass -p "$pass" ssh-copy-id \
+  if timeout 7 sshpass -p "$pass" ssh-copy-id \
         -i "${SSH_KEY}.pub" \
         -o StrictHostKeyChecking=no \
         -o PreferredAuthentications=password \
@@ -327,7 +328,7 @@ copy_key_to() {
     return 0
   fi
   echo "[bootstrap] ssh-copy-id failed/timed out; fallback append → ${tgt}"
-  timeout 5 sshpass -p "$pass" ssh \
+  timeout 7 sshpass -p "$pass" ssh \
         -o StrictHostKeyChecking=no \
         -o PreferredAuthentications=password \
         -o PubkeyAuthentication=no \
@@ -336,39 +337,47 @@ copy_key_to() {
         "umask 077 && mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && printf '%s\\n' '$(cat "${SSH_KEY}.pub")' >> ~/.ssh/authorized_keys"
 }
 
-# ---------- ensure sshpass on the CN itself (per your requirement) ----------
+# ---------- FORCE install sshpass on the CN with loud logs ----------
 ensure_sshpass_on_cn() {
   local host="$1"
-  # Try via key if available
+  echo "[CN][${host}] ensuring sshpass (key path if possible, else password)..."
   if key_ok "${host}"; then
     ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
       set -euo pipefail
       export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SVC=l UCF_FORCE_CONFFOLD=1
-      if command -v sshpass >/dev/null 2>&1; then exit 0; fi
+      if command -v sshpass >/dev/null 2>&1; then echo "[CN] sshpass already present"; exit 0; fi
       if command -v apt-get >/dev/null 2>&1; then
-        apt-get install -yq --no-install-recommends --no-upgrade sshpass
+        echo "[CN] installing sshpass via apt-get (no-upgrade) ..."
+        apt-get install -yq --no-install-recommends --no-upgrade sshpass && echo "[CN] sshpass INSTALLED"
       elif command -v yum >/dev/null 2>&1; then
-        yum install -y sshpass
+        echo "[CN] installing sshpass via yum ..."
+        yum install -y sshpass && echo "[CN] sshpass INSTALLED"
       else
-        exit 0
+        echo "[CN] package manager not found; skip sshpass"
       fi
     ' || true
-    return 0
-  fi
-  # Fallback via password if key not yet accepted on CN
-  if command -v sshpass >/dev/null 2>&1; then
+  else
+    # password path on CN (runner must have sshpass)
     sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no "root@${host}" bash -lc '
       set -euo pipefail
       export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SVC=l UCF_FORCE_CONFFOLD=1
-      if command -v sshpass >/dev/null 2>&1; then exit 0; fi
+      if command -v sshpass >/dev/null 2>&1; then echo "[CN] sshpass already present"; exit 0; fi
       if command -v apt-get >/dev/null 2>&1; then
-        apt-get install -yq --no-install-recommends --no-upgrade sshpass
+        echo "[CN] installing sshpass via apt-get (no-upgrade) ..."
+        apt-get install -yq --no-install-recommends --no-upgrade sshpass && echo "[CN] sshpass INSTALLED"
       elif command -v yum >/dev/null 2>&1; then
-        yum install -y sshpass
+        echo "[CN] installing sshpass via yum ..."
+        yum install -y sshpass && echo "[CN] sshpass INSTALLED"
       else
-        exit 0
+        echo "[CN] package manager not found; skip sshpass"
       fi
     ' || true
+  fi
+  # verify & print on runner
+  if timeout 5 ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" 'command -v sshpass >/dev/null 2>&1 && echo "[CN] sshpass present" || echo "[CN] sshpass MISSING"' 2>/dev/null; then
+    : # printed by CN
+  else
+    echo "[CN][${host}] sshpass verification skipped (no key yet)"
   fi
 }
 
@@ -395,7 +404,7 @@ for host in "${HOSTS[@]}"; do
     rc_warn=1
   fi
 
-  # 2) Ensure sshpass on the CN (requested)
+  # 2) Install sshpass on CN (FORCED, with clear logs)
   ensure_sshpass_on_cn "${host}" || true
 
   # 3) Fix sshd binding/auth on the CN so it listens on alias IP and allows bootstrap
@@ -406,21 +415,31 @@ for host in "${HOSTS[@]}"; do
 
   # 4) Ensure key-based SSH for host IP
   key_ok "${host}" || copy_key_to "${host}" "${CN_BOOTSTRAP_PASS}" || rc_warn=1
-  key_ok "${host}" && echo "[bootstrap][${host}] ✅ key OK (host IP)" || { echo "[bootstrap][${host}] ❌ key still failing (host IP)"; rc_warn=1; }
+  if key_ok "${host}"; then
+    echo "[bootstrap][${host}] ✅ key OK (host IP)"
+  else
+    echo "[bootstrap][${host}] ❌ key still failing (host IP)"; rc_warn=1
+  fi
 
   # 5) Ensure key-based SSH for alias IP
   if [[ -n "${ALIAS_IP}" ]]; then
     key_ok "${ALIAS_IP}" || copy_key_to "${ALIAS_IP}" "${CN_BOOTSTRAP_PASS}" || rc_warn=1
-    key_ok "${ALIAS_IP}" && echo "[bootstrap][${host}] ✅ key OK (alias ${ALIAS_IP})" || { echo "[bootstrap][${host}] ⚠️ key still failing (alias ${ALIAS_IP})"; rc_warn=1; }
+    if key_ok "${ALIAS_IP}"; then
+      echo "[bootstrap][${host}] ✅ key OK (alias ${ALIAS_IP})"
+    else
+      echo "[bootstrap][${host}] ❌ key still failing (alias ${ALIAS_IP})"
+      rc_warn=1
+    fi
   fi
 done
 
-# Do not hard-fail here; install has its own robust retries.
+# Don't hard-fail here; main install has its own retries.
 exit 0
 '''
-        }
-      }
     }
+  }
+}
+
 
     stage('Reset &/or Fetch (parallel)') {
       parallel {
