@@ -116,30 +116,62 @@ exit 2
 RS
 
 # 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>/<TAG>, waiting for a tar if needed
+#    On success, ECHO the actual TRILLIUM directory path to stdout (caller captures it).
+# $1=root_base_dir (normalized), $2=BASE, $3=TAG, $4=WAIT_SECS
 read -r -d '' ENSURE_TRILLIUM_EXTRACTED <<'RS' || true
 set -euo pipefail
 ROOT="$1"; BASE="$2"; TAG="$3"; WAIT="${4:-0}"
 DEST_DIR="$ROOT/$BASE/$TAG"
+
 mkdir -p "$DEST_DIR"
 shopt -s nullglob
-matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
-if (( ${#matches[@]} )); then
-  echo "[TRIL] Found existing dir: ${matches[0]}"; echo "${matches[0]}"; exit 0
+
+# ✓ Consider "already extracted" ONLY if a DIRECTORY exists
+dir_candidates=( "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*/ )
+if (( ${#dir_candidates[@]} )); then
+  # strip trailing slash when echoing
+  found_dir="${dir_candidates[0]%/}"
+  echo "[TRIL] Found existing dir: ${found_dir}"
+  echo "${found_dir}"
+  exit 0
 fi
-tars=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz" "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*.tar.gz )
+
+# Candidate tars: prefer exact name, then wildcard
+exact_tar="$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz"
+wild_tars=( "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*.tar.gz )
+
+# Wait for tar to appear (exact preferred)
 elapsed=0; interval=3; found_tar=""
 while :; do
-  for f in "${tars[@]}"; do if [[ -s "$f" ]]; then found_tar="$f"; break; fi; done
+  if [[ -s "$exact_tar" ]]; then found_tar="$exact_tar"; break; fi
+  for f in "${wild_tars[@]}"; do
+    [[ -s "$f" ]] && { found_tar="$f"; break; }
+  done
   [[ -n "$found_tar" || $elapsed -ge $WAIT ]] && break
-  echo "[TRIL] Waiting for tar in $DEST_DIR ... (${elapsed}/${WAIT}s)"; sleep "$interval"; elapsed=$((elapsed+interval))
+  echo "[TRIL] Waiting for tar in $DEST_DIR ... (${elapsed}/${WAIT}s)"
+  sleep "$interval"; elapsed=$((elapsed+interval))
 done
-[[ -n "$found_tar" ]] || { echo "[ERROR] No TRILLIUM tar found in $DEST_DIR after ${WAIT}s"; exit 2; }
+
+if [[ -z "$found_tar" ]]; then
+  echo "[ERROR] No TRILLIUM tar found in $DEST_DIR after ${WAIT}s"; exit 2
+fi
+
+# Extract ONLY the chosen tar
 echo "[TRIL] Extracting $(basename "$found_tar") into $DEST_DIR ..."
 tar -C "$DEST_DIR" -xzf "$found_tar"
-matches=( "$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}"* )
-[[ ${#matches[@]} -gt 0 ]] || { echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2; }
-echo "[TRIL] Extracted dir: ${matches[0]}"; echo "${matches[0]}"
+
+# After extraction, find the extracted directory (not the tar)
+dir_candidates=( "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*/ )
+if (( ${#dir_candidates[@]} )); then
+  found_dir="${dir_candidates[0]%/}"
+  echo "[TRIL] Extracted dir: ${found_dir}"
+  echo "${found_dir}"
+  exit 0
+fi
+
+echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2
 RS
+
 
 # 3) Preflight: ensure kube ports are free (6443/10257)
 read -r -d '' FREE_PORTS_SNIPPET <<'RS' || true
