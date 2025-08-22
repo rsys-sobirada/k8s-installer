@@ -196,6 +196,12 @@ pipeline {
       steps { checkout scm }
     }
 
+    stage('Show inputs') {
+      steps {
+        echo "INSTALL_MODE='${params.INSTALL_MODE}'  FETCH_BUILD='${params.FETCH_BUILD}'  NEW_VERSION='${params.NEW_VERSION}'  OLD_VERSION='${params.OLD_VERSION}'"
+      }
+    }
+
     // ✅ Single source of truth for SSH readiness; also pushes key via CN_BOOTSTRAP_PASS if needed
     stage('Preflight SSH to CNs') {
       steps {
@@ -217,35 +223,24 @@ echo "[preflight] Hosts: ${HOSTS}"
 
 push_key_if_needed() {
   local host="$1"
-
-  # Try key login first
   if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true 2>/dev/null; then
     echo "[preflight] ${host}: ✅ key login OK"
     return 0
   fi
-
-  # If key login failed and a password is provided, push the key once
   if [ -n "${CN_BOOTSTRAP_PASS:-}" ]; then
     if ! command -v sshpass >/dev/null 2>&1; then
       echo "[preflight] ERROR: sshpass required but not installed on the Jenkins agent."
       exit 2
     fi
     echo "[preflight] ${host}: ⛏️ pushing Jenkins key via password…"
-
-    # Prepare ~/.ssh and perms
     sshpass -p "${CN_BOOTSTRAP_PASS}" \
       ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
       "root@${host}" 'install -m700 -d /root/.ssh; touch /root/.ssh/authorized_keys; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys'
-
-    # Copy pubkey file and append if missing (safe, no brittle quoting)
     sshpass -p "${CN_BOOTSTRAP_PASS}" \
       scp -o StrictHostKeyChecking=no "${PUB_KEY_FILE}" "root@${host}:/root/.jenkins_key.pub.tmp"
-
     sshpass -p "${CN_BOOTSTRAP_PASS}" \
       ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
       "root@${host}" 'grep -Fxf /root/.jenkins_key.pub.tmp /root/.ssh/authorized_keys >/dev/null || cat /root/.jenkins_key.pub.tmp >> /root/.ssh/authorized_keys; rm -f /root/.jenkins_key.pub.tmp'
-
-    # Clear potentially stale known_hosts on the agent and re-test
     ssh-keygen -R "${host}" >/dev/null 2>&1 || true
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" 'echo "[preflight] ✅ key login OK on $(hostname)"'
   else
@@ -274,7 +269,8 @@ echo "[preflight] ✅ All CNs accept Jenkins key. Proceeding."
     stage('Validate inputs') {
       steps {
         script {
-          if (params.INSTALL_MODE != 'Fresh_installation' && !(params.OLD_BUILD_PATH_UI ?: '').toString().trim()) {
+          if ((params.INSTALL_MODE ?: '').toString().trim() != 'Fresh_installation' &&
+              !((params.OLD_BUILD_PATH_UI ?: '').toString().trim())) {
             error "OLD_BUILD_PATH is required for ${params.INSTALL_MODE}"
           }
         }
@@ -283,7 +279,7 @@ echo "[preflight] ✅ All CNs accept Jenkins key. Proceeding."
 
     // -------- Pre-bootstrap: Fresh_installation only --------
     stage('Pre-bootstrap keys (Fresh only)') {
-      when { expression { return params.INSTALL_MODE == 'Fresh_installation' } }
+      when { expression { (params.INSTALL_MODE ?: '').toString().trim() == 'Fresh_installation' } }
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
@@ -324,6 +320,7 @@ EOF
 }
 
 for h in ${HOSTS}; do
+  # ensure alias exists first so the ssh-copy-id step can reach it
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
     set -euo pipefail
     ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "'"${INSTALL_IP_ADDR}"'" || {
@@ -340,31 +337,38 @@ done
       }
     }
 
+    // -------- Reset &/or Fetch (parallel, with failFast) --------
     stage('Reset &/or Fetch (parallel)') {
       parallel {
+        failFast true
+
         stage('Cluster reset (auto from INSTALL_MODE)') {
-          when { expression { return params.INSTALL_MODE == 'Upgrade_with_cluster_reset' } }
+          when { expression { (params.INSTALL_MODE ?: '').toString().trim() == 'Upgrade_with_cluster_reset' } }
           steps {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
               sh '''
-                set -eu
-                echo ">>> Cluster reset starting (INSTALL_MODE=Upgrade_with_cluster_reset)"
-                sed -i 's/\r$//' scripts/cluster_reset.sh || true
-                chmod +x scripts/cluster_reset.sh
-                env \
-                  CLUSTER_RESET=true \
-                  OLD_VERSION="${OLD_VERSION}" \
-                  OLD_BUILD_PATH="${OLD_BUILD_PATH_UI}" \
-                  K8S_VER="${K8S_VER}" \
-                  KSPRAY_DIR="kubespray-2.27.0" \
-                  RESET_YML_WS="$WORKSPACE/reset.yml" \
-                  SSH_KEY="${SSH_KEY}" \
-                  SERVER_FILE="${SERVER_FILE}" \
-                  REQ_WAIT_SECS="360" \
-                  RETRY_COUNT="3" \
-                  RETRY_DELAY_SECS="10" \
-                bash -euo pipefail scripts/cluster_reset.sh
-              '''
+set -eu
+echo ">>> Cluster reset starting (INSTALL_MODE=Upgrade_with_cluster_reset)"
+sed -i 's/\r$//' scripts/cluster_reset.sh || true
+chmod +x scripts/cluster_reset.sh
+env \
+  CLUSTER_RESET=true \
+  OLD_VERSION="${OLD_VERSION}" \
+  OLD_BUILD_PATH="${OLD_BUILD_PATH_UI}" \
+  K8S_VER="${K8S_VER}" \
+  KSPRAY_DIR="kubespray-2.27.0" \
+  RESET_YML_WS="$WORKSPACE/reset.yml" \
+  SSH_KEY="${SSH_KEY}" \
+  SERVER_FILE="${SERVER_FILE}" \
+  REQ_WAIT_SECS="360" \
+  RETRY_COUNT="3" \
+  RETRY_DELAY_SECS="10" \
+bash -euo pipefail scripts/cluster_reset.sh
+
+# Marker for downstream gating
+touch "$WORKSPACE/.cluster_reset_done"
+echo "[reset] Wrote marker $WORKSPACE/.cluster_reset_done"
+'''
             }
           }
         }
@@ -374,43 +378,50 @@ done
           steps {
             timeout(time: 20, unit: 'MINUTES', activity: true) {
               sh '''
-                set -eu
-                sed -i 's/\r$//' scripts/fetch_build.sh || true
-                chmod +x scripts/fetch_build.sh
+set -eu
+sed -i 's/\r$//' scripts/fetch_build.sh || true
+chmod +x scripts/fetch_build.sh
 
-                if [ -n "${BUILD_SRC_PASS:-}" ]; then
-                  if ! command -v sshpass >/dev/null 2>&1; then
-                    echo "ERROR: sshpass is required on this agent for password-based SCP/SSH to BUILD_SRC_HOST." >&2
-                    exit 2
-                  fi
-                fi
+if [ -n "${BUILD_SRC_PASS:-}" ]; then
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo "ERROR: sshpass is required on this agent for password-based SCP/SSH to BUILD_SRC_HOST." >&2
+    exit 2
+  fi
+fi
 
-                echo "Targets from ${SERVER_FILE}:"
-                awk 'NF && $1 !~ /^#/' "${SERVER_FILE}" || true
+echo "Targets from ${SERVER_FILE}:"
+awk 'NF && $1 !~ /^#/' "${SERVER_FILE}" || true
 
-                NEW_VERSION="${NEW_VERSION}" \
-                NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-                SERVER_FILE="${SERVER_FILE}" \
-                BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
-                BUILD_SRC_USER="${BUILD_SRC_USER}" \
-                BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
-                BUILD_SRC_PASS="${BUILD_SRC_PASS:-}" \
-                CN_SSH_KEY="${SSH_KEY}" \
-                EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
-                bash -euo pipefail scripts/fetch_build.sh
-              '''
+NEW_VERSION="${NEW_VERSION}" \
+NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+SERVER_FILE="${SERVER_FILE}" \
+BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
+BUILD_SRC_USER="${BUILD_SRC_USER}" \
+BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
+BUILD_SRC_PASS="${BUILD_SRC_PASS:-}" \
+CN_SSH_KEY="${SSH_KEY}" \
+EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
+bash -euo pipefail scripts/fetch_build.sh
+'''
             }
           }
         }
       }
     }
 
-    // -------- Cluster install with auto-retry on SSH permission denial --------
+    // -------- Cluster install gated on reset marker when required --------
     stage('Cluster install') {
       steps {
         timeout(time: 20, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
+
+if [ "${INSTALL_MODE:-}" = "Upgrade_with_cluster_reset" ] && [ ! -f "$WORKSPACE/.cluster_reset_done" ]; then
+  echo "[gate] INSTALL_MODE=Upgrade_with_cluster_reset but reset marker not found: $WORKSPACE/.cluster_reset_done"
+  echo "[gate] This usually means the reset stage didn't run or failed."
+  exit 2
+fi
+
 echo ">>> Cluster install starting (mode: ${INSTALL_MODE})"
 sed -i 's/\r$//' scripts/cluster_install.sh || true
 chmod +x scripts/cluster_install.sh
@@ -439,7 +450,6 @@ set -e
 
 if grep -q "Permission denied (publickey,password)" /tmp/cluster_install.out; then
   echo "[auto-recovery] SSH permission denied detected → re-running bootstrap on each host and retrying install once."
-
   ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
   HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
   for h in ${HOSTS}; do
