@@ -170,7 +170,7 @@ return """<input type='password' class='setting-input' name='value' value=''/>""
            defaultValue: '10.10.10.20/24',
            description: 'Alias IP/CIDR to plumb on CN servers'),
 
-    // -------- OPTIONAL bootstrap control (no defaultValue to avoid warnings) --------
+    // -------- OPTIONAL bootstrap control (no defaultValue) --------
     password(
       name: 'CN_BOOTSTRAP_PASS',
       description: 'One-time CN root password (used to push Jenkins key if needed).'
@@ -196,7 +196,7 @@ pipeline {
       steps { checkout scm }
     }
 
-    // Guarantees key-based SSH to all CNs; uses CN_BOOTSTRAP_PASS if needed
+    // ✅ Single source of truth for SSH readiness; also pushes key via CN_BOOTSTRAP_PASS if needed
     stage('Preflight SSH to CNs') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
