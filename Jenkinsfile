@@ -337,11 +337,9 @@ done
       }
     }
 
-    // -------- Reset &/or Fetch (parallel, with failFast) --------
+    // -------- Reset &/or Fetch (parallel) --------
     stage('Reset &/or Fetch (parallel)') {
       parallel {
-        failFast true
-
         stage('Cluster reset (auto from INSTALL_MODE)') {
           when { expression { (params.INSTALL_MODE ?: '').toString().trim() == 'Upgrade_with_cluster_reset' } }
           steps {
