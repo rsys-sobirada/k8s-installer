@@ -1,35 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ---------- Resolve IP ----------
-# Prefer env IP; else accept --alias-ip <ip>; ignore other flags.
+# Resolve IP the same way you’ve been passing it
 IP="${IP:-}"
 if [[ -z "${IP}" && $# -gt 0 ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --alias-ip) IP="${2:-}"; shift 2 ;;
-      --host|--pass|--key) shift 2 ;;   # ignore these flags + their values
-      --force) shift ;;                 # ignore flag without value
-      --*) shift ;;                     # ignore unknown flags
-      *) shift ;;                       # ignore stray args
+      --host|--pass|--key) shift 2 ;;
+      --force) shift ;;
+      --*) shift ;;
+      *) shift ;;
     esac
   done
 fi
-
-# Strip CIDR mask and sanitize (trim/strip CR/LF/quotes)
 IP="${IP%%/*}"
-IP="$(printf '%s' "$IP" | tr -d '\r\n\"' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-
-# Validate IPv4
 if ! [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-  echo "ERROR: IP is empty or malformed after sanitization: '$(printf %q "$IP")'" >&2
+  echo "ERROR: IP is empty or malformed: '$IP'" >&2
   exit 2
 fi
 
-# ---------- Your requested lines (with non-interactive keygen guard) ----------
+# --- your requested sequence, with tiny hardening for host key ---
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 [[ -s ~/.ssh/id_rsa ]] || ssh-keygen -q -t rsa -N '' -f ~/.ssh/id_rsa
-ssh-copy-id root@"${IP}"
+
+# NEW: clear any stale key and pre-seed the current one to avoid the popup
+ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}" >/dev/null 2>&1 || true
+ssh-keyscan -H "${IP}" >> /root/.ssh/known_hosts 2>/dev/null || true
+
+# Add -o StrictHostKeyChecking=no to bypass interactivity on first contact
+ssh-copy-id -o StrictHostKeyChecking=no root@"${IP}"
+
 cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
-ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}" || true
+ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}" >/dev/null 2>&1 || true
 systemctl restart sshd
