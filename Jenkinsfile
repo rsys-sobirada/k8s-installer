@@ -174,7 +174,7 @@ return """<input type='password' class='setting-input' name='value' value=''/>""
     password(
       name: 'CN_BOOTSTRAP_PASS',
       defaultValue: '',
-      description: 'One-time CN root password (if you ever need sshpass locally). Not used by bootstrap_keys.sh.'
+      description: 'One-time CN root password (used to push Jenkins key if needed).'
     )
   ])
 ])
@@ -196,12 +196,85 @@ pipeline {
     stage('Checkout') {
       steps { checkout scm }
     }
-stage('Bootstrap Jenkins key to CN (optional)') {
-  // Runs only if you provide CN_BOOTSTRAP_PASS in the job parameters
-  when { expression { return params.CN_BOOTSTRAP_PASS?.trim() } }
-  steps {
-    timeout(time: 8, unit: 'MINUTES', activity: true) {
-      sh '''#!/usr/bin/env bash
+
+    // NEW: Defensive preflight that guarantees key-based SSH works to all CNs
+    stage('Preflight SSH to CNs') {
+      steps {
+        timeout(time: 10, unit: 'MINUTES', activity: true) {
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"
+
+PUB_KEY_FILE="${SSH_KEY}.pub"
+if [ ! -s "${PUB_KEY_FILE}" ]; then
+  echo "[preflight] Generating Jenkins SSH key at ${SSH_KEY} (no passphrase)…"
+  install -m 700 -d "$(dirname "${SSH_KEY}")"
+  ssh-keygen -q -t rsa -N "" -f "${SSH_KEY}"
+fi
+PUB_KEY="$(cat "${PUB_KEY_FILE}")"
+ssh-keygen -lf "${PUB_KEY_FILE}" || true
+
+HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
+[ -n "${HOSTS}" ] || { echo "[preflight] ERROR: No hosts parsed from ${SERVER_FILE}"; exit 2; }
+echo "[preflight] Hosts: ${HOSTS}"
+
+push_key_if_needed() {
+  local host="$1"
+  set +e
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true
+  local rc=$?
+  set -e
+  if [ $rc -eq 0 ]; then
+    echo "[preflight] ${host}: ✅ key login OK"
+    return 0
+  fi
+
+  if [ -n "${CN_BOOTSTRAP_PASS:-}" ]; then
+    if ! command -v sshpass >/dev/null 2>&1; then
+      echo "[preflight] ERROR: sshpass required but not installed on the Jenkins agent."
+      exit 2
+    fi
+    echo "[preflight] ${host}: ⛏️ pushing Jenkins key via password…"
+    sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${host}" bash -lc '
+      set -euo pipefail
+      install -m700 -d /root/.ssh
+      touch /root/.ssh/authorized_keys
+      chmod 600 /root/.ssh/authorized_keys
+    '
+    sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${host}" bash -lc "
+      grep -Fqx '${PUB_KEY}' /root/.ssh/authorized_keys || echo '${PUB_KEY}' >> /root/.ssh/authorized_keys
+    "
+    ssh-keygen -R "${host}" >/dev/null 2>&1 || true
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" 'echo "[preflight] ✅ key login OK on $(hostname)"'
+  else
+    echo "[preflight] ${host}: ❌ key login failed and CN_BOOTSTRAP_PASS not provided"
+    return 1
+  fi
+}
+
+fail=0
+for h in ${HOSTS}; do
+  echo "[preflight] Testing ${h}…"
+  push_key_if_needed "${h}" || fail=1
+done
+
+if [ $fail -ne 0 ]; then
+  echo "[preflight] ❌ One or more hosts failed SSH preflight."
+  exit 1
+fi
+
+echo "[preflight] ✅ All CNs accept Jenkins key. Proceeding."
+'''
+        }
+      }
+    }
+
+    // (kept) Optional bulk bootstrap if you want a dedicated run
+    stage('Bootstrap Jenkins key to CN (optional)') {
+      when { expression { return params.CN_BOOTSTRAP_PASS?.trim() } }
+      steps {
+        timeout(time: 8, unit: 'MINUTES', activity: true) {
+          sh '''#!/usr/bin/env bash
 set -euo pipefail
 
 : "${SERVER_FILE:?missing}"
@@ -221,30 +294,26 @@ if [ ! -s "${PUB_KEY_FILE}" ]; then
 fi
 PUB_KEY="$(cat "${PUB_KEY_FILE}")"
 
-# Enumerate hosts from server_pci_map.txt (supports lines like: "role:IP" or just "IP")
 HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
 echo "[key-push] Hosts: ${HOSTS}"
 
 for h in ${HOSTS}; do
   echo "[key-push] -> ${h}"
-  # Prepare ~/.ssh with password auth
   sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${h}" bash -lc '
     set -euo pipefail
     install -m 700 -d /root/.ssh
     touch /root/.ssh/authorized_keys
     chmod 600 /root/.ssh/authorized_keys
   '
-  # Append Jenkins pubkey if missing (idempotent)
   sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${h}" bash -lc "
     grep -Fqx '${PUB_KEY}' /root/.ssh/authorized_keys || echo '${PUB_KEY}' >> /root/.ssh/authorized_keys
   "
-  # Sanity check: now key-only login must work
   ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" 'echo "[key-push] ✅ key login OK on $(hostname)"'
 done
 '''
+        }
+      }
     }
-  }
-}
 
     stage('Validate inputs') {
       steps {
@@ -276,7 +345,6 @@ bootstrap_one() {
   echo ""
   echo "─── Host ${host} ───────────────────────────────────────"
 
-  # write tiny script on CN that uses the EXACT lines you requested
   SCRIPT_CONTENT='#!/usr/bin/env bash
 set -euo pipefail
 IP="$1"
@@ -288,7 +356,6 @@ ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}"
 systemctl restart sshd
 '
 
-  # copy & run with the alias IP (no env dependency on the CN)
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
     set -euo pipefail
     cat > /root/bootstrap_keys.sh <<'"'"'EOF'"'"'
@@ -301,7 +368,6 @@ EOF
 }
 
 for h in ${HOSTS}; do
-  # ensure alias exists first so the ssh-copy-id step can reach it
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
     set -euo pipefail
     ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "'"${INSTALL_IP_ADDR}"'" || {
@@ -418,7 +484,6 @@ set -e
 if grep -q "Permission denied (publickey,password)" /tmp/cluster_install.out; then
   echo "[auto-recovery] SSH permission denied detected → re-running bootstrap on each host and retrying install once."
 
-  # Re-bootstrap on all hosts with the exact-lines script (no env inside CN script)
   ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
   HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
   for h in ${HOSTS}; do
@@ -440,7 +505,6 @@ EOF
     '
   done
 
-  # Retry once
   set +e
   run_install
   RC=$?
@@ -453,7 +517,7 @@ exit $RC
       }
     }
 
-    // ---------- Health check after cluster install (runs kubectl on CN host) ----------
+    // ---------- Health check after cluster install ----------
     stage('Cluster health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
@@ -492,7 +556,7 @@ ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
       kubectl get pods -A || true
       exit 1
     fi
-  fi
+  }
 '
 '''
         }
