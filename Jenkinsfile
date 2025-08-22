@@ -196,6 +196,55 @@ pipeline {
     stage('Checkout') {
       steps { checkout scm }
     }
+stage('Bootstrap Jenkins key to CN (optional)') {
+  // Runs only if you provide CN_BOOTSTRAP_PASS in the job parameters
+  when { expression { return params.CN_BOOTSTRAP_PASS?.trim() } }
+  steps {
+    timeout(time: 8, unit: 'MINUTES', activity: true) {
+      sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+: "${SERVER_FILE:?missing}"
+: "${SSH_KEY:?missing}"
+: "${CN_BOOTSTRAP_PASS:?missing}"
+
+if ! command -v sshpass >/dev/null 2>&1; then
+  echo "ERROR: sshpass is required on this Jenkins agent to push keys with CN_BOOTSTRAP_PASS." >&2
+  exit 2
+fi
+
+PUB_KEY_FILE="${SSH_KEY}.pub"
+if [ ! -s "${PUB_KEY_FILE}" ]; then
+  echo "Generating Jenkins SSH key at ${SSH_KEY} (no passphrase)..."
+  install -m 700 -d "$(dirname "${SSH_KEY}")"
+  ssh-keygen -q -t rsa -N "" -f "${SSH_KEY}"
+fi
+PUB_KEY="$(cat "${PUB_KEY_FILE}")"
+
+# Enumerate hosts from server_pci_map.txt (supports lines like: "role:IP" or just "IP")
+HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
+echo "[key-push] Hosts: ${HOSTS}"
+
+for h in ${HOSTS}; do
+  echo "[key-push] -> ${h}"
+  # Prepare ~/.ssh with password auth
+  sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${h}" bash -lc '
+    set -euo pipefail
+    install -m 700 -d /root/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+  '
+  # Append Jenkins pubkey if missing (idempotent)
+  sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${h}" bash -lc "
+    grep -Fqx '${PUB_KEY}' /root/.ssh/authorized_keys || echo '${PUB_KEY}' >> /root/.ssh/authorized_keys
+  "
+  # Sanity check: now key-only login must work
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" 'echo "[key-push] ✅ key login OK on $(hostname)"'
+done
+'''
+    }
+  }
+}
 
     stage('Validate inputs') {
       steps {
