@@ -170,7 +170,7 @@ return """<input type='password' class='setting-input' name='value' value=''/>""
            defaultValue: '10.10.10.20/24',
            description: 'Alias IP/CIDR to plumb on CN servers'),
 
-    // -------- OPTIONAL bootstrap control (password param; no defaultValue) --------
+    // -------- OPTIONAL bootstrap control (no defaultValue to avoid warnings) --------
     password(
       name: 'CN_BOOTSTRAP_PASS',
       description: 'One-time CN root password (used to push Jenkins key if needed).'
@@ -210,8 +210,6 @@ if [ ! -s "${PUB_KEY_FILE}" ]; then
   install -m 700 -d "$(dirname "${SSH_KEY}")"
   ssh-keygen -q -t rsa -N "" -f "${SSH_KEY}"
 fi
-PUB_KEY="$(cat "${PUB_KEY_FILE}")"
-ssh-keygen -lf "${PUB_KEY_FILE}" || true
 
 HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
 [ -n "${HOSTS}" ] || { echo "[preflight] ERROR: No hosts parsed from ${SERVER_FILE}"; exit 2; }
@@ -237,17 +235,18 @@ push_key_if_needed() {
     # Prepare ~/.ssh and perms
     sshpass -p "${CN_BOOTSTRAP_PASS}" \
       ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-      "root@${host}" bash -lc 'set -euo pipefail; install -m700 -d /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys'
+      "root@${host}" 'install -m700 -d /root/.ssh; touch /root/.ssh/authorized_keys; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys'
 
-    # Append key if missing (idempotent)
+    # Copy pubkey file and append if missing (safe, no brittle quoting)
+    sshpass -p "${CN_BOOTSTRAP_PASS}" \
+      scp -o StrictHostKeyChecking=no "${PUB_KEY_FILE}" "root@${host}:/root/.jenkins_key.pub.tmp"
+
     sshpass -p "${CN_BOOTSTRAP_PASS}" \
       ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-      "root@${host}" bash -lc "set -euo pipefail; KEY=\"${PUB_KEY}\"; grep -Fqx \"\$KEY\" /root/.ssh/authorized_keys || echo \"\$KEY\" >> /root/.ssh/authorized_keys"
+      "root@${host}" 'grep -Fxf /root/.jenkins_key.pub.tmp /root/.ssh/authorized_keys >/dev/null || cat /root/.jenkins_key.pub.tmp >> /root/.ssh/authorized_keys; rm -f /root/.jenkins_key.pub.tmp'
 
-    # Clear potentially stale known_hosts on the agent
+    # Clear potentially stale known_hosts on the agent and re-test
     ssh-keygen -R "${host}" >/dev/null 2>&1 || true
-
-    # Retry key login
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" 'echo "[preflight] ✅ key login OK on $(hostname)"'
   else
     echo "[preflight] ${host}: ❌ key login failed and CN_BOOTSTRAP_PASS not provided"
