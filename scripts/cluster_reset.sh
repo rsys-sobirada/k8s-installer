@@ -1,167 +1,306 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# scripts/cluster_reset.sh
+# Uninstall/reset on each CN node, only if CLUSTER_RESET is enabled.
+# - Detects existing clusters via kube ports (6443/10257) OR kubectl pods
+# - Swaps in Jenkins reset.yml and inventory (with restore)
+# - Uninstall with retries + delay; frees kube ports before/after each try
+# - SSH key auth to root@<ip>
+
 set -euo pipefail
 
-# Required envs passed by Jenkins
-: "${CLUSTER_RESET:?missing}"
-: "${OLD_VERSION:?missing}"         # e.g. 6.3.0_EA2 or 6.3.0
-: "${OLD_BUILD_PATH:?missing}"      # e.g. /home/labadmin
-: "${K8S_VER:?missing}"             # e.g. 1.31.4
-: "${KSPRAY_DIR:?missing}"          # e.g. kubespray-2.27.0
-: "${RESET_YML_WS:?missing}"
-: "${SSH_KEY:?missing}"
-: "${SERVER_FILE:?missing}"
-: "${REQ_WAIT_SECS:?missing}"       # e.g. 360
-: "${RETRY_COUNT:?missing}"         # e.g. 3
-: "${RETRY_DELAY_SECS:?missing}"    # e.g. 10
+# ---- Gate ----
+CR="${CLUSTER_RESET:-No}"
+shopt -s nocasematch
+if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
+  echo "ℹ️  CLUSTER_RESET disabled (got '$CR'). Skipping."
+  exit 0
+fi
+shopt -u nocasematch
 
-log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
-die() { log "ERROR: $*"; exit 1; }
+# ---- Inputs ----
+SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
+SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}"     # name:ip[:custom_k8s_base]
+UNINSTALL_NAME="${UNINSTALL_NAME:-uninstall_k8s.sh}"
+KSPRAY_DIR="${KSPRAY_DIR:-kubespray-2.27.0}"
+K8S_VER="${K8S_VER:-1.31.4}"
+REL_SUFFIX="${REL_SUFFIX:-}"
+OLD_VERSION="${OLD_VERSION:-}"          # e.g. 6.3.0_EA1
+OLD_BUILD_PATH="${OLD_BUILD_PATH:-}"    # e.g. /home/labadmin
+REQ_WAIT_SECS="${REQ_WAIT_SECS:-360}"
+RETRY_COUNT="${RETRY_COUNT:-3}"
+RETRY_DELAY_SECS="${RETRY_DELAY_SECS:-10}"   # ⬅️ delay between retries
+RESET_YML_WS="${RESET_YML_WS:-$WORKSPACE/reset.yml}"
 
-# -------------------------------
-# Build path strictly from inputs
-# -------------------------------
-build_reset_root_from_inputs() {
-  # OLD_VERSION can be like "6.3.0_EA2" or "6.3.0"
-  local old_ver="$1"       # OLD_VERSION
-  local base_dir="$2"      # OLD_BUILD_PATH
-  local k8s_ver="$3"       # K8S_VER
+[[ -f "$SSH_KEY" ]]     || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
+chmod 600 "$SSH_KEY" || true
+[[ -f "$SERVER_FILE" ]] || { echo "❌ $SERVER_FILE not found"; exit 1; }
+[[ -f "$RESET_YML_WS" ]]|| { echo "❌ Jenkins reset.yml not found at $RESET_YML_WS"; exit 1; }
 
-  local ver tag base reset_root
-  if [[ "$old_ver" == *_* ]]; then
-    ver="${old_ver%%_*}"   # 6.3.0
-    tag="${old_ver#*_}"    # EA2
-  else
-    ver="$old_ver"         # 6.3.0
-    tag=""
+# ---- Helpers ----
+ver_num(){ echo "${1%%_*}"; }   # 6.3.0_EA1 -> 6.3.0
+ver_tag(){ echo "${1##*_}"; }   # 6.3.0_EA1 -> EA1
+normalize_k8s_path(){
+  local base="${1%/}" ver="$2" num tag
+  num="$(ver_num "$ver")"; tag="$(ver_tag "$ver")"
+  echo "$base/${num}/${tag}/TRILLIUM_5GCN_CNF_REL_${num}${REL_SUFFIX}/common/tools/install/k8s-v${K8S_VER}"
+}
+
+SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
+
+# ---- Remote helpers ----
+remote_file_exists(){
+  local ip="$1" p="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$p" <<'EOF'
+set -euo pipefail; p="$1"; [[ -e "$p" ]]
+EOF
+}
+
+remote_cluster_present(){
+  local ip="$1"
+  # 1) Ports check
+  if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" 'ss -ltn | egrep -q ":(6443|10257)\s"'; then
+    return 0
   fi
-
-  base="${base_dir%/}/${ver}"
-  [[ -n "$tag" ]] && base="${base}/${tag}"
-
-  # Example:
-  # /home/labadmin/6.3.0/EA2/TRILLIUM_5GCN_CNF_REL_6.3.0/common/tools/install/k8s-v1.31.4
-  reset_root="${base}/TRILLIUM_5GCN_CNF_REL_${ver}/common/tools/install/k8s-v${k8s_ver}"
-  printf '%s' "$reset_root"
+  # 2) kubectl check
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s <<'EOF' >/dev/null
+set +e
+check(){ kubectl get pods -A --no-headers 2>/dev/null | grep -q .; }
+if command -v kubectl >/dev/null 2>&1; then
+  check && exit 0
+  if [[ -r /etc/kubernetes/admin.conf ]]; then export KUBECONFIG=/etc/kubernetes/admin.conf; check && exit 0; fi
+fi
+exit 1
+EOF
 }
 
-# ---------------------------------------------
-# Read hosts only (ignore any mapped path part)
-# server_pci_map.txt can be:
-#   name:ip:/some/old/path
-# or
-#   ip
-# or
-#   name ip
-# ---------------------------------------------
-read_targets() {
-  awk '
-    NF && $1 !~ /^#/ {
-      # If line has colon-separated fields name:ip[:path], pick the 2nd as IP
-      if (index($0,":")>0) {
-        n=split($0, a, ":");
-        if (n>=2) print a[2];
-        else      print a[1];
-      } else {
-        # Otherwise, first whitespace field is the host/IP
-        print $1;
-      }
-    }
-  ' "$SERVER_FILE"
-}
-
-# -------------------------
-# Work on a single host/IP
-# -------------------------
-reset_on_host() {
-  local host_ip="$1"
-
-  local reset_root
-  reset_root="$(build_reset_root_from_inputs "$OLD_VERSION" "$OLD_BUILD_PATH" "$K8S_VER")"
-
-  log "🔧 Server: ${host_ip}"
-  log "📁 Path (from Jenkins inputs): ${reset_root}"
-
-  # Run remote steps
-  ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@${host_ip}" bash -euo pipefail -s -- \
-      "$reset_root" "$KSPRAY_DIR" "$REQ_WAIT_SECS" <<'EOSSH'
+force_free_kube_ports(){
+  local ip="$1"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s <<'EOF'
 set -euo pipefail
-RESET_ROOT="$1"
-KSPRAY_DIR="$2"
-REQ_WAIT_SECS="$3"
-
-echo "Jenkins reset root: ${RESET_ROOT}"
-
-if [[ ! -d "${RESET_ROOT}" ]]; then
-  echo "WARN: ${RESET_ROOT} does not exist on this node. Creating directory (to proceed)..." >&2
-  mkdir -p "${RESET_ROOT}"
+systemctl stop kubelet || true
+rm -f /etc/kubernetes/manifests/*.yaml || true
+pkill -f 'kube-apiserver|kube-controller-manager|kube-scheduler' 2>/dev/null || true
+if command -v crictl >/dev/null 2>&1; then
+  crictl ps -a | awk '/kube-apiserver|kube-controller-manager|kube-scheduler/{print $1}' | xargs -r crictl rm -f
 fi
+EOF
+}
 
-# If requirements.txt is not present, kick installer in background (existing behavior)
-REQ_FILE="${RESET_ROOT}/${KSPRAY_DIR}/requirements.txt"
-if [[ ! -f "${REQ_FILE}" ]]; then
-  echo "⏳ ${REQ_FILE} not found → starting install_k8s.sh in background to generate it (if applicable)"
-  # Run from RESET_ROOT if the script exists there; otherwise try to find it
-  cd "${RESET_ROOT}" || exit 1
-  if [[ -x ./install_k8s.sh ]]; then
-    nohup ./install_k8s.sh > /var/log/install_k8s_bg.log 2>&1 &
-    echo "[START] install_k8s.sh pid=$! (log: /var/log/install_k8s_bg.log)"
+start_installer_bg(){
+  local ip="$1" sp="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$sp" <<'EOF'
+set -euo pipefail
+SP="$1"; cd "$SP"
+if [[ -x ./install_k8s.sh || -f ./install_k8s.sh ]]; then
+  ( setsid bash -c 'yes yes | bash ./install_k8s.sh' > install.log 2>&1 & echo $! > install.pid )
+  PGID="$(ps -o pgid= -p "$(cat install.pid)" | tr -d ' ')"
+  echo "$PGID" > install.pgid
+  echo "[START] install_k8s.sh pid=$(cat install.pid) pgid=$PGID"
+else
+  echo "❌ install_k8s.sh not found in $(pwd)"; exit 127
+fi
+EOF
+}
+
+stop_installer_pg(){
+  local ip="$1" sp="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$sp" <<'EOF'
+set +e
+SP="$1"; cd "$SP" 2>/dev/null || exit 0
+echo "[STOP] Pre-kill:"; pgrep -a -f 'install_k8s.sh|ansible-playbook|kubespray' || true
+[[ -f install.pgid ]] && PGID="$(tr -d ' ' < install.pgid 2>/dev/null)" && [[ -n "$PGID" ]] && { kill -TERM -"$PGID" 2>/dev/null; sleep 2; kill -KILL -"$PGID" 2>/dev/null; }
+[[ -f install.pid  ]] && PID="$(tr -d ' ' < install.pid  2>/dev/null)" && [[ -n "$PID"  ]] && { kill -TERM "$PID"    2>/dev/null; sleep 2; kill -KILL "$PID"    2>/dev/null; }
+pkill -f 'install_k8s.sh' 2>/dev/null || true
+pkill -f 'ansible-playbook.*kubespray' 2>/dev/null || true
+rm -f install.pid install.pgid 2>/dev/null || true
+echo "[STOP] Post-kill:"; pgrep -a -f 'install_k8s.sh|ansible-playbook|kubespray' || true
+exit 0
+EOF
+}
+
+push_reset_override(){
+  local ip="$1" sp="$2" swap_id="$3"
+  local remote_tmp="/tmp/ci_reset_${swap_id}.yml"
+  scp $SSH_OPTS -i "$SSH_KEY" "$RESET_YML_WS" "root@$ip:${remote_tmp}"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$sp" "$KSPRAY_DIR" "$remote_tmp" "$swap_id" <<'EOF'
+set -euo pipefail
+SP="$1"; KS="$2"; TMP="$3"; ID="$4"
+BASE="$SP/$KS"
+TGT=""
+if [[ -f "$BASE/playbooks/reset.yml" || ! -f "$BASE/reset.yml" ]]; then
+  mkdir -p "$BASE/playbooks"; TGT="$BASE/playbooks/reset.yml"
+else
+  TGT="$BASE/reset.yml"
+fi
+BK="/tmp/reset_backup_${ID}.yml"; [[ -f "$TGT" ]] && cp -f "$TGT" "$BK" || : > "$BK"
+mv -f "$TMP" "$TGT"
+CTX="/tmp/reset_swap_ctx_${ID}"; printf "TGT=%s\nBK=%s\n" "$TGT" "$BK" > "$CTX"
+echo "[SWAP] Using $TGT; backup at $BK; ctx $CTX"
+EOF
+}
+
+restore_reset_override(){
+  local ip="$1" swap_id="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$swap_id" <<'EOF'
+set +e
+ID="$1"; CTX="/tmp/reset_swap_ctx_${ID}"; [[ -f "$CTX" ]] || { echo "[RESTORE] reset: no ctx"; exit 0; }
+. "$CTX"
+mkdir -p "$(dirname "$TGT")"
+if [[ -s "$BK" ]]; then mv -f "$BK" "$TGT"; echo "[RESTORE] reset: restored to $TGT"; else rm -f "$TGT"; echo "[RESTORE] reset: removed override"; fi
+rm -f "$CTX" 2>/dev/null || true
+EOF
+}
+
+push_inventory_override(){
+  local ip="$1" sp="$2" swap_id="$3"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$sp" "$KSPRAY_DIR" "$swap_id" <<'EOF'
+set -euo pipefail
+SP="$1"; KS="$2"; ID="$3"
+INV_SAMPLE="$SP/$KS/inventory/sample/hosts.yaml"
+INV_REAL="$SP/k8s-yamls/hosts.yaml"
+[[ -f "$INV_REAL" ]] || { echo "[ERROR] Missing real inventory $INV_REAL"; exit 2; }
+mkdir -p "$(dirname "$INV_SAMPLE")"
+BK="/tmp/inventory_backup_${ID}.yml"; [[ -f "$INV_SAMPLE" ]] && cp -f "$INV_SAMPLE" "$BK" || : > "$BK"
+cp -f "$INV_REAL" "$INV_SAMPLE"
+CTX="/tmp/inventory_swap_ctx_${ID}"; printf "INV_SAMPLE=%s\nBK=%s\n" "$INV_SAMPLE" "$BK" > "$CTX"
+echo "[SWAP] inventory: $INV_SAMPLE ← $INV_REAL; backup at $BK; ctx $CTX"
+EOF
+}
+
+restore_inventory_override(){
+  local ip="$1" swap_id="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$swap_id" <<'EOF'
+set +e
+ID="$1"; CTX="/tmp/inventory_swap_ctx_${ID}"; [[ -f "$CTX" ]] || { echo "[RESTORE] inventory: no ctx"; exit 0; }
+. "$CTX"
+mkdir -p "$(dirname "$INV_SAMPLE")"
+if [[ -s "$BK" ]]; then mv -f "$BK" "$INV_SAMPLE"; echo "[RESTORE] inventory: restored $INV_SAMPLE"; else rm -f "$INV_SAMPLE"; echo "[RESTORE] inventory: removed temp"; fi
+rm -f "$CTX" 2>/dev/null || true
+EOF
+}
+
+run_uninstall_with_retries(){
+  local ip="$1" sp="$2"
+  local attempt=1
+  while (( attempt <= RETRY_COUNT )); do
+    echo "🧹 Running $UNINSTALL_NAME on $ip (attempt $attempt/$RETRY_COUNT)..."
+    force_free_kube_ports "$ip" || true
+    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$sp" "$UNINSTALL_NAME" <<'EOF'
+set -euo pipefail
+SP="$1"; NAME="$2"
+cd "$SP"
+sed -i 's/\r$//' "$NAME" 2>/dev/null || true
+bash -x "./$NAME"
+EOF
+    then
+      force_free_kube_ports "$ip" || true
+      echo "✅ Uninstall succeeded on $ip"; return 0
+    fi
+    echo "⚠️ Uninstall attempt $attempt failed on $ip"
+    ((attempt++))
+    (( attempt <= RETRY_COUNT )) && { echo "🔁 Retrying in ${RETRY_DELAY_SECS}s..."; sleep "$RETRY_DELAY_SECS"; }
+  done
+  echo "❌ Uninstall failed after $RETRY_COUNT attempts on $ip"; return 1
+}
+
+# ---- Traps ----
+declare -a SWAP_IDS=()        # "<ip>|<id>"
+declare -a SERVER_CTX=()      # "<ip>|<server_path>"
+ABORTING=0
+on_abort(){
+  [[ "$ABORTING" -eq 1 ]] && return
+  ABORTING=1
+  echo ""
+  echo "⚠️  Abort signal — stopping remote processes and cleaning up..."
+  for entry in "${SERVER_CTX[@]}"; do
+    ip="${entry%%|*}"; sp="${entry#*|}"
+    stop_installer_pg "$ip" "$sp" || true
+  done
+  echo "🔚 Exiting due to abort."
+  exit 130
+}
+trap on_abort INT TERM HUP QUIT
+
+on_exit_restore_all(){
+  local item ip id
+  for item in "${SWAP_IDS[@]}"; do
+    ip="${item%%|*}"; id="${item#*|}"
+    restore_reset_override "$ip" "$id" || true
+    restore_inventory_override "$ip" "$id" || true
+  done
+}
+trap on_exit_restore_all EXIT
+
+# ---- Main ----
+echo "Jenkins reset.yml: $RESET_YML_WS"
+any_failed=0
+
+while IFS=':' read -r name ip maybe_path || [[ -n "${name:-}" ]]; do
+  [[ -z "${name// }" ]] && continue
+  [[ "${name:0:1}" == "#" ]] && continue
+
+  if [[ -n "${maybe_path:-}" ]]; then
+    server_path="${maybe_path%/}"
   else
-    echo "WARN: install_k8s.sh not found in ${RESET_ROOT}. Background start skipped." >&2
+    if [[ -z "${OLD_BUILD_PATH:-}" || -z "${OLD_VERSION:-}" ]]; then
+      echo "❌ $name ($ip): no path provided and OLD_BUILD_PATH/OLD_VERSION not set"
+      any_failed=1; continue
+    fi
+    server_path="$(normalize_k8s_path "$OLD_BUILD_PATH" "$OLD_VERSION")"
   fi
-fi
+  SERVER_CTX+=("$ip|$server_path")
 
-# Wait up to REQ_WAIT_SECS for requirements.txt to appear
-elapsed=0
-while [[ ! -f "${REQ_FILE}" && "${elapsed}" -lt "${REQ_WAIT_SECS}" ]]; do
-  sleep 3
-  elapsed=$((elapsed+3))
-done
+  echo ""
+  echo "🔧 Server: $name ($ip)"
+  echo "📁 Path:   $server_path"
 
-if [[ ! -f "${REQ_FILE}" ]]; then
-  echo "❌ Timed out (${REQ_WAIT_SECS}s) waiting for ${REQ_FILE}" >&2
-  # Best-effort: show any background log if present
-  if [[ -f /var/log/install_k8s_bg.log ]]; then
-    echo "---- /var/log/install_k8s_bg.log (tail) ----"
-    tail -n 100 /var/log/install_k8s_bg.log || true
+  if remote_cluster_present "$ip"; then
+    echo "✅ Kubernetes detected on $ip — proceeding with uninstall."
+  else
+    echo "ℹ️  No Kubernetes detected on $ip. Skipping uninstall for this server."
+    continue
   fi
+
+  req="$server_path/$KSPRAY_DIR/requirements.txt"
+  if remote_file_exists "$ip" "$req"; then
+    echo "✅ requirements.txt present"
+    swap_id="$(date +%s)_$$_$RANDOM"; SWAP_IDS+=("$ip|$swap_id")
+    push_reset_override      "$ip" "$server_path" "$swap_id"
+    push_inventory_override  "$ip" "$server_path" "$swap_id"
+    run_uninstall_with_retries "$ip" "$server_path" || any_failed=1
+    restore_reset_override     "$ip" "$swap_id"
+    restore_inventory_override "$ip" "$swap_id"
+  else
+    echo "⏳ requirements.txt not found → starting install_k8s.sh in background to generate it"
+    start_installer_bg "$ip" "$server_path"
+
+    detected=0; loops=$(( REQ_WAIT_SECS / 2 ))
+    for _ in $(seq 1 "$loops"); do
+      if remote_file_exists "$ip" "$req"; then
+        echo "📄 $req detected → stopping installer"
+        stop_installer_pg "$ip" "$server_path"
+        swap_id="$(date +%s)_$$_$RANDOM"; SWAP_IDS+=("$ip|$swap_id")
+        push_reset_override      "$ip" "$server_path" "$swap_id"
+        push_inventory_override  "$ip" "$server_path" "$swap_id"
+        run_uninstall_with_retries "$ip" "$server_path" || any_failed=1
+        restore_reset_override     "$ip" "$swap_id"
+        restore_inventory_override "$ip" "$swap_id"
+        detected=1; break
+      fi
+      sleep 2
+    done
+
+    if [[ "$detected" -eq 0 ]]; then
+      echo "❌ Timed out waiting for $req on $ip"
+      stop_installer_pg "$ip" "$server_path"
+      any_failed=1
+    fi
+  fi
+done < "$SERVER_FILE"
+
+echo ""
+if [[ $any_failed -ne 0 ]]; then
+  echo "❌ One or more servers failed."
   exit 1
 fi
-
-echo "✅ Found ${REQ_FILE}"
-# TODO: Keep your existing uninstall/reset steps here if they rely on RESET_ROOT/KSPRAY_DIR
-# e.g., kubeadm reset, remove manifests, etc.
-
-EOSSH
-}
-
-# ----------------
-# Main entrypoint
-# ----------------
-log "Jenkins reset.yml: ${RESET_YML_WS}"
-targets=()
-while IFS= read -r ip; do
-  [[ -n "$ip" ]] && targets+=("$ip")
-done < <(read_targets)
-
-if [[ ${#targets[@]} -eq 0 ]]; then
-  die "No valid targets parsed from ${SERVER_FILE}"
-fi
-
-# Retry wrapper per host (preserves your RETRY_COUNT / RETRY_DELAY_SECS behavior)
-for ip in "${targets[@]}"; do
-  attempt=1
-  while : ; do
-    if reset_on_host "$ip"; then
-      log "✅ Reset preparation ok on ${ip}"
-      break
-    fi
-    if (( attempt >= RETRY_COUNT )); then
-      die "Reset failed on ${ip} after ${RETRY_COUNT} attempts"
-    fi
-    log "WARN: Attempt ${attempt} failed on ${ip}; retrying in ${RETRY_DELAY_SECS}s..."
-    sleep "${RETRY_DELAY_SECS}"
-    attempt=$((attempt+1))
-  done
-done
-
-log "🎉 Cluster reset stage completed for all targets (path derived from Jenkins inputs)."
+echo "🎉 Completed all servers successfully."
