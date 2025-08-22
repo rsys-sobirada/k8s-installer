@@ -274,7 +274,7 @@ echo "[preflight] ✅ All CNs accept Jenkins key. Proceeding."
     stage('Validate inputs') {
       steps {
         script {
-          if (params.INSTALL_MODE != 'Fresh_installation' && !params.OLD_BUILD_PATH_UI?.trim()) {
+          if (params.INSTALL_MODE != 'Fresh_installation' && !(params.OLD_BUILD_PATH_UI ?: '').toString().trim()) {
             error "OLD_BUILD_PATH is required for ${params.INSTALL_MODE}"
           }
         }
