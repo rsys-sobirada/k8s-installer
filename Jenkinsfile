@@ -207,44 +207,19 @@ pipeline {
     }
 
     // ---------- Pre-bootstrap keys (Fresh only) ----------
-    stage('Pre-bootstrap keys (Fresh only)') {
-      when { expression { return params.INSTALL_MODE == 'Fresh_installation' } }
-      steps {
-        timeout(time: 10, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
-set -euo pipefail
-
-HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
-ALIAS="$(echo "${INSTALL_IP_ADDR}" | awk -F/ '{print $1}')"
-
-echo "[bootstrap][runner] Hosts: ${HOST}"
-echo "[bootstrap][runner] Alias IP: ${ALIAS}  (from ${INSTALL_IP_ADDR})"
-echo ""
-
-echo "─── Host ${HOST} ───────────────────────────────────────"
-
-# Ensure alias IP exists BEFORE bootstrap (idempotent)
+// Copy and normalize the script on CN
+scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" scripts/bootstrap_keys.sh "root@${HOST}:/root/bootstrap_keys.sh"
 ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
   set -euo pipefail
-  if ! ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "'"${INSTALL_IP_ADDR}"'"; then
-    IFACE="$(ip route | awk "/^default/{print \\$5; exit}")"
-    ip link set dev "$IFACE" up || true
-    ip addr replace "'"${INSTALL_IP_ADDR}"'" dev "$IFACE"
-  fi
-  echo "[IP] Present: '"${INSTALL_IP_ADDR}"'"
+  sed -i "s/\r$//" /root/bootstrap_keys.sh || true
+  chmod +x /root/bootstrap_keys.sh
 '
-
-# Copy script to CN and make it executable
-scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" scripts/bootstrap_keys.sh "root@${HOST}:/root/bootstrap_keys.sh"
-ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc 'chmod +x /root/bootstrap_keys.sh && head -n 2 /root/bootstrap_keys.sh >/dev/null'
 echo "✅ Script integrity OK on ${HOST}"
 
-# Run bootstrap_keys.sh ON CN with environment variables (NO flags)
-ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' CN_BOOTSTRAP_PASS='${CN_BOOTSTRAP_PASS}' /root/bootstrap_keys.sh"
-'''
-        }
-      }
-    }
+// RUN WITH ENV VARS — NO FLAGS
+ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc \
+  "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' CN_BOOTSTRAP_PASS='${CN_BOOTSTRAP_PASS}' /root/bootstrap_keys.sh"
+
 
     // ---------- Reset &/or Fetch (parallel) ----------
     stage('Reset &/or Fetch (parallel)') {
