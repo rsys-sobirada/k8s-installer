@@ -83,7 +83,7 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
 
     choice(
       name: 'BUILD_SRC_BASE',
-      choices: '/CNBuild/6.3.0_EA2\n/CNBuild/6.3.0\n/CNBuild/6.3.0_EA1',
+      choices: '/CNBuild/6.3.0_EA2\n/CNBuild/6.3.0_EA3\n/CNBuild/6.3.0_EA1',
       description: 'Path on build host (use custom field below to override)'
     ),
     string(
