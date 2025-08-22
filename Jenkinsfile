@@ -170,10 +170,9 @@ return """<input type='password' class='setting-input' name='value' value=''/>""
            defaultValue: '10.10.10.20/24',
            description: 'Alias IP/CIDR to plumb on CN servers'),
 
-    // -------- OPTIONAL bootstrap controls --------
+    // -------- OPTIONAL bootstrap control (password param; no defaultValue) --------
     password(
       name: 'CN_BOOTSTRAP_PASS',
-      defaultValue: '',
       description: 'One-time CN root password (used to push Jenkins key if needed).'
     )
   ])
@@ -197,7 +196,7 @@ pipeline {
       steps { checkout scm }
     }
 
-    // NEW: Defensive preflight that guarantees key-based SSH works to all CNs
+    // Guarantees key-based SSH to all CNs; uses CN_BOOTSTRAP_PASS if needed
     stage('Preflight SSH to CNs') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
@@ -220,31 +219,35 @@ echo "[preflight] Hosts: ${HOSTS}"
 
 push_key_if_needed() {
   local host="$1"
-  set +e
-  ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true
-  local rc=$?
-  set -e
-  if [ $rc -eq 0 ]; then
+
+  # Try key login first
+  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true 2>/dev/null; then
     echo "[preflight] ${host}: ✅ key login OK"
     return 0
   fi
 
+  # If key login failed and a password is provided, push the key once
   if [ -n "${CN_BOOTSTRAP_PASS:-}" ]; then
     if ! command -v sshpass >/dev/null 2>&1; then
       echo "[preflight] ERROR: sshpass required but not installed on the Jenkins agent."
       exit 2
     fi
     echo "[preflight] ${host}: ⛏️ pushing Jenkins key via password…"
-    sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${host}" bash -lc '
-      set -euo pipefail
-      install -m700 -d /root/.ssh
-      touch /root/.ssh/authorized_keys
-      chmod 600 /root/.ssh/authorized_keys
-    '
-    sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${host}" bash -lc "
-      grep -Fqx '${PUB_KEY}' /root/.ssh/authorized_keys || echo '${PUB_KEY}' >> /root/.ssh/authorized_keys
-    "
+
+    # Prepare ~/.ssh and perms
+    sshpass -p "${CN_BOOTSTRAP_PASS}" \
+      ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+      "root@${host}" bash -lc 'set -euo pipefail; install -m700 -d /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys'
+
+    # Append key if missing (idempotent)
+    sshpass -p "${CN_BOOTSTRAP_PASS}" \
+      ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+      "root@${host}" bash -lc "set -euo pipefail; KEY=\"${PUB_KEY}\"; grep -Fqx \"\$KEY\" /root/.ssh/authorized_keys || echo \"\$KEY\" >> /root/.ssh/authorized_keys"
+
+    # Clear potentially stale known_hosts on the agent
     ssh-keygen -R "${host}" >/dev/null 2>&1 || true
+
+    # Retry key login
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" 'echo "[preflight] ✅ key login OK on $(hostname)"'
   else
     echo "[preflight] ${host}: ❌ key login failed and CN_BOOTSTRAP_PASS not provided"
@@ -264,52 +267,6 @@ if [ $fail -ne 0 ]; then
 fi
 
 echo "[preflight] ✅ All CNs accept Jenkins key. Proceeding."
-'''
-        }
-      }
-    }
-
-    // (kept) Optional bulk bootstrap if you want a dedicated run
-    stage('Bootstrap Jenkins key to CN (optional)') {
-      when { expression { return params.CN_BOOTSTRAP_PASS?.trim() } }
-      steps {
-        timeout(time: 8, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
-set -euo pipefail
-
-: "${SERVER_FILE:?missing}"
-: "${SSH_KEY:?missing}"
-: "${CN_BOOTSTRAP_PASS:?missing}"
-
-if ! command -v sshpass >/dev/null 2>&1; then
-  echo "ERROR: sshpass is required on this Jenkins agent to push keys with CN_BOOTSTRAP_PASS." >&2
-  exit 2
-fi
-
-PUB_KEY_FILE="${SSH_KEY}.pub"
-if [ ! -s "${PUB_KEY_FILE}" ]; then
-  echo "Generating Jenkins SSH key at ${SSH_KEY} (no passphrase)..."
-  install -m 700 -d "$(dirname "${SSH_KEY}")"
-  ssh-keygen -q -t rsa -N "" -f "${SSH_KEY}"
-fi
-PUB_KEY="$(cat "${PUB_KEY_FILE}")"
-
-HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
-echo "[key-push] Hosts: ${HOSTS}"
-
-for h in ${HOSTS}; do
-  echo "[key-push] -> ${h}"
-  sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${h}" bash -lc '
-    set -euo pipefail
-    install -m 700 -d /root/.ssh
-    touch /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-  '
-  sshpass -p "${CN_BOOTSTRAP_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "root@${h}" bash -lc "
-    grep -Fqx '${PUB_KEY}' /root/.ssh/authorized_keys || echo '${PUB_KEY}' >> /root/.ssh/authorized_keys
-  "
-  ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" 'echo "[key-push] ✅ key login OK on $(hostname)"'
-done
 '''
         }
       }
