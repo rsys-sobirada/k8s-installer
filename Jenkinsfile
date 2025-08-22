@@ -58,7 +58,7 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
            defaultValue: true,
            description: 'Fetch NEW_VERSION from build host to CN servers'),
 
-    // 8) Host (visible only if FETCH_BUILD truthy)
+    // 8) Host (visible only if FETCH_BUILD truthy) — dropdown + custom input
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_HOST',
@@ -73,10 +73,34 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
-return """<select class='setting-input' name='value'>
-           <option value="172.26.2.96">172.26.2.96</option>
-           <option value="172.26.2.95">172.26.2.95</option>
-         </select>"""
+return """<div>
+  <select id='hostSel' class='setting-input'>
+    <option value="172.26.2.96">172.26.2.96</option>
+    <option value="172.26.2.95">172.26.2.95</option>
+    <option value="__custom__">Custom…</option>
+  </select>
+  <input id='hostCustom' class='setting-input' type='text' placeholder='Enter host/IP' style='display:none;margin-left:8px;' />
+  <input type='hidden' name='value' id='hostValue' value='172.26.2.96' />
+  <script>
+    (function(){
+      var sel = document.getElementById('hostSel');
+      var inp = document.getElementById('hostCustom');
+      var out = document.getElementById('hostValue');
+      function sync(){
+        if (sel.value === '__custom__') {
+          inp.style.display = '';
+          out.value = inp.value;
+        } else {
+          inp.style.display = 'none';
+          out.value = sel.value;
+        }
+      }
+      sel.addEventListener('change', sync);
+      inp.addEventListener('input', function(){ out.value = inp.value; });
+      sync();
+    })();
+  </script>
+</div>"""
 ''',
           sandbox: true,
           classpath: []
@@ -85,7 +109,7 @@ return """<select class='setting-input' name='value'>
       ]
     ],
 
-    // 9) User (visible only if FETCH_BUILD truthy)
+    // 9) User (visible only if FETCH_BUILD truthy) — dropdown + custom input
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_USER',
@@ -100,10 +124,34 @@ return """<select class='setting-input' name='value'>
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
-return """<select class='setting-input' name='value'>
-           <option value="sobirada">sobirada</option>
-           <option value="labadmin">labadmin</option>
-         </select>"""
+return """<div>
+  <select id='userSel' class='setting-input'>
+    <option value="sobirada">sobirada</option>
+    <option value="labadmin">labadmin</option>
+    <option value="__custom__">Custom…</option>
+  </select>
+  <input id='userCustom' class='setting-input' type='text' placeholder='Enter username' style='display:none;margin-left:8px;' />
+  <input type='hidden' name='value' id='userValue' value='sobirada' />
+  <script>
+    (function(){
+      var sel = document.getElementById('userSel');
+      var inp = document.getElementById('userCustom');
+      var out = document.getElementById('userValue');
+      function sync(){
+        if (sel.value === '__custom__') {
+          inp.style.display = '';
+          out.value = inp.value;
+        } else {
+          inp.style.display = 'none';
+          out.value = sel.value;
+        }
+      }
+      sel.addEventListener('change', sync);
+      inp.addEventListener('input', function(){ out.value = inp.value; });
+      sync();
+    })();
+  </script>
+</div>"""
 ''',
           sandbox: true,
           classpath: []
@@ -112,7 +160,7 @@ return """<select class='setting-input' name='value'>
       ]
     ],
 
-    // 10) Base path (visible only if FETCH_BUILD truthy)
+    // 10) Base path (visible only if FETCH_BUILD truthy) — dropdown + custom input
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_BASE',
@@ -127,11 +175,35 @@ return """<select class='setting-input' name='value'>
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
-return """<select class='setting-input' name='value'>
-           <option value="/CNBuild/6.3.0_EA2">/CNBuild/6.3.0_EA2</option>
-           <option value="/CNBuild/6.3.0">/CNBuild/6.3.0</option>
-           <option value="/CNBuild/6.3.0_EA1">/CNBuild/6.3.0_EA1</option>
-         </select>"""
+return """<div>
+  <select id='baseSel' class='setting-input'>
+    <option value="/CNBuild/6.3.0_EA2">/CNBuild/6.3.0_EA2</option>
+    <option value="/CNBuild/6.3.0">/CNBuild/6.3.0</option>
+    <option value="/CNBuild/6.3.0_EA1">/CNBuild/6.3.0_EA1</option>
+    <option value="__custom__">Custom…</option>
+  </select>
+  <input id='baseCustom' class='setting-input' type='text' placeholder='Enter path e.g. /CNBuild/6.4.0' style='display:none;margin-left:8px;width:28em;' />
+  <input type='hidden' name='value' id='baseValue' value='/CNBuild/6.3.0_EA2' />
+  <script>
+    (function(){
+      var sel = document.getElementById('baseSel');
+      var inp = document.getElementById('baseCustom');
+      var out = document.getElementById('baseValue');
+      function sync(){
+        if (sel.value === '__custom__') {
+          inp.style.display = '';
+          out.value = inp.value;
+        } else {
+          inp.style.display = 'none';
+          out.value = sel.value;
+        }
+      }
+      sel.addEventListener('change', sync);
+      inp.addEventListener('input', function(){ out.value = inp.value; });
+      sync();
+    })();
+  </script>
+</div>"""
 ''',
           sandbox: true,
           classpath: []
@@ -426,7 +498,7 @@ ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
       if [[ "$status" != "Running" || "$x" != "$y" ]]; then
         echo "[cluster-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
         notok=1
-      fi
+      }
     done < <(kubectl get pods -A --no-headers)
     return $notok
   }
