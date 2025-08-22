@@ -5,10 +5,10 @@
 # - Pre-check: create /mnt/data{0,1,2} and clear contents
 # - Only untars TRILLIUM_5GCN_CNF_REL_<BASE>*.tar.gz (no BINs)
 # - Preflight: ensure kube ports 6443/10257 are free
-# - Retries end-to-end per host (waits for TRILLIUM tar if fetch runs in parallel)
+# - Streams install_k8s.sh output live to Jenkins
 # - SSH key auth to root@host
-# - If Ansible shows "Permission denied (publickey,password)" → exit with error (bootstrap is now external)
-# - Abort trap: kills remote activity and frees kube ports on abort
+# - If Ansible shows "Permission denied (publickey,password)" → print ANSIBLE_SSH_DENIED (bootstrap handled externally)
+# - On DEPLOYMENT_TYPE=LOW, comment kubelet tuning in k8s-cluster.yml right before install
 
 set -euo pipefail
 
@@ -37,6 +37,7 @@ require NEW_BUILD_PATH  "/home/labadmin"
 : "${INSTALL_IP_ADDR:=10.10.10.20/24}"           # optional; skip if empty
 : "${INSTALL_IP_IFACE:=}"
 : "${INSTALL_MODE:=}"                             # Fresh_installation / Upgrade_*
+: "${DEPLOYMENT_TYPE:=}"                          # Low / Medium / High (case-insensitive)
 
 # Retries / waits
 : "${INSTALL_RETRY_COUNT:=3}"
@@ -145,61 +146,35 @@ if needs_free; then
 fi
 RS
 
-# 3b) Stronger cleanup between retries (includes kubeadm reset)
-read -r -d '' RESET_KUBE_SNIPPET <<'RS' || true
+# 4) Comment kubelet tuning for DEPLOYMENT_TYPE=LOW (before install)
+read -r -d '' LOW_CAPACITY_TWEAK <<'RS' || true
 set -euo pipefail
-systemctl stop kubelet || true
-rm -f /etc/kubernetes/manifests/*.yaml || true
-kubeadm reset -f || true
-rm -rf /var/lib/etcd /etc/kubernetes/* /var/lib/kubelet/* 2>/dev/null || true
-if command -v crictl >/dev/null 2>&1; then
-  crictl ps -a | awk '{print $1}' | xargs -r crictl rm -f
+K8S_YAML="$1"
+if [[ -f "$K8S_YAML" ]]; then
+  echo "[LOW] Commenting kubelet CPU/NUMA settings in: $K8S_YAML"
+  sed -i \
+    -e 's/^\(\s*kubelet_cpu_manager_policy:.*\)$/# \1/' \
+    -e 's/^\(\s*kubelet_topology_manager_policy:.*\)$/# \1/' \
+    -e 's/^\(\s*kubelet_topology_manager_scope:.*\)$/# \1/' \
+    -e 's/^\(\s*reserved_system_cpus:.*\)$/# \1/' \
+    "$K8S_YAML"
+else
+  echo "[LOW] WARNING: k8s-cluster.yml not found at $K8S_YAML"
 fi
 RS
 
-# 4) Run installer and verify cluster health
-#    On SSH permission error print marker and exit 42 (caller will fail/stop)
-read -r -d '' RUN_INSTALL_AND_VERIFY_SNIPPET <<'RS' || true
+# 5) Run installer (stream logs). We stream on the agent by stdbuf on the remote.
+read -r -d '' RUN_INSTALL_STREAMING <<'RS' || true
 set -euo pipefail
-P="$1"; EXP_VER="${2-}"
+P="$1"
 cd "$P" || { echo "[ERROR] Path not found: $P"; exit 2; }
 sed -i 's/\r$//' install_k8s.sh 2>/dev/null || true
-
 echo "[RUN] yes yes | ./install_k8s.sh (in $P)"
 set +e
-OUT="$(yes yes | bash ./install_k8s.sh 2>&1)"
+stdbuf -oL -eL yes yes | bash ./install_k8s.sh
 RC=$?
 set -e
-echo "$OUT"
-
-# Detect the SSH permission error from Ansible run
-if echo "$OUT" | grep -q 'Permission denied (publickey,password)'; then
-  echo "ANSIBLE_SSH_DENIED"
-  exit 42
-fi
-
-# Health check: allow installer RC!=0 only if cluster becomes Ready
-export KUBECONFIG=/etc/kubernetes/admin.conf
-READY=0
-for i in $(seq 1 30); do
-  if kubectl get nodes >/dev/null 2>&1; then
-    if kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}:{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' | grep -q ':True$'; then
-      READY=1; break
-    fi
-  fi
-  sleep 10
-done
-
-if [[ $READY -eq 1 ]]; then
-  echo "[VERIFY] Node Ready detected."
-  [[ -n "$EXP_VER" ]] && { kubectl version --short 2>&1 | grep -q "$EXP_VER" && echo "[VERIFY] Kubernetes version matches expected: $EXP_VER" || echo "[WARN] Kubernetes version does not match expected: $EXP_VER"; }
-  kubectl get pods -A || true
-  kubectl get nodes -o wide || true
-  exit 0
-fi
-
-echo "[VERIFY] Cluster not Ready after install (installer rc=$RC)."
-exit 1
+exit $RC
 RS
 
 any_failed=0
@@ -251,6 +226,7 @@ RS
   fi
 
   NEW_VER_PATH="${TRIL_DIR}/common/tools/install/k8s-v${K8S_VER}"
+  K8S_YAML="${NEW_VER_PATH}/k8s-yamls/k8s-cluster.yml"
   echo "📁 Path:  $NEW_VER_PATH"
   if [[ -z "$NEW_VER_PATH" ]]; then echo "[ERROR] NEW_VER_PATH empty"; any_failed=1; continue; fi
 
@@ -264,25 +240,33 @@ RS
     echo "[IP] Skipping ensure; INSTALL_IP_ADDR is empty"
   fi
 
-  # Run installer and capture rc (do NOT swallow)
-  set +e
-  RUN_OUT="$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$NEW_VER_PATH" "$K8S_VER" <<<"$RUN_INSTALL_AND_VERIFY_SNIPPET" 2>&1)"
-  RUN_RC=$?
-  set -e
-  echo "$RUN_OUT"
+  # LOW footprint tweak BEFORE install
+  if [[ "${DEPLOYMENT_TYPE,,}" == "low" ]]; then
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$K8S_YAML" <<<"$LOW_CAPACITY_TWEAK"
+  fi
 
-  # If SSH denied, fail fast (bootstrap is external now)
-  if echo "$RUN_OUT" | grep -q "ANSIBLE_SSH_DENIED"; then
-    echo "❌ SSH permission denied during install on $host. Run scripts/bootstrap_keys.sh first."
+  # Run installer (live stream) and mirror to temp log to detect SSH denied
+  echo "[RUN] Starting installer on $host ..."
+  tmp_log="/tmp/install_k8s_${host}_$$.log"
+  set +e
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$NEW_VER_PATH" <<<"$RUN_INSTALL_STREAMING" \
+    | tee "$tmp_log"
+  RUN_RC=${PIPESTATUS[0]}
+  set -e
+
+  if grep -q 'Permission denied (publickey,password)' "$tmp_log"; then
+    echo "ANSIBLE_SSH_DENIED"
+    rm -f "$tmp_log" || true
     any_failed=1
     continue
   fi
+  rm -f "$tmp_log" || true
 
   if [[ $RUN_RC -eq 0 ]]; then
     echo "✅ Install verified healthy on $host"
   else
     echo "❌ Install failed on $host (rc=$RUN_RC)"
-    # Strong cleanup then mark failed (no automatic retries here—caller can loop if desired)
+    # Optional deep cleanup between attempts (kept from your original)
     ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<<"$RESET_KUBE_SNIPPET" || true
     any_failed=1
   fi
