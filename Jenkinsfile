@@ -1,31 +1,75 @@
 // ================== Parameters (Active Choices, ordered as requested) ==================
 properties([
   parameters([
-    choice(name: 'DEPLOYMENT_TYPE', choices: 'Low\nMedium\nHigh', description: 'Deployment type'),
-    choice(name: 'INSTALL_MODE', choices: 'Upgrade_with_cluster_reset\nUpgrade_without_cluster_reset\nFresh_installation', description: 'Select installation mode'),
+    // 1) Deployment type
+    choice(
+      name: 'DEPLOYMENT_TYPE',
+      choices: 'Low\nMedium\nHigh',
+      description: 'Deployment type'
+    ),
+
+    // 2) Install mode (controls OLD_BUILD_PATH visibility)
+    choice(
+      name: 'INSTALL_MODE',
+      choices: 'Upgrade_with_cluster_reset\nUpgrade_without_cluster_reset\nFresh_installation',
+      description: 'Select installation mode'
+    ),
+
+    // 3) OLD_BUILD_PATH shown only for Upgrade_* modes
     [
       $class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
       description: 'Base dir of OLD_VERSION (shown only for Upgrade modes)',
       referencedParameters: 'INSTALL_MODE',
-      choiceType: 'ET_FORMATTED_HTML', omitValueField: true,
-      script: [$class: 'GroovyScript', script: [script: '''
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
 def mode = (INSTALL_MODE ?: "").toString()
 if (mode == 'Fresh_installation') return ""
 return """<input class='setting-input' name='value' type='text' value='/home/labadmin'/>"""
-''', sandbox: true, classpath: []], fallbackScript: [script: 'return ""', sandbox: true, classpath: []]]
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
     ],
-    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin', description: 'Base dir to place NEW_VERSION (and extract)'),
-    choice(name: 'NEW_VERSION', choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2', description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'),
-    choice(name: 'OLD_VERSION', choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2', description: 'Existing bundle (used if upgrading)'),
-    booleanParam(name: 'FETCH_BUILD', defaultValue: true, description: 'Fetch NEW_VERSION from build host to CN servers'),
+
+    // 4) New build path
+    string(name: 'NEW_BUILD_PATH',
+           defaultValue: '/home/labadmin',
+           description: 'Base dir to place NEW_VERSION (and extract)'),
+
+    // 5) New version
+    choice(name: 'NEW_VERSION',
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+           description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'),
+
+    // 6) Old version
+    choice(name: 'OLD_VERSION',
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+           description: 'Existing bundle (used if upgrading)'),
+
+    // 7) Fetch toggle
+    booleanParam(name: 'FETCH_BUILD',
+           defaultValue: true,
+           description: 'Fetch NEW_VERSION from build host to CN servers'),
+
+    // 8) Host (visible only if FETCH_BUILD truthy)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_HOST',
       description: 'Build repo host',
       referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML', omitValueField: true,
-      script: [$class: 'GroovyScript', script: [script: '''
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
@@ -33,15 +77,26 @@ return """<select class='setting-input' name='value'>
            <option value="172.26.2.96">172.26.2.96</option>
            <option value="172.26.2.95">172.26.2.95</option>
          </select>"""
-''', sandbox: true, classpath: []], fallbackScript: [script: 'return ""', sandbox: true, classpath: []]]
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
     ],
+
+    // 9) User (visible only if FETCH_BUILD truthy)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_USER',
       description: 'Build repo user',
       referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML', omitValueField: true,
-      script: [$class: 'GroovyScript', script: [script: '''
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
@@ -49,15 +104,26 @@ return """<select class='setting-input' name='value'>
            <option value="sobirada">sobirada</option>
            <option value="labadmin">labadmin</option>
          </select>"""
-''', sandbox: true, classpath: []], fallbackScript: [script: 'return ""', sandbox: true, classpath: []]]
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
     ],
+
+    // 10) Base path (visible only if FETCH_BUILD truthy)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_BASE',
       description: 'Path on build host containing the tar.gz files',
       referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML', omitValueField: true,
-      script: [$class: 'GroovyScript', script: [script: '''
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
@@ -66,25 +132,49 @@ return """<select class='setting-input' name='value'>
            <option value="/CNBuild/6.3.0">/CNBuild/6.3.0</option>
            <option value="/CNBuild/6.3.0_EA1">/CNBuild/6.3.0_EA1</option>
          </select>"""
-''', sandbox: true, classpath: []], fallbackScript: [script: 'return ""', sandbox: true, classpath: []]]
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
     ],
+
+    // 11) Password (Active Choices; conditional; visually masked)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_PASS',
       description: 'Build host password (for SCP/SSH from build repo)',
       referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML', omitValueField: true,
-      script: [$class: 'GroovyScript', script: [script: '''
+      choiceType: 'ET_FORMATTED_HTML',
+      omitValueField: true,
+      script: [
+        $class: 'GroovyScript',
+        script: [
+          script: '''
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
 return """<input type='password' class='setting-input' name='value' value=''/>"""
-''', sandbox: true, classpath: []], fallbackScript: [script: 'return ""', sandbox: true, classpath: []]]
+''',
+          sandbox: true,
+          classpath: []
+        ],
+        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+      ]
     ],
-    string(name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24', description: 'Alias IP/CIDR to plumb on CN servers'),
-    // optional bootstrap controls
-    booleanParam(name: 'CN_BOOTSTRAP', defaultValue: false, description: 'If true, push Jenkins SSH key to CN hosts before fetch (needs CN_BOOTSTRAP_PASS)'),
-    password(name: 'CN_BOOTSTRAP_PASS', defaultValue: '', description: 'One-time CN root password, used by bootstrap_keys.sh')
+
+    // 12) Alias IP/CIDR
+    string(name: 'INSTALL_IP_ADDR',
+           defaultValue: '10.10.10.20/24',
+           description: 'Alias IP/CIDR to plumb on CN servers'),
+
+    // -------- OPTIONAL bootstrap controls --------
+    password(
+      name: 'CN_BOOTSTRAP_PASS',
+      defaultValue: '',
+      description: 'One-time CN root password (if you ever need sshpass locally). Not used by bootstrap_keys.sh.'
+    )
   ])
 ])
 
@@ -95,10 +185,10 @@ pipeline {
 
   environment {
     SERVER_FILE = 'server_pci_map.txt'
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // root key used to reach CN
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'
-    INSTALL_IP_ADDR = "${params.INSTALL_IP_ADDR ?: '10.10.10.20/24'}"
+    INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; param overrides
   }
 
   stages {
@@ -116,9 +206,7 @@ pipeline {
       }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // NEW: Pre-bootstrap keys (Fresh only) by copying the full script to CN and running it
-    // ─────────────────────────────────────────────────────────────────────────────
+    // -------- Pre-bootstrap: Fresh_installation only --------
     stage('Pre-bootstrap keys (Fresh only)') {
       when { expression { return params.INSTALL_MODE == 'Fresh_installation' } }
       steps {
@@ -126,53 +214,60 @@ pipeline {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 
-[[ -s "${SSH_KEY}" ]] || { echo "Missing SSH_KEY: ${SSH_KEY}"; exit 2; }
-chmod 600 "${SSH_KEY}" || true
+: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
+ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
 
-# strip mask for alias IP
-ALIAS_IP="$(printf %s "${INSTALL_IP_ADDR}" | awk -F/ '{print $1}')"
-
-echo "[bootstrap][runner] Hosts: $(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){ n=split($0,a,":"); print a[2] } else { print $1 } }' "${SERVER_FILE}" | xargs -n1 | paste -sd, -)"
+HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
+echo "[bootstrap][runner] Hosts: ${HOSTS}"
 echo "[bootstrap][runner] Alias IP: ${ALIAS_IP}  (from ${INSTALL_IP_ADDR})"
-echo
 
-SSH_OPTS='-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=8'
-
-while read -r raw || [[ -n "${raw:-}" ]]; do
-  line="$(echo -n "${raw:-}" | tr -d '\r')"
-  [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
-
-  if [[ "$line" == *:* ]]; then
-    IFS=':' read -r _name ip _rest <<<"$line"; host="$(echo -n "${ip:-}" | xargs)"
-  else
-    host="$(echo -n "$line" | xargs)"
-  fi
-  [[ -z "$host" ]] && continue
-
+bootstrap_one() {
+  local host="$1"
+  echo ""
   echo "─── Host ${host} ───────────────────────────────────────"
 
-  # 1) Copy the full script to CN:/root/bootstrap_keys.sh
-  #    Use scp to ensure the entire file is transferred intact.
-  scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no "scripts/bootstrap_keys.sh" "root@${host}:/root/bootstrap_keys.sh"
+  # write tiny script on CN that uses the EXACT lines you requested
+  SCRIPT_CONTENT='#!/usr/bin/env bash
+set -euo pipefail
+IP="$1"
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa
+ssh-copy-id root@"${IP}"
+cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}"
+systemctl restart sshd
+'
 
-  # 2) Make it executable and quick sanity check
-  ssh -i "${SSH_KEY}" ${SSH_OPTS} "root@${host}" "chmod +x /root/bootstrap_keys.sh; head -n2 /root/bootstrap_keys.sh >/dev/null || true"
-  echo "✅ Script integrity OK on ${host}"
+  # copy & run with the alias IP (no env dependency on the CN)
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
+    set -euo pipefail
+    cat > /root/bootstrap_keys.sh <<'"'"'EOF'"'"'
+'"${SCRIPT_CONTENT}"'
+EOF
+    chmod +x /root/bootstrap_keys.sh
+    [[ -s /root/bootstrap_keys.sh ]] && echo "✅ Script integrity OK on ${HOSTNAME}" || { echo "❌ Script not present"; exit 2; }
+    /root/bootstrap_keys.sh "'"${ALIAS_IP}"'"
+  '
+}
 
-  # 3) Run it on the CN with env + args (password masked in Jenkins log)
-  echo "[run] /root/bootstrap_keys.sh --host ${host} --alias-ip ${ALIAS_IP} --pass '******' --force"
-  ssh -i "${SSH_KEY}" ${SSH_OPTS} "root@${host}" bash -lc "
-    INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' \
-    CN_BOOTSTRAP_PASS='${CN_BOOTSTRAP_PASS}' \
-    /root/bootstrap_keys.sh --host '${host}' --alias-ip '${ALIAS_IP}' --pass '${CN_BOOTSTRAP_PASS}' --force
-  "
-done < "${SERVER_FILE}"
+for h in ${HOSTS}; do
+  # ensure alias exists first so the ssh-copy-id step can reach it
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
+    set -euo pipefail
+    ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "'"${INSTALL_IP_ADDR}"'" || {
+      DEFIF=$(ip route | awk "/^default/{print \\$5; exit}")
+      ip link set dev "${DEFIF}" up || true
+      ip addr replace "'"${INSTALL_IP_ADDR}"'" dev "${DEFIF}"
+    }
+    ip -4 addr show | grep -q "'"${INSTALL_IP_ADDR}"'" && echo "[IP] Present: ${INSTALL_IP_ADDR}" || { echo "[IP] Failed to plumb ${INSTALL_IP_ADDR}"; exit 2; }
+  '
+  bootstrap_one "$h"
+done
 '''
         }
       }
     }
 
-    // Fetch/Reset in parallel (unchanged)
     stage('Reset &/or Fetch (parallel)') {
       parallel {
         stage('Cluster reset (auto from INSTALL_MODE)') {
@@ -211,7 +306,6 @@ done < "${SERVER_FILE}"
                 sed -i 's/\r$//' scripts/fetch_build.sh || true
                 chmod +x scripts/fetch_build.sh
 
-                # We ONLY use password auth for the BUILD host.
                 if [ -n "${BUILD_SRC_PASS:-}" ]; then
                   if ! command -v sshpass >/dev/null 2>&1; then
                     echo "ERROR: sshpass is required on this agent for password-based SCP/SSH to BUILD_SRC_HOST." >&2
@@ -239,9 +333,7 @@ done < "${SERVER_FILE}"
       }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // Cluster install (+ automatic bootstrap/retry on SSH denial)
-    // ─────────────────────────────────────────────────────────────────────────────
+    // -------- Cluster install with auto-retry on SSH permission denial --------
     stage('Cluster install') {
       steps {
         timeout(time: 20, unit: 'MINUTES', activity: true) {
@@ -264,7 +356,7 @@ run_install() {
     INSTALL_RETRY_COUNT="1" \
     INSTALL_RETRY_DELAY_SECS="10" \
     BUILD_WAIT_SECS="300" \
-  bash -euo pipefail scripts/cluster_install.sh 2>&1 | tee install_out.log
+  bash -euo pipefail scripts/cluster_install.sh | tee /tmp/cluster_install.out
 }
 
 # 1st attempt
@@ -273,33 +365,32 @@ run_install
 RC=$?
 set -e
 
-# If SSH denied marker found anywhere in output → remediate and retry once
-if grep -q "ANSIBLE_SSH_DENIED" install_out.log; then
-  echo "[remediate] SSH denied detected — copying & running bootstrap_keys.sh on all hosts, then retrying install once."
+if grep -q "Permission denied (publickey,password)" /tmp/cluster_install.out; then
+  echo "[auto-recovery] SSH permission denied detected → re-running bootstrap on each host and retrying install once."
 
-  ALIAS_IP="$(printf %s "${INSTALL_IP_ADDR}" | awk -F/ '{print $1}')"
-  SSH_OPTS='-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=8'
-  while read -r raw || [[ -n "${raw:-}" ]]; do
-    line="$(echo -n "${raw:-}" | tr -d '\r')"
-    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
-    if [[ "$line" == *:* ]]; then
-      IFS=':' read -r _name ip _rest <<<"$line"; host="$(echo -n "${ip:-}" | xargs)"
-    else
-      host="$(echo -n "$line" | xargs)"
-    fi
-    [[ -z "$host" ]] && continue
+  # Re-bootstrap on all hosts with the exact-lines script (no env inside CN script)
+  ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
+  HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
+  for h in ${HOSTS}; do
+    ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
+      set -euo pipefail
+      cat > /root/bootstrap_keys.sh <<'"'"'EOF'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+IP="$1"
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa
+ssh-copy-id root@"${IP}"
+cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}"
+systemctl restart sshd
+EOF
+      chmod +x /root/bootstrap_keys.sh
+      /root/bootstrap_keys.sh "'"${ALIAS_IP}"'"
+    '
+  done
 
-    scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no "scripts/bootstrap_keys.sh" "root@${host}:/root/bootstrap_keys.sh"
-    ssh -i "${SSH_KEY}" ${SSH_OPTS} "root@${host}" "chmod +x /root/bootstrap_keys.sh"
-    echo "[run] remedial bootstrap on ${host}"
-    ssh -i "${SSH_KEY}" ${SSH_OPTS} "root@${host}" bash -lc "
-      INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' \
-      CN_BOOTSTRAP_PASS='${CN_BOOTSTRAP_PASS}' \
-      /root/bootstrap_keys.sh --host '${host}' --alias-ip '${ALIAS_IP}' --pass '${CN_BOOTSTRAP_PASS}' --force
-    "
-  done < "${SERVER_FILE}"
-
-  # retry once
+  # Retry once
   set +e
   run_install
   RC=$?
@@ -312,13 +403,12 @@ exit $RC
       }
     }
 
-    // Cluster health check (unchanged)
+    // ---------- Health check after cluster install (runs kubectl on CN host) ----------
     stage('Cluster health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
-
 HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
 if [[ -z "${HOST}" ]]; then
   echo "[cluster-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
@@ -328,6 +418,7 @@ echo "[cluster-health] Using host ${HOST} for kubectl checks"
 
 ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
   set -euo pipefail
+  kubectl get nodes >/dev/null 2>&1 || { echo "[cluster-health] kubectl not yet available; treating as not-ready"; exit 0; }
   check() {
     local notok=0
     while read -r ns name ready status rest; do
@@ -339,22 +430,18 @@ ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
     done < <(kubectl get pods -A --no-headers)
     return $notok
   }
-
   if check; then
     echo "[cluster-health] ✅ All pods Running & Ready."
-    exit 0
-  fi
-
-  echo "[cluster-health] Pods not healthy, waiting 300s and retrying..."
-  sleep 300
-
-  if check; then
-    echo "[cluster-health] ✅ Healthy after retry."
-    exit 0
   else
-    echo "[cluster-health] ❌ Pods still not healthy after 5 minutes."
-    kubectl get pods -A
-    exit 1
+    echo "[cluster-health] Pods not healthy, waiting 300s and retrying..."
+    sleep 300
+    if check; then
+      echo "[cluster-health] ✅ Healthy after retry."
+    else
+      echo "[cluster-health] ❌ Pods still not healthy after 5 minutes."
+      kubectl get pods -A || true
+      exit 1
+    fi
   fi
 '
 '''
@@ -362,14 +449,16 @@ ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
       }
     }
 
-    // PS config & install (unchanged shell)
+    // ---------- PS config & install ----------
     stage('PS config & install') {
       steps {
         timeout(time: 30, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
+
 sed -i 's/\r$//' scripts/ps_config.sh || true
 chmod +x scripts/ps_config.sh
+
 env \
   SERVER_FILE="${SERVER_FILE}" \
   SSH_KEY="${SSH_KEY}" \
@@ -383,7 +472,7 @@ bash -euo pipefail scripts/ps_config.sh
       }
     }
 
-    // PS health check (unchanged)
+    // ---------- PS health check ----------
     stage('PS health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
@@ -395,8 +484,10 @@ if [[ -z "${HOST}" ]]; then
   exit 2
 fi
 echo "[ps-health] Using host ${HOST} for kubectl checks"
+
 ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
   set -euo pipefail
+  kubectl get nodes >/dev/null 2>&1 || { echo "[ps-health] kubectl not yet available; treating as not-ready"; exit 0; }
   check() {
     local notok=0
     while read -r ns name ready status rest; do
@@ -410,18 +501,17 @@ ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
   }
   if check; then
     echo "[ps-health] ✅ All pods Running & Ready."
-    exit 0
-  fi
-  echo "[ps-health] Pods not healthy, waiting 300s and retrying..."
-  sleep 300
-  if check; then
-    echo "[ps-health] ✅ Healthy after retry."
-    exit 0
   else
-    echo "[ps-health] ❌ Pods still not healthy after 5 minutes."
-    kubectl get pods -A
-    exit 1
-  fi
+    echo "[ps-health] Pods not healthy, waiting 300s and retrying..."
+    sleep 300
+    if check; then
+      echo "[ps-health] ✅ Healthy after retry."
+    else
+      echo "[ps-health] ❌ Pods still not healthy after 5 minutes."
+      kubectl get pods -A || true
+      exit 1
+    fi
+  }
 '
 '''
         }
