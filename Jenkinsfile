@@ -1,4 +1,4 @@
-// ================== Parameters (Active Choices, ordered as requested) ==================
+// ================== Parameters ==================
 properties([
   parameters([
     // 1) Deployment type
@@ -15,7 +15,7 @@ properties([
       description: 'Select installation mode'
     ),
 
-    // 3) OLD_BUILD_PATH shown only for Upgrade_* modes
+    // 3) OLD_BUILD_PATH shown only for Upgrade_* modes (simple input)
     [
       $class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
@@ -45,12 +45,12 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
 
     // 5) New version
     choice(name: 'NEW_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2\n6.3.0_EA3',
            description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'),
 
     // 6) Old version
     choice(name: 'OLD_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2',
+           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2\n6.3.0_EA3',
            description: 'Existing bundle (used if upgrading)'),
 
     // 7) Fetch toggle
@@ -58,183 +58,46 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
            defaultValue: true,
            description: 'Fetch NEW_VERSION from build host to CN servers'),
 
-    // 8) Host (visible only if FETCH_BUILD truthy) — dropdown + custom input
-    [
-      $class: 'DynamicReferenceParameter',
+    // ---- Build source (dropdowns + optional custom overrides) ----
+    choice(
       name: 'BUILD_SRC_HOST',
-      description: 'Build repo host',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
-def enabled = ['true','on','1','yes','y'].contains(fb)
-if (!enabled) return ""
-return """<div>
-  <select id='hostSel' class='setting-input'>
-    <option value="172.26.2.96">172.26.2.96</option>
-    <option value="172.26.2.95">172.26.2.95</option>
-    <option value="__custom__">Custom…</option>
-  </select>
-  <input id='hostCustom' class='setting-input' type='text' placeholder='Enter host/IP' style='display:none;margin-left:8px;' />
-  <input type='hidden' name='value' id='hostValue' value='172.26.2.96' />
-  <script>
-    (function(){
-      var sel = document.getElementById('hostSel');
-      var inp = document.getElementById('hostCustom');
-      var out = document.getElementById('hostValue');
-      function sync(){
-        if (sel.value === '__custom__') {
-          inp.style.display = '';
-          out.value = inp.value;
-        } else {
-          inp.style.display = 'none';
-          out.value = sel.value;
-        }
-      }
-      sel.addEventListener('change', sync);
-      inp.addEventListener('input', function(){ out.value = inp.value; });
-      sync();
-    })();
-  </script>
-</div>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
+      choices: '172.26.2.96\n172.26.2.95',
+      description: 'Build repo host (use custom field below to override)'
+    ),
+    string(
+      name: 'BUILD_SRC_HOST_CUSTOM',
+      defaultValue: '',
+      description: 'Custom host/IP (leave empty to use dropdown)'
+    ),
 
-    // 9) User (visible only if FETCH_BUILD truthy) — dropdown + custom input
-    [
-      $class: 'DynamicReferenceParameter',
+    choice(
       name: 'BUILD_SRC_USER',
-      description: 'Build repo user',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
-def enabled = ['true','on','1','yes','y'].contains(fb)
-if (!enabled) return ""
-return """<div>
-  <select id='userSel' class='setting-input'>
-    <option value="sobirada">sobirada</option>
-    <option value="labadmin">labadmin</option>
-    <option value="__custom__">Custom…</option>
-  </select>
-  <input id='userCustom' class='setting-input' type='text' placeholder='Enter username' style='display:none;margin-left:8px;' />
-  <input type='hidden' name='value' id='userValue' value='sobirada' />
-  <script>
-    (function(){
-      var sel = document.getElementById('userSel');
-      var inp = document.getElementById('userCustom');
-      var out = document.getElementById('userValue');
-      function sync(){
-        if (sel.value === '__custom__') {
-          inp.style.display = '';
-          out.value = inp.value;
-        } else {
-          inp.style.display = 'none';
-          out.value = sel.value;
-        }
-      }
-      sel.addEventListener('change', sync);
-      inp.addEventListener('input', function(){ out.value = inp.value; });
-      sync();
-    })();
-  </script>
-</div>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
+      choices: 'sobirada\nlabadmin',
+      description: 'Build repo user (use custom field below to override)'
+    ),
+    string(
+      name: 'BUILD_SRC_USER_CUSTOM',
+      defaultValue: '',
+      description: 'Custom username (leave empty to use dropdown)'
+    ),
 
-    // 10) Base path (visible only if FETCH_BUILD truthy) — dropdown + custom input
-    [
-      $class: 'DynamicReferenceParameter',
+    choice(
       name: 'BUILD_SRC_BASE',
-      description: 'Path on build host containing the tar.gz files',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
-def enabled = ['true','on','1','yes','y'].contains(fb)
-if (!enabled) return ""
-return """<div>
-  <select id='baseSel' class='setting-input'>
-    <option value="/CNBuild/6.3.0_EA2">/CNBuild/6.3.0_EA2</option>
-    <option value="/CNBuild/6.3.0">/CNBuild/6.3.0</option>
-    <option value="/CNBuild/6.3.0_EA1">/CNBuild/6.3.0_EA1</option>
-    <option value="__custom__">Custom…</option>
-  </select>
-  <input id='baseCustom' class='setting-input' type='text' placeholder='Enter path e.g. /CNBuild/6.4.0' style='display:none;margin-left:8px;width:28em;' />
-  <input type='hidden' name='value' id='baseValue' value='/CNBuild/6.3.0_EA2' />
-  <script>
-    (function(){
-      var sel = document.getElementById('baseSel');
-      var inp = document.getElementById('baseCustom');
-      var out = document.getElementById('baseValue');
-      function sync(){
-        if (sel.value === '__custom__') {
-          inp.style.display = '';
-          out.value = inp.value;
-        } else {
-          inp.style.display = 'none';
-          out.value = sel.value;
-        }
-      }
-      sel.addEventListener('change', sync);
-      inp.addEventListener('input', function(){ out.value = inp.value; });
-      sync();
-    })();
-  </script>
-</div>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
+      choices: '/CNBuild/6.3.0_EA2\n/CNBuild/6.3.0\n/CNBuild/6.3.0_EA1',
+      description: 'Path on build host (use custom field below to override)'
+    ),
+    string(
+      name: 'BUILD_SRC_BASE_CUSTOM',
+      defaultValue: '',
+      description: 'Custom path (leave empty to use dropdown)'
+    ),
 
-    // 11) Password (Active Choices; conditional; visually masked)
-    [
-      $class: 'DynamicReferenceParameter',
+    // 11) Password (masked)
+    password(
       name: 'BUILD_SRC_PASS',
-      description: 'Build host password (for SCP/SSH from build repo)',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
-def enabled = ['true','on','1','yes','y'].contains(fb)
-if (!enabled) return ""
-return """<input type='password' class='setting-input' name='value' value=''/>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
+      defaultValue: '',
+      description: 'Build host password (for SCP/SSH from build repo)'
+    ),
 
     // 12) Alias IP/CIDR
     string(name: 'INSTALL_IP_ADDR',
@@ -257,10 +120,10 @@ pipeline {
 
   environment {
     SERVER_FILE = 'server_pci_map.txt'
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // root key used to reach CN
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'
-    INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; param overrides
+    INSTALL_IP_ADDR  = '10.10.10.20/24'   // default; param overrides
   }
 
   stages {
@@ -298,7 +161,6 @@ bootstrap_one() {
   echo ""
   echo "─── Host ${host} ───────────────────────────────────────"
 
-  # write tiny script on CN that uses the EXACT lines you requested
   SCRIPT_CONTENT='#!/usr/bin/env bash
 set -euo pipefail
 IP="$1"
@@ -310,7 +172,6 @@ ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}"
 systemctl restart sshd
 '
 
-  # copy & run with the alias IP (no env dependency on the CN)
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
     set -euo pipefail
     cat > /root/bootstrap_keys.sh <<'"'"'EOF'"'"'
@@ -323,7 +184,6 @@ EOF
 }
 
 for h in ${HOSTS}; do
-  # ensure alias exists first so the ssh-copy-id step can reach it
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
     set -euo pipefail
     ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "'"${INSTALL_IP_ADDR}"'" || {
@@ -378,6 +238,16 @@ done
                 sed -i 's/\r$//' scripts/fetch_build.sh || true
                 chmod +x scripts/fetch_build.sh
 
+                # Compute effective values: custom overrides dropdowns if set
+                BUILD_SRC_HOST_EFF="${BUILD_SRC_HOST_CUSTOM:-}"
+                [ -n "$BUILD_SRC_HOST_EFF" ] || BUILD_SRC_HOST_EFF="${BUILD_SRC_HOST}"
+
+                BUILD_SRC_USER_EFF="${BUILD_SRC_USER_CUSTOM:-}"
+                [ -n "$BUILD_SRC_USER_EFF" ] || BUILD_SRC_USER_EFF="${BUILD_SRC_USER}"
+
+                BUILD_SRC_BASE_EFF="${BUILD_SRC_BASE_CUSTOM:-}"
+                [ -n "$BUILD_SRC_BASE_EFF" ] || BUILD_SRC_BASE_EFF="${BUILD_SRC_BASE}"
+
                 if [ -n "${BUILD_SRC_PASS:-}" ]; then
                   if ! command -v sshpass >/dev/null 2>&1; then
                     echo "ERROR: sshpass is required on this agent for password-based SCP/SSH to BUILD_SRC_HOST." >&2
@@ -391,9 +261,9 @@ done
                 NEW_VERSION="${NEW_VERSION}" \
                 NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
                 SERVER_FILE="${SERVER_FILE}" \
-                BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
-                BUILD_SRC_USER="${BUILD_SRC_USER}" \
-                BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
+                BUILD_SRC_HOST="${BUILD_SRC_HOST_EFF}" \
+                BUILD_SRC_USER="${BUILD_SRC_USER_EFF}" \
+                BUILD_SRC_BASE="${BUILD_SRC_BASE_EFF}" \
                 BUILD_SRC_PASS="${BUILD_SRC_PASS:-}" \
                 CN_SSH_KEY="${SSH_KEY}" \
                 EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
@@ -440,7 +310,6 @@ set -e
 if grep -q "Permission denied (publickey,password)" /tmp/cluster_install.out; then
   echo "[auto-recovery] SSH permission denied detected → re-running bootstrap on each host and retrying install once."
 
-  # Re-bootstrap on all hosts with the exact-lines script (no env inside CN script)
   ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
   HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
   for h in ${HOSTS}; do
@@ -475,13 +344,13 @@ exit $RC
       }
     }
 
-    // ---------- Health check after cluster install (runs kubectl on CN host) ----------
+    // ---------- Cluster health check ----------
     stage('Cluster health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
-HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
+HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print $2; exit } else { print $1; exit } }' "${SERVER_FILE}")"
 if [[ -z "${HOST}" ]]; then
   echo "[cluster-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
   exit 2
@@ -490,7 +359,7 @@ echo "[cluster-health] Using host ${HOST} for kubectl checks"
 
 ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
   set -euo pipefail
-  kubectl get nodes >/dev/null 2>&1 || { echo "[cluster-health] kubectl not yet available; treating as not-ready"; exit 0; }
+  kubectl get nodes >/dev/null 2nd || { echo "[cluster-health] kubectl not yet available; treating as not-ready"; exit 0; }
   check() {
     local notok=0
     while read -r ns name ready status rest; do
@@ -498,7 +367,7 @@ ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
       if [[ "$status" != "Running" || "$x" != "$y" ]]; then
         echo "[cluster-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
         notok=1
-      }
+      fi
     done < <(kubectl get pods -A --no-headers)
     return $notok
   }
@@ -514,7 +383,7 @@ ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
       kubectl get pods -A || true
       exit 1
     fi
-  fi
+  }
 '
 '''
         }
@@ -550,7 +419,7 @@ bash -euo pipefail scripts/ps_config.sh
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
-HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
+HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print $2; exit } else { print $1; exit } }' "${SERVER_FILE}")"
 if [[ -z "${HOST}" ]]; then
   echo "[ps-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
   exit 2
