@@ -210,11 +210,11 @@ pipeline {
     }
 
     // ---------------- Pre-bootstrap (Fresh only) ----------------
-    stage('Pre-bootstrap keys (Fresh only)') {
-      when { expression { return params.INSTALL_MODE == 'Fresh_installation' } }
-      steps {
-        timeout(time: 10, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
+stage('Pre-bootstrap keys (Fresh only)') {
+  when { expression { return params.INSTALL_MODE == 'Fresh_installation' } }
+  steps {
+    timeout(time: 10, unit: 'MINUTES', activity: true) {
+      sh '''#!/usr/bin/env bash
 set -euo pipefail
 
 alias_ip_cidr="${INSTALL_IP_ADDR}"
@@ -228,33 +228,32 @@ mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){split($0,a,":"
 [[ ${#HOSTS[@]} -gt 0 ]] || { echo "no hosts in ${SERVER_FILE}"; exit 2; }
 
 ENSURE_IP_SNIPPET='set -euo pipefail
-C="$1"
-present(){ ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "$C"; }
-if present; then echo "[IP] Present: $C"; exit 0; fi
+CIDR="$1"
+present(){ ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "$CIDR"; }
+if present; then echo "[IP] Present: $CIDR"; exit 0; fi
 IF=$(ip route 2>/dev/null | awk "/^default/{print \\$5; exit}" || true)
 if [[ -z "$IF" ]]; then IF=$(ip -o link | awk -F": " "{print \\$2}" | grep -E "^(en|eth|ens|eno|em)[0-9A-Za-z._-]+" | head -n1 || true); fi
 [[ -z "$IF" ]] && { echo "[IP] no iface"; exit 1; }
-echo "[IP] Trying $C on iface $IF..."; ip link set dev "$IF" up || true
-ip addr replace "$C" dev "$IF" && echo "[IP] OK on $IF" || { echo "[IP] failed"; exit 2; }'
+echo "[IP] Trying $CIDR on iface $IF..."; ip link set dev "$IF" up || true
+ip addr replace "$CIDR" dev "$IF" && echo "[IP] OK on $IF" || { echo "[IP] failed"; exit 2; }'
 
 for host in "${HOSTS[@]}"; do
   echo "─── Host ${host} ───────────────────────────────────────"
-  # 1) ensure alias IP on CN (so port 22 on alias responds)
+  # 1) ensure alias IP on CN
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -s -- "${INSTALL_IP_ADDR}" <<<"$ENSURE_IP_SNIPPET"
 
-  # 2) put bootstrap_keys.sh on CN
+  # 2) push script and chmod
   scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" scripts/bootstrap_keys.sh "root@${host}:/root/bootstrap_keys.sh"
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" chmod +x /root/bootstrap_keys.sh
   echo "✅ Script integrity OK on ${host}"
 
-  # 3) ensure sshpass on CN (since bootstrap script uses it)
+  # 3) ensure sshpass on CN
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
     export NEEDRESTART_MODE=a
     export NEEDRESTART_SVC=l
     if ! command -v sshpass >/dev/null 2>&1; then
-      echo "[CN] installing sshpass via apt-get (no-upgrade) ..."
       apt-get install -yq --no-install-recommends --no-upgrade sshpass
       echo "[CN] sshpass INSTALLED"
     else
@@ -262,14 +261,15 @@ for host in "${HOSTS[@]}"; do
     fi
   '
 
-  # 4) run bootstrap_keys.sh with required env
+  # 4) RUN bootstrap_keys.sh — NO FLAGS, PASS ENVS
   echo "[run] /root/bootstrap_keys.sh (env INSTALL_IP_ADDR + CN_BOOTSTRAP_PASS)"
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' CN_BOOTSTRAP_PASS='${CN_BOOTSTRAP_PASS}' /root/bootstrap_keys.sh"
 done
 '''
-        }
-      }
     }
+  }
+}
+
 
     // ---------------- Reset &/or Fetch (parallel) ----------------
     stage('Reset &/or Fetch (parallel)') {
@@ -363,57 +363,53 @@ done
               bash -euo pipefail scripts/cluster_install.sh | tee install_stage.log
             ''')
 
-            // If failed due to SSH permission, run bootstrap on CN(s) and retry once
-            if (rc != 0) {
-              def denied = sh(returnStatus: true, script: "grep -E 'Permission denied \\(publickey,password\\)|ANSIBLE_SSH_DENIED' install_stage.log >/dev/null 2>&1")
-              if (denied == 0) {
-                echo "[Cluster install] Detected SSH permission error → running bootstrap_keys.sh on CN(s) then retrying once..."
-                sh '''
-                  set -euo pipefail
-                  mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}")
-                  for host in "${HOSTS[@]}"; do
-                    # ensure script present & executable
-                    scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" scripts/bootstrap_keys.sh "root@${host}:/root/bootstrap_keys.sh"
-                    ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" chmod +x /root/bootstrap_keys.sh
-                    # ensure sshpass on CN
-                    ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
-                      set -euo pipefail
-                      export DEBIAN_FRONTEND=noninteractive
-                      export NEEDRESTART_MODE=a
-                      export NEEDRESTART_SVC=l
-                      if ! command -v sshpass >/dev/null 2>&1; then
-                        apt-get install -yq --no-install-recommends --no-upgrade sshpass
-                      fi
-                    '
-                    # run bootstrap with envs
-                    ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' CN_BOOTSTRAP_PASS='${CN_BOOTSTRAP_PASS}' /root/bootstrap_keys.sh"
-                  done
-                '''
-                // retry once
-                sh '''
-                  set -eu
-                  env \
-                    NEW_VERSION="${NEW_VERSION}" \
-                    NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-                    K8S_VER="${K8S_VER}" \
-                    KSPRAY_DIR="kubespray-2.27.0" \
-                    INSTALL_SERVER_FILE="${SERVER_FILE}" \
-                    INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
-                    SSH_KEY="${SSH_KEY}" \
-                    INSTALL_MODE="${INSTALL_MODE}" \
-                    INSTALL_RETRY_COUNT="3" \
-                    INSTALL_RETRY_DELAY_SECS="20" \
-                    BUILD_WAIT_SECS="300" \
-                  bash -euo pipefail scripts/cluster_install.sh
-                '''
-              } else {
-                error("Cluster install failed; see console or install_stage.log")
-              }
-            }
-          }
-        }
-      }
-    }
+// If failed due to SSH permission, run bootstrap on CN(s) and retry once
+if (rc != 0) {
+  def denied = sh(returnStatus: true, script: "grep -E 'Permission denied \\(publickey,password\\)|ANSIBLE_SSH_DENIED' install_stage.log >/dev/null 2>&1")
+  if (denied == 0) {
+    echo "[Cluster install] Detected SSH permission error → running bootstrap_keys.sh on CN(s) then retrying once..."
+    sh '''
+      set -euo pipefail
+      mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}")
+      for host in "${HOSTS[@]}"; do
+        scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" scripts/bootstrap_keys.sh "root@${host}:/root/bootstrap_keys.sh"
+        ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" chmod +x /root/bootstrap_keys.sh
+        # ensure sshpass
+        ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          export NEEDRESTART_MODE=a
+          export NEEDRESTART_SVC=l
+          if ! command -v sshpass >/dev/null 2>&1; then
+            apt-get install -yq --no-install-recommends --no-upgrade sshpass
+          fi
+        '
+        # RUN bootstrap_keys.sh — NO FLAGS, PASS ENVS
+        ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' CN_BOOTSTRAP_PASS='${CN_BOOTSTRAP_PASS}' /root/bootstrap_keys.sh"
+      done
+    '''
+    // retry once
+    sh '''
+      set -eu
+      env \
+        NEW_VERSION="${NEW_VERSION}" \
+        NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+        K8S_VER="${K8S_VER}" \
+        KSPRAY_DIR="kubespray-2.27.0" \
+        INSTALL_SERVER_FILE="${SERVER_FILE}" \
+        INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
+        SSH_KEY="${SSH_KEY}" \
+        INSTALL_MODE="${INSTALL_MODE}" \
+        INSTALL_RETRY_COUNT="3" \
+        INSTALL_RETRY_DELAY_SECS="20" \
+        BUILD_WAIT_SECS="300" \
+      bash -euo pipefail scripts/cluster_install.sh
+    '''
+  } else {
+    error("Cluster install failed; see console or install_stage.log")
+  }
+}
+
 
     // ---------- Health check after cluster install ----------
     stage('Cluster health check') {
