@@ -10,13 +10,6 @@
 # - If Ansible shows "Permission denied (publickey,password)" → print ANSIBLE_SSH_DENIED (bootstrap handled externally)
 # - On DEPLOYMENT_TYPE=LOW, comment kubelet tuning in k8s-cluster.yml right before install
 
-set -euo pipefail
-# Re-assert alias IP just before doing work
-HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
-for h in ${HOSTS}; do
-  ensure_alias_ip "$h"
-done
-
 # ---- helpers ----
 require(){ local n="$1" ex="$2"; [[ -n "${!n:-}" ]] || { echo "❌ Missing $n (e.g. $ex)"; exit 1; }; }
 base_ver(){ echo "${1%%_*}"; }                                   # 6.3.0_EA2 -> 6.3.0
