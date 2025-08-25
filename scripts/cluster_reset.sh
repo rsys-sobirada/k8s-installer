@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/cluster_reset.sh
-# Uses user inputs OLD_VERSION and OLD_BUILD_PATH only (no per-server override).
+# Now takes OLD_BUILD_PATH per-server from server_pci_map.txt (ignores user OLD_BUILD_PATH).
 # Pre-check flow:
 # 1) Check kubectl status (nodes or pods)
 # 2) Ensure requirements.txt under old build's kubespray; if missing, start install_k8s.sh and monitor
@@ -9,16 +9,15 @@
 
 set -euo pipefail
 
-# ===== Inputs (from Jenkins parameters) =====
+# ===== Inputs =====
 CR="${CLUSTER_RESET:-Yes}"                         # gate (Yes/True/1 to run)
 SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
-SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}"   # lines like: name:ip or just ip
+SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}"   # lines: name:ip:path  |  ip:path
 KSPRAY_DIR="${KSPRAY_DIR:-kubespray-2.27.0}"
 K8S_VER="${K8S_VER:-1.31.4}"
 
-# **MUST come from user input**
-OLD_VERSION="${OLD_VERSION:-}"                     # e.g. 6.3.0_EA2 or 6.3.0
-OLD_BUILD_PATH="${OLD_BUILD_PATH:-}"               # e.g. /home/labadmin
+# Required: old version tag (e.g., 6.3.0_EA2 or 6.3.0)
+OLD_VERSION="${OLD_VERSION:-}"
 
 RESET_YML_WS="${RESET_YML_WS:-$WORKSPACE/reset.yml}"
 REQ_WAIT_SECS="${REQ_WAIT_SECS:-360}"
@@ -26,7 +25,7 @@ RETRY_COUNT="${RETRY_COUNT:-3}"
 RETRY_DELAY_SECS="${RETRY_DELAY_SECS:-10}"
 INSTALL_NAME="${INSTALL_NAME:-install_k8s.sh}"
 UNINSTALL_NAME="${UNINSTALL_NAME:-uninstall_k8s.sh}"
-REL_SUFFIX="${REL_SUFFIX:-}"                       # optional suffix in TRILLIUM dir name (keep default empty)
+REL_SUFFIX="${REL_SUFFIX:-}"                       # optional suffix in TRILLIUM dir name
 
 # ===== Gate & validation =====
 shopt -s nocasematch
@@ -40,19 +39,36 @@ shopt -u nocasematch
 chmod 600 "$SSH_KEY" || true
 [[ -f "$SERVER_FILE" ]]  || { echo "❌ $SERVER_FILE not found"; exit 1; }
 [[ -f "$RESET_YML_WS" ]] || { echo "❌ Jenkins reset.yml not found: $RESET_YML_WS"; exit 1; }
-[[ -n "$OLD_VERSION" ]]  || { echo "❌ OLD_VERSION (user input) is required"; exit 1; }
-[[ -n "$OLD_BUILD_PATH" ]] || { echo "❌ OLD_BUILD_PATH (user input) is required"; exit 1; }
+[[ -n "$OLD_VERSION" ]]  || { echo "❌ OLD_VERSION is required (e.g. 6.3.0_EA2)"; exit 1; }
 
 # ===== Helpers =====
 log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
 ver_num(){ echo "${1%%_*}"; }   # 6.3.0_EA1 -> 6.3.0
 ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }
 
-# Build the old build path strictly from user inputs:
-# /home/labadmin/6.3.0/EA2/TRILLIUM_5GCN_CNF_REL_6.3.0/common/tools/install/k8s-v1.31.4
+# Smart normalizer: accepts base, versioned, TRILLIUM root, full k8s root, or kubespray dir
 normalize_k8s_path(){
   local base="${1%/}" ver="$2" num tag
   num="$(ver_num "$ver")"; tag="$(ver_tag "$ver")"
+
+  # Full k8s root provided
+  if [[ "$base" =~ /common/tools/install/k8s-v[^/]+$ ]]; then
+    echo "$base"; return
+  fi
+  # TRILLIUM root up to common/tools/install provided
+  if [[ "$base" =~ /TRILLIUM_5GCN_CNF_REL_${num}[^/]*/common/tools/install$ ]]; then
+    echo "$base/k8s-v${K8S_VER}"; return
+  fi
+  # If user pointed at kubespray dir, trim back to k8s root
+  if [[ "$base" =~ /common/tools/install/k8s-v[^/]+/kubespray(-[^/]+)?$ ]]; then
+    echo "${base%/kubespray*}"; return
+  fi
+  # Versioned base already ends with /<num> or /<num>/<tag>
+  if [[ "$base" =~ /${num}(/${tag})?$ ]]; then
+    echo "$base/TRILLIUM_5GCN_CNF_REL_${num}${REL_SUFFIX}/common/tools/install/k8s-v${K8S_VER}"
+    return
+  fi
+  # Plain base: build full hierarchy
   local p="$base/${num}"
   [[ -n "$tag" ]] && p="$p/${tag}"
   echo "$p/TRILLIUM_5GCN_CNF_REL_${num}${REL_SUFFIX}/common/tools/install/k8s-v${K8S_VER}"
@@ -60,8 +76,14 @@ normalize_k8s_path(){
 
 SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
 
-read_ips(){
-  awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "$SERVER_FILE"
+# Read "ip|path" from server_pci_map.txt (supports name:ip:path or ip:path)
+read_server_entries(){
+  awk 'NF && $1 !~ /^#/ {
+    n=split($0,a,":")
+    if(n==3){ printf "%s|%s\n", a[2], a[3] }      # name:ip:path
+    else if(n==2){ printf "%s|%s\n", a[1], a[2] } # ip:path
+    else { printf "%s|\n", a[1] }                 # ip only (no path)
+  }' "$SERVER_FILE"
 }
 
 remote_file_exists(){
@@ -71,7 +93,6 @@ set -euo pipefail; p="$1"; [[ -e "$p" ]]
 EOF
 }
 
-# 1) Pre-check: kubectl nodes or pods
 remote_cluster_present(){
   local ip="$1"
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail <<'EOF'
@@ -117,7 +138,6 @@ exit 0
 EOF
 }
 
-# Swap Jenkins reset.yml into kubespray (with restore)
 push_reset_override(){
   local ip="$1" sp="$2" swap_id="$3"
   local remote_tmp="/tmp/ci_reset_${swap_id}.yml"
@@ -151,7 +171,6 @@ rm -f "$CTX" 2>/dev/null || true
 EOF
 }
 
-# Copy real inventory into kubespray sample (with restore)
 push_inventory_override(){
   local ip="$1" sp="$2" swap_id="$3"
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$KSPRAY_DIR" "$swap_id" <<'EOF'
@@ -216,18 +235,26 @@ trap on_exit_restore_all EXIT
 
 # ===== Main =====
 log "Jenkins reset.yml: $RESET_YML_WS"
-server_path="$(normalize_k8s_path "$OLD_BUILD_PATH" "$OLD_VERSION")"   # ← from user inputs
-echo "📁 Old build path (user input): $server_path"
 
 any_failed=0
-while IFS= read -r ip; do
-  [[ -n "${ip// }" ]] || continue
+while IFS= read -r entry; do
+  [[ -n "${entry// }" ]] || continue
+  ip="${entry%%|*}"
+  pth="${entry#*|}"
 
   echo ""
   echo "🔧 Server: $ip"
-  echo "📁 Using:  $server_path"
 
-  # 1) Pre-check: kubectl available & reports nodes or pods
+  if [[ -z "$pth" || "$pth" == "$ip" ]]; then
+    echo "❌ No OLD_BUILD_PATH specified for $ip in $SERVER_FILE (and UI param is ignored by design). Skipping."
+    any_failed=1
+    continue
+  fi
+
+  server_path="$(normalize_k8s_path "$pth" "$OLD_VERSION")"
+  echo "📁 Using (normalized): $server_path"
+
+  # 1) Pre-check: Kubernetes present?
   if remote_cluster_present "$ip"; then
     echo "✅ Kubernetes detected on $ip — proceeding."
   else
@@ -237,7 +264,7 @@ while IFS= read -r ip; do
 
   req="$server_path/$KSPRAY_DIR/requirements.txt"
 
-  # 2) Ensure requirements.txt; if missing, start install and monitor
+  # 2) Ensure requirements.txt; if missing, start installer briefly to generate it
   if remote_file_exists "$ip" "$req"; then
     echo "✅ requirements.txt present"
   else
@@ -274,7 +301,7 @@ while IFS= read -r ip; do
   restore_reset_override     "$ip" "$swap_id"
   restore_inventory_override "$ip" "$swap_id"
 
-done < <(read_ips)
+done < <(read_server_entries)
 
 echo ""
 if [[ $any_failed -ne 0 ]]; then
