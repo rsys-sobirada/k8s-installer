@@ -188,7 +188,7 @@ pipeline {
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // root key used to reach CN
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'
-    INSTALL_IP_ADDR  = "${params.INSTALL_IP_ADDR}"      // ensure param override is available
+    INSTALL_IP_ADDR  = "${params.INSTALL_IP_ADDR}"      // param override available to shell
   }
 
   stages {
@@ -202,7 +202,7 @@ pipeline {
       }
     }
 
-    // ✅ Preflight: ensure SSH + ensure alias IP (add only if missing)
+    // ✅ Preflight: ensure SSH + ensure alias IP (add only if missing; IP-only match)
     stage('Preflight SSH to CNs') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
@@ -265,6 +265,7 @@ IP_CIDR="$1"
 if [ -z "${IP_CIDR:-}" ] || ! echo "${IP_CIDR}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]{1,2}$'; then
   echo "[alias-ip] ❌ invalid or empty IP/CIDR: '${IP_CIDR}'"; exit 2
 fi
+IP_ONLY="${IP_CIDR%%/*}"
 
 # Preferred iface: default route; fallback to first physical NIC
 DEFIF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
@@ -278,16 +279,16 @@ fi
 [ -n "${IFACE:-}" ] || { echo "[alias-ip] ❌ no candidate interface"; exit 2; }
 ip link set "${IFACE}" up || true
 
-# Add only if missing
-if ip -4 addr show dev "${IFACE}" | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}"; then
-  echo "[alias-ip] ✅ Already present: ${IP_CIDR} on ${IFACE}"
+# Add only if missing (IP-only presence check)
+if ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "${IP_ONLY}"; then
+  echo "[alias-ip] ✅ Already present: ${IP_ONLY}"
   exit 0
 fi
-if ip addr add "${IP_CIDR}" dev "${IFACE}" 2>/tmp/ip_alias_err.log; then
-  ip -4 addr show dev "${IFACE}" | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}" \
-    && echo "[alias-ip] ✅ Added ${IP_CIDR} on ${IFACE}" && exit 0
+if ip addr replace "${IP_CIDR}" dev "${IFACE}" 2>/tmp/ip_alias_err.log; then
+  ip -4 addr show dev "${IFACE}" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "${IP_ONLY}" \
+    && echo "[alias-ip] ✅ ${IP_CIDR} ensured on ${IFACE}" && exit 0
 fi
-echo "[alias-ip] ❌ Failed to add ${IP_CIDR} on ${IFACE}: $(tr -d '\n' </tmp/ip_alias_err.log || true)"
+echo "[alias-ip] ❌ Failed to ensure ${IP_CIDR} on ${IFACE}: $(tr -d '\n' </tmp/ip_alias_err.log || true)"
 exit 2
 REMOTE
 done
@@ -359,15 +360,17 @@ EOF
 }
 
 for h in ${HOSTS}; do
-  # ensure alias exists first so the ssh-copy-id step can reach it
+  # ensure alias exists first so the ssh-copy-id step can reach it (IP-only check)
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
     set -euo pipefail
-    ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "'"${INSTALL_IP_ADDR}"'" || {
-      DEFIF=$(ip route | awk "/^default/{print \\$5; exit}")
-      ip link set dev "${DEFIF}" up || true
-      ip addr add "'"${INSTALL_IP_ADDR}"'" dev "${DEFIF}"
-    }
-    ip -4 addr show | grep -q "'"${INSTALL_IP_ADDR}"'" && echo "[IP] Present: ${INSTALL_IP_ADDR}" || { echo "[IP] Failed to plumb ${INSTALL_IP_ADDR}"; exit 2; }
+    IP_CIDR="'"${INSTALL_IP_ADDR}"'"
+    IP_ONLY="${IP_CIDR%%/*}"
+    DEFIF=$(ip route | awk "/^default/{print \\$5; exit}")
+    ip link set dev "${DEFIF}" up || true
+    if ! ip -4 addr show | awk "/inet /{print \\$2}" | cut -d/ -f1 | grep -qx "${IP_ONLY}"; then
+      ip addr replace "'"${INSTALL_IP_ADDR}"'" dev "${DEFIF}"
+    fi
+    ip -4 addr show | awk "/inet /{print \\$2}" | cut -d/ -f1 | grep -qx "${IP_ONLY}" && echo "[IP] Present: ${IP_ONLY}" || { echo "[IP] Failed to ensure ${IP_CIDR}"; exit 2; }
   '
   bootstrap_one "$h"
 done
