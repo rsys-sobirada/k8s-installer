@@ -300,9 +300,9 @@ start_ip_monitor(){
   local ip="$1" ip_cidr="$2" iface="$3"
   [[ -z "$ip_cidr" ]] && { echo "[IPMON][$ip] skipped (INSTALL_IP_ADDR empty)"; return 0; }
 
-  local cidr_sanitized="${ip_cidr//\//_}"
+  # Stable one-per-host+CIDR tag
+  local cidr_sanitized="${ip_cidr//\//_}"               # e.g. 10.10.10.20_24
   local tag="ipmon_${ip//./-}_${cidr_sanitized}"
-  # (Keep: we can leave this line here; harmless even if start fails)
   IP_MON_IDS+=("$ip|$tag")
 
   local remote="/tmp/${tag}"
@@ -311,36 +311,68 @@ start_ip_monitor(){
   local pgf="${remote}.pgid"
   local log="/var/log/alias_ipmon.log"
 
-  # --------------- PATCHED REMOTE PREAMBLE (only these lines changed) ---------------
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -eo pipefail -s -- \
       "${ip_cidr:-}" "${iface:-}" "${IP_MONITOR_INTERVAL:-30}" \
       "${sh:-}" "${pidf:-}" "${pgf:-}" "${log:-/var/log/alias_ipmon.log}" <<'EOF'
-# NOTE: be lenient with args; provide defaults to avoid "parameter null or not set"
 CIDR="${1:-}"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"
 SH="${4:-/tmp/ipmon.sh}"; PIDF="${5:-/tmp/ipmon.pid}"; PGF="${6:-/tmp/ipmon.pgid}"
-LOG="${7:-/var/log/alias_ipmon.log}"
-# --------------- /PATCHED REMOTE PREAMBLE ------------------------------------------
+LOG_PATH="${7:-/var/log/alias_ipmon.log}"
+IP="${CIDR%%/*}"
 
+# ensure log file usable
+if ! { mkdir -p "$(dirname "$LOG_PATH")" 2>/dev/null && : >>"$LOG_PATH"; }; then
+  LOG_PATH="/tmp/alias_ipmon.log"
+  mkdir -p /tmp >/dev/null 2>&1 || true
+  : >>"$LOG_PATH" || true
+fi
+
+ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG_PATH"; }
+
+# If already running, keep it
+if [[ -s "$PIDF" ]] && ps -p "$(cat "$PIDF" 2>/dev/null)" >/dev/null 2>&1; then
+  ipmon_log "already running (PID=$(cat "$PIDF")) logging to $LOG_PATH"
+  exit 0
+fi
+
+cat >"$SH" <<'MON'
+#!/usr/bin/env bash
+set -euo pipefail
+CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; LOG_PATH="$4"
+IP="${CIDR%%/*}"
+
+ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG_PATH"; }
+
+is_present(){ ip -4 addr show | awk "/inet /{print \$2}" | cut -d/ -f1 | grep -qx "$IP"; }
+
+pick_if(){
+  [[ -n "$IFACE" ]] && { echo "$IFACE"; return; }
+  DEFIF=$(ip route 2>/dev/null | awk "/^default/{print \$5; exit}" || true)
+  if [[ -n "$DEFIF" ]]; then echo "$DEFIF"; return; fi
+  ip -o link | awk -F': ' '{print $2}' \
+    | sed 's/@.*//' \
+    | grep -E '^(en|eth|ens|eno|em|bond|br)' \
+    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
+    | head -n1
+}
 
 ensure_once(){
   local IF
   IF="$(pick_if)"
-  if [[ -z "$IF" ]]; then log "no suitable iface"; return 1; fi
+  if [[ -z "$IF" ]]; then ipmon_log "no suitable iface"; return 1; fi
   ip link set dev "$IF" up || true
   if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ipmon_err.log; then
     sleep 1
     if is_present; then
-      log "added $CIDR on $IF"
+      ipmon_log "added $CIDR on $IF"
       return 0
     fi
   fi
   local ERR="$(tr -d '\n' </tmp/ipmon_err.log 2>/dev/null || true)"
-  log "failed to add $CIDR on $IF: ${ERR:-unknown}"
+  ipmon_log "failed to add $CIDR on $IF: ${ERR:-unknown}"
   return 1
 }
 
-mkdir -p "$(dirname "$LOG")"; touch "$LOG" || true
-log "watchdog start for $CIDR (IFACE=${IFACE:-auto})"
+ipmon_log "watchdog start for $CIDR (IFACE=${IFACE:-auto})"
 
 # Ensure once at start
 if ! is_present; then
@@ -352,7 +384,7 @@ if command -v ip >/dev/null 2>&1; then
   (
     ip monitor address 2>/dev/null | while read -r _; do
       if ! is_present; then
-        log "detected address change; re-adding $CIDR"
+        ipmon_log "detected address change; re-adding $CIDR"
         ensure_once || true
       fi
     done
@@ -362,7 +394,7 @@ fi
 # Periodic safety check
 while true; do
   if ! is_present; then
-    log "missing; re-adding $CIDR"
+    ipmon_log "missing; re-adding $CIDR"
     ensure_once || true
   fi
   sleep "$SLEEP_SEC"
@@ -371,13 +403,14 @@ MON
 chmod +x "$SH"
 
 # Launch detached; persist beyond SSH session; record PID+PGID
-nohup setsid bash -lc "bash '$SH' '$CIDR' '${IFACE:-}' '$SLEEP_SEC' '$LOG'" >/dev/null 2>&1 &
+nohup setsid bash -lc "bash '$SH' '$CIDR' '${IFACE:-}' '$SLEEP_SEC' '$LOG_PATH'" >/dev/null 2>&1 &
 echo $! >"$PIDF"
 PGID="$(ps -o pgid= -p "$(cat "$PIDF")" | tr -d ' ')"
 echo "$PGID" >"$PGF"
-echo "[IPMON] started PID=$(cat "$PIDF") PGID=$PGID → $LOG"
+ipmon_log "started PID=$(cat "$PIDF") PGID=$PGID → $LOG_PATH"
 EOF
 }
+
 
 stop_ip_monitor(){
   local ip="$1" tag="$2"
