@@ -263,7 +263,7 @@ IP_CIDR="$1"
 IP_ONLY="${IP_CIDR%%/*}"
 
 # Validate CIDR
-if [ -z "${IP_CIDR:-}" ] || ! echo "${IP_CIDR}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]{1,2}$'; then
+if [ -z "${IP_CIDR:-}" ] || ! echo "${IP_CIDR}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\\/[0-9]{1,2}$'; then
   echo "[alias-ip] ❌ invalid or empty IP/CIDR: '${IP_CIDR}'"; exit 2
 fi
 
@@ -273,27 +273,44 @@ if ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "${IP_ONLY
   exit 0
 fi
 
-# Preferred iface: default route; fallback to first physical NIC
-DEFIF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
-IFACE="${DEFIF}"
-if [ -z "${IFACE:-}" ]; then
-  IFACE=$(ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
-    | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
-    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
-    | head -n1)
-fi
-[ -n "${IFACE:-}" ] || { echo "[alias-ip] ❌ no candidate interface"; exit 2; }
-ip link set "${IFACE}" up || true
+# Build candidate interface list: default-route interface first, then other physical NICs
+candidates=()
+defif="$(ip route | awk '/^default/{print $5; exit}')"
+if [ -n "${defif:-}" ]; then candidates+=("$defif"); fi
 
-# Add only if missing
-if ip addr add "${IP_CIDR}" dev "${IFACE}" 2>/tmp/ip_alias_err.log; then
-  if ip -4 addr show dev "${IFACE}" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "${IP_ONLY}"; then
-    echo "[alias-ip] ✅ Added ${IP_CIDR} on ${IFACE}"
-    exit 0
-  fi
+# physical-looking NICs (exclude loopback & container/overlay/tun/tap/virt)
+while IFS= read -r nic; do
+  if [ -n "${defif:-}" ] && [ "$nic" = "$defif" ]; then continue; fi
+  candidates+=("$nic")
+done < <(ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
+         | grep -E '^(en|eth|ens|eno|em|bond|br)' \
+         | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)')
+
+if [ ${#candidates[@]} -eq 0 ]; then
+  echo "[alias-ip] ❌ no suitable interface found"
+  exit 2
 fi
-echo "[alias-ip] ❌ Failed to add ${IP_CIDR} on ${IFACE}: $(tr -d '\n' </tmp/ip_alias_err.log || true)"
-exit 2
+
+# Try each candidate until success (idempotent replace)
+ok=1
+for IFACE in "${candidates[@]}"; do
+  ip link show "$IFACE" >/dev/null 2>&1 || continue
+  ip link set dev "$IFACE" up || true
+  if ip addr replace "${IP_CIDR}" dev "${IFACE}" 2>/tmp/ip_alias_err.log; then
+    # verify presence on the selected iface
+    sleep 1
+    if ip -4 addr show dev "${IFACE}" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "${IP_ONLY}"; then
+      echo "[alias-ip] ✅ ${IP_CIDR} present on ${IFACE}"
+      ok=0
+      break
+    fi
+  fi
+done
+
+if [ $ok -ne 0 ]; then
+  echo "[alias-ip] ❌ Failed to add ${IP_CIDR}. Kernel says: $(tr -d '\\n' </tmp/ip_alias_err.log 2>/dev/null || true)"
+  exit 2
+fi
 REMOTE
 done
 
