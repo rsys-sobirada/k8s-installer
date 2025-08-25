@@ -75,33 +75,50 @@ echo "[MNT] Prepared /mnt/data{0,1,2} (created if missing, contents cleared)"
 RS
 
 # 1) Ensure alias IP exists (robust)
+# 1) Ensure alias IP exists (add only if missing)
 read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
 set -euo pipefail
 IP_CIDR="$1"; FORCE_IFACE="${2-}"
-[[ -n "$IP_CIDR" ]] || exit 0
-is_present(){ ip -4 addr show | awk '/inet /{print $2}' | grep -qx "$IP_CIDR"; }
-echo "[IP] Ensuring ${IP_CIDR}"
-if is_present; then echo "[IP] Present: ${IP_CIDR}"; exit 0; fi
+
+# Validate
+if [ -z "${IP_CIDR:-}" ] || ! echo "${IP_CIDR}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]{1,2}$'; then
+  echo "[IP] ❌ invalid or empty IP/CIDR: '${IP_CIDR}'"
+  exit 2
+fi
+
+# If already present on any iface → done
+if ip -4 addr show | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}"; then
+  echo "[IP] Present: ${IP_CIDR}"
+  exit 0
+fi
+
+# Choose interface(s) to try
 declare -a CAND=()
-[[ -n "$FORCE_IFACE" ]] && CAND+=("$FORCE_IFACE")
-DEF_IF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
-[[ -n "${DEF_IF:-}" ]] && CAND+=("$DEF_IF")
+[ -n "${FORCE_IFACE}" ] && CAND+=("${FORCE_IFACE}")
+DEF_IF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+[ -n "${DEF_IF:-}" ] && CAND+=("${DEF_IF}")
 while IFS= read -r ifc; do CAND+=("$ifc"); done < <(
-  ip -o link | awk -F': ' '{print $2}' \
+  ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
     | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
     | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
     | sort -u
 )
+
+# Try to add once on a candidate iface
 for IF in "${CAND[@]}"; do
-  [[ -z "$IF" ]] && continue
-  echo "[IP] Trying ${IP_CIDR} on iface ${IF}..."
+  [ -n "$IF" ] || continue
   ip link set dev "$IF" up || true
-  if ip addr replace "$IP_CIDR" dev "$IF" 2>"/tmp/ip_err_${IF}.log"; then
-    ip -4 addr show dev "$IF" | awk '/inet /{print $2}' | grep -qx "$IP_CIDR" && { echo "[IP] OK on ${IF}"; exit 0; }
+  if ip addr add "${IP_CIDR}" dev "$IF" 2>"/tmp/ip_err_${IF}.log"; then
+    if ip -4 addr show dev "$IF" | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}"; then
+      echo "[IP] OK: ${IP_CIDR} on ${IF}"
+      exit 0
+    fi
   fi
-  echo "[IP] Failed on ${IF}: $(tr -d '\n' </tmp/ip_err_${IF}.log)" || true
 done
-echo "[IP] ERROR: Could not plumb ${IP_CIDR} on any iface. Candidates tried: ${CAND[*]}"; exit 2
+
+echo "[IP] ❌ Could not add ${IP_CIDR} on any interface"
+ip -4 addr show || true; ip route || true
+exit 2
 RS
 
 # 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>/<TAG>; returns DIR path
