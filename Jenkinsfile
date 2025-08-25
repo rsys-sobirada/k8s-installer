@@ -260,8 +260,7 @@ fail=0
 for h in ${HOSTS}; do
   echo "[alias-ip][${h}] ▶ start"
   tmplog="$(mktemp)"
-  # Push and run the repo script on the remote via stdin (no heredoc in Jenkinsfile)
-  if ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' bash -s" 2>&1 < scripts/alias_ip.sh | tee "${tmplog}"; then
+  if ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}"        "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' bash -s -- '${INSTALL_IP_ADDR}'"        2>&1 < scripts/alias_ip.sh | tee "${tmplog}"; then
     rc=0
   else
     rc=$?
@@ -273,6 +272,7 @@ for h in ${HOSTS}; do
     fail=1
   fi
 done
+[ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
 [ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
 
 [ $fail -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
