@@ -129,7 +129,7 @@ def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
 return """<select class='setting-input' name='value'>
            <option value="/CNBuild/6.3.0_EA2">/CNBuild/6.3.0_EA2</option>
-           <option value="/CNBuild/6.3.0_EA3">/CNBuild/6.3.0_EA3</option>
+           <option value="/CNBuild/6.3.0_EA3/x86>/CNBuild/6.3.0_EA3/x86</option>
            <option value="/CNBuild/6.3.0">/CNBuild/6.3.0</option>
            <option value="/CNBuild/6.3.0_EA1">/CNBuild/6.3.0_EA1</option>
          </select>"""
