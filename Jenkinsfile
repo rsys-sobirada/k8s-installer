@@ -232,15 +232,26 @@ push_key_if_needed() {
 
 ensure_alias_ip() {
   local host="$1"
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
-    set -euo pipefail
-    IP_CIDR="'"${INSTALL_IP_ADDR}"'"
-    IFACE="$(ip route | awk "/^default/{print \\$5; exit}")"
-    ip link set "$IFACE" up || true
-    ip addr replace "$IP_CIDR" dev "$IFACE"
-    ip -4 addr show dev "$IFACE" | awk "/inet /{print \\$2}" | grep -qx "$IP_CIDR"
-    echo "[alias-ip] ✅ $IP_CIDR on $IFACE"
-  '
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -s -- "${INSTALL_IP_ADDR}" <<'REMOTE'
+set -euo pipefail
+IP_CIDR="$1"
+[ -n "${IP_CIDR:-}" ] || { echo "[alias-ip] ❌ empty IP/CIDR"; exit 2; }
+
+DEFIF="$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')"
+IFACE="${DEFIF:-$(ip -o link | awk -F': ' '{print $2}' \
+  | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
+  | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
+  | head -n1)}"
+[ -n "${IFACE:-}" ] || { echo "[alias-ip] ❌ no suitable interface found"; exit 2; }
+ip link set "$IFACE" up || true
+
+if ! ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}' | grep -qx "$IP_CIDR"; then
+  ip addr replace "$IP_CIDR" dev "$IFACE"
+fi
+ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}' | grep -qx "$IP_CIDR" \
+  || { echo "[alias-ip] ❌ failed to ensure $IP_CIDR on $IFACE"; exit 2; }
+echo "[alias-ip] ✅ $IP_CIDR on $IFACE"
+REMOTE
 }
 
 # 1) Key preflight
