@@ -156,12 +156,19 @@ P="$1"
 cd "$P" || { echo "[ERROR] Path not found: $P"; exit 2; }
 sed -i 's/\r$//' install_k8s.sh 2>/dev/null || true
 echo "[RUN] yes yes | ./install_k8s.sh (in $P)"
+
+# We want the exit of bash (right side of the pipe), not 'yes'
 set +e
+trap ':' PIPE  # ignore SIGPIPE in this wrapper shell
+set -o pipefail
 stdbuf -oL -eL yes yes | bash ./install_k8s.sh
-RC=$?
+rc_bash=${PIPESTATUS[1]}  # 0:left('yes'), 1:right('bash')
+set +o pipefail
 set -e
-exit $RC
+
+exit "$rc_bash"
 RS
+
 
 any_failed=0
 
