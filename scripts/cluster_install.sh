@@ -129,20 +129,7 @@ dir_candidates=( "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*/ )
 echo "${dir_candidates[0]%/}"
 RS
 
-# 3) Preflight: ensure kube ports are free
-read -r -d '' FREE_PORTS_SNIPPET <<'RS' || true
-set -euo pipefail
-needs_free(){ ss -ltn | egrep -q ":(6443|10257)\s"; }
-if needs_free; then
-  echo "[PRE] Ports 6443/10257 busy → stopping kubelet & removing static pods"
-  systemctl stop kubelet || true
-  rm -f /etc/kubernetes/manifests/*.yaml || true
-  pkill -f 'kube-apiserver|kube-controller-manager|kube-scheduler' 2>/dev/null || true
-  if command -v crictl >/dev/null 2>&1; then
-    crictl ps -a | awk '/kube-apiserver|kube-controller-manager|kube-scheduler/{print $1}' | xargs -r crictl rm -f
-  fi
-fi
-RS
+
 
 # 4) Comment kubelet tuning for DEPLOYMENT_TYPE=LOW (before install)
 read -r -d '' LOW_CAPACITY_TWEAK <<'RS' || true
