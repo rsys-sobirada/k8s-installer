@@ -261,12 +261,12 @@ for h in ${HOSTS}; do
   echo "[alias-ip][${h}] ▶ start"
   tmplog="$(mktemp)"
   # Push and run the repo script on the remote via stdin (no heredoc in Jenkinsfile)
-  if ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -s -- "${INSTALL_IP_ADDR}" 2>&1 < scripts/alias_ip.sh | tee "${tmplog}"; then
+  if env INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -s 2>&1 < scripts/alias_ip.sh | tee "${tmplog}"; then
     rc=0
   else
     rc=$?
   fi
-  sed -e "s/^/[alias-ip][${h}] /" -n 'p' "${tmplog}"
+  sed "s/^/[alias-ip][${h}] /" "${tmplog}"
   rm -f "${tmplog}"
   echo "[alias-ip][${h}] ◀ exit code=${rc}"
   if [ "${rc}" -ne 0 ]; then
