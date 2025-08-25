@@ -2,26 +2,32 @@
 # scripts/cluster_install.sh
 # Sequential install per server
 # - Uses NEW_BUILD_PATH as root (normalized to /<BASE>[/<TAG>])
-# - Pre-check: create /mnt/data{0,1,2} and clear contents
+# - Prepares /mnt/data{0,1,2} (clears contents)
 # - Only untars TRILLIUM_5GCN_CNF_REL_<BASE>*.tar.gz (no BINs)
-# - Preflight: ensure kube ports 6443/10257 are free
-# - Streams install_k8s.sh output live to Jenkins
+# - Streams install_k8s.sh output live to Jenkins; returns installer rc (not SIGPIPE from 'yes')
 # - SSH key auth to root@host
-# - If Ansible shows "Permission denied (publickey,password)" → print ANSIBLE_SSH_DENIED (bootstrap handled externally)
-# - On DEPLOYMENT_TYPE=LOW, comment kubelet tuning in k8s-cluster.yml right before install
+# - If Ansible shows "Permission denied (publickey,password)" → prints ANSIBLE_SSH_DENIED
+# - On DEPLOYMENT_TYPE=LOW, comments kubelet tuning in k8s-cluster.yml before install
+# - Reads servers from INSTALL_SERVER_FILE; supports "name:ip[:path]" or just "ip"
+
+set -euo pipefail
 
 # ---- helpers ----
 require(){ local n="$1" ex="$2"; [[ -n "${!n:-}" ]] || { echo "❌ Missing $n (e.g. $ex)"; exit 1; }; }
 base_ver(){ echo "${1%%_*}"; }                                   # 6.3.0_EA2 -> 6.3.0
 ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }    # 6.3.0_EA2 -> EA2 ; 6.3.0 -> ""
 
-ip_only_from_cidr(){ local s="${1:-}"; s="${s%%/*}"; echo -n "$s"; }
-
+# Return a ROOT dir by stripping any trailing /<BASE>[/<TAG>] from NEW_BUILD_PATH
 normalize_root(){  # <path> <BASE> [TAG]
   local p="${1%/}" base="$2" tag="${3-}"
-  if [[ -n "$tag" && "$p" == */"$base"/"$tag" ]]; then p="${p%/$base/$tag}"
-  elif [[ "$p" == */"$base" ]]; then p="${p%/$base}"
-  else case "$p" in */"$base"/EA*) p="${p%/$base/*}";; esac
+  if [[ -n "$tag" && "$p" == */"$base"/"$tag" ]]; then
+    p="${p%/$base/$tag}"
+  elif [[ "$p" == */"$base" ]]; then
+    p="${p%/$base}"
+  else
+    case "$p" in
+      */"$base"/EA*) p="${p%/$base/*}";;
+    esac
   fi
   echo "${p:-/}"
 }
@@ -31,15 +37,13 @@ require NEW_VERSION     "6.3.0_EA2"
 require NEW_BUILD_PATH  "/home/labadmin"
 : "${K8S_VER:=1.31.4}"
 : "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
-: "${INSTALL_SERVER_FILE:=server_pci_map.txt}"   # "name:ip" or just "ip"
+: "${INSTALL_SERVER_FILE:=server_pci_map.txt}"   # "name:ip[:path]" or just "ip"
 : "${INSTALL_IP_ADDR:=10.10.10.20/24}"           # optional; skip if empty
-: "${INSTALL_IP_IFACE:=}"
-: "${INSTALL_MODE:=}"                             # Fresh_installation / Upgrade_*
-: "${DEPLOYMENT_TYPE:=}"                          # Low / Medium / High (case-insensitive)
+: "${INSTALL_IP_IFACE:=}"                        # optional preferred iface name
+: "${INSTALL_MODE:=}"                            # Fresh_installation / Upgrade_*
+: "${DEPLOYMENT_TYPE:=}"                         # Low / Medium / High (case-insensitive)
 
-# Retries / waits
-: "${INSTALL_RETRY_COUNT:=3}"
-: "${INSTALL_RETRY_DELAY_SECS:=20}"
+# Waits
 : "${BUILD_WAIT_SECS:=300}"
 
 [[ -f "$SSH_KEY" ]] || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
@@ -74,6 +78,7 @@ RS
 read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
 set -euo pipefail
 IP_CIDR="$1"; FORCE_IFACE="${2-}"
+[[ -n "$IP_CIDR" ]] || exit 0
 is_present(){ ip -4 addr show | awk '/inet /{print $2}' | grep -qx "$IP_CIDR"; }
 echo "[IP] Ensuring ${IP_CIDR}"
 if is_present; then echo "[IP] Present: ${IP_CIDR}"; exit 0; fi
@@ -92,7 +97,7 @@ for IF in "${CAND[@]}"; do
   echo "[IP] Trying ${IP_CIDR} on iface ${IF}..."
   ip link set dev "$IF" up || true
   if ip addr replace "$IP_CIDR" dev "$IF" 2>"/tmp/ip_err_${IF}.log"; then
-    ip -4 addr show dev "$IF" | grep -q "$IP_CIDR" && { echo "[IP] OK on ${IF}"; exit 0; }
+    ip -4 addr show dev "$IF" | awk '/inet /{print $2}' | grep -qx "$IP_CIDR" && { echo "[IP] OK on ${IF}"; exit 0; }
   fi
   echo "[IP] Failed on ${IF}: $(tr -d '\n' </tmp/ip_err_${IF}.log)" || true
 done
@@ -129,9 +134,7 @@ dir_candidates=( "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*/ )
 echo "${dir_candidates[0]%/}"
 RS
 
-
-
-# 4) Comment kubelet tuning for DEPLOYMENT_TYPE=LOW (before install)
+# 3) Comment kubelet tuning for DEPLOYMENT_TYPE=LOW (before install)
 read -r -d '' LOW_CAPACITY_TWEAK <<'RS' || true
 set -euo pipefail
 K8S_YAML="$1"
@@ -148,7 +151,7 @@ else
 fi
 RS
 
-# 5) Run installer (stream logs). We stream on the agent by stdbuf on the remote.
+# 4) Run installer (stream logs) and return installer rc (avoid SIGPIPE 141)
 read -r -d '' RUN_INSTALL_STREAMING <<'RS' || true
 set -euo pipefail
 P="$1"
@@ -156,10 +159,10 @@ cd "$P" || { echo "[ERROR] Path not found: $P"; exit 2; }
 sed -i 's/\r$//' install_k8s.sh 2>/dev/null || true
 echo "[RUN] yes yes | ./install_k8s.sh (in $P)"
 set +e
-stdbuf -oL -eL yes yes | bash ./install_k8s.sh
-RC=$?
+yes yes | bash ./install_k8s.sh
+rc_bash=${PIPESTATUS[1]}   # installer exit code, not 'yes'
 set -e
-exit $RC
+exit "${rc_bash}"
 RS
 
 any_failed=0
@@ -169,10 +172,11 @@ while IFS= read -r raw || [[ -n "${raw:-}" ]]; do
   line="$(echo -n "${raw:-}" | tr -d '\r')"
   [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
 
+  # Accept "name:ip[:path]" or just "ip" — we only need the IP for install
+  host="$line"
   if [[ "$line" == *:* ]]; then
-    IFS=':' read -r _name ip _rest <<<"$line"; host="$(echo -n "${ip:-}" | xargs)"
-  else
-    host="$(echo -n "$line" | xargs)"
+    IFS=':' read -r maybe_name maybe_ip _rest <<<"$line"
+    host="$(echo -n "${maybe_ip:-}" | xargs)"
   fi
   [[ -z "$host" ]] && { echo "⚠️  Skipping malformed line: $line"; continue; }
 
@@ -215,9 +219,6 @@ RS
   echo "📁 Path:  $NEW_VER_PATH"
   if [[ -z "$NEW_VER_PATH" ]]; then echo "[ERROR] NEW_VER_PATH empty"; any_failed=1; continue; fi
 
-  # Free kube ports if needed
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<<"$FREE_PORTS_SNIPPET" || true
-
   # Ensure alias IP (only if configured)
   if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
     ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET" || true
@@ -230,12 +231,11 @@ RS
     ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$K8S_YAML" <<<"$LOW_CAPACITY_TWEAK"
   fi
 
-  # Run installer (live stream) and mirror to temp log to detect SSH denied
+  # Run installer (live stream) and capture installer rc
   echo "[RUN] Starting installer on $host ..."
   tmp_log="/tmp/install_k8s_${host}_$$.log"
   set +e
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$NEW_VER_PATH" <<<"$RUN_INSTALL_STREAMING" \
-    | tee "$tmp_log"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s -- "$NEW_VER_PATH" <<<"$RUN_INSTALL_STREAMING" | tee "$tmp_log"
   RUN_RC=${PIPESTATUS[0]}
   set -e
 
@@ -250,9 +250,7 @@ RS
   if [[ $RUN_RC -eq 0 ]]; then
     echo "✅ Install verified healthy on $host"
   else
-    echo "❌ Install failed on $host (rc=$RUN_RC)"
-    # Optional deep cleanup between attempts (kept from your original)
-    ssh $SSH_OPTS -i "$SSH_KEY" "root@$host" bash -s <<<"$RESET_KUBE_SNIPPET" || true
+    echo "❌ Install failed on $host (rc=$RUN_RC) — not performing deep cleanup"
     any_failed=1
   fi
 
