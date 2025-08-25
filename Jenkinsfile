@@ -259,15 +259,15 @@ echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
 fail=0
 for h in ${HOSTS}; do
   echo "[alias-ip][${h}] ▶ start"
-  # Stream remote output and prefix lines; capture ssh exit with pipefail
   set -o pipefail
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}"       "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' bash -s -- '${INSTALL_IP_ADDR}'"       2>&1 < scripts/alias_ip.sh | sed "s/^/[alias-ip][${h}] /"
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" \
+      "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' bash -s -- '${INSTALL_IP_ADDR}'" \
+      2>&1 < scripts/alias_ip.sh | sed "s/^/[alias-ip][${h}] /"
   rc=${PIPESTATUS[0]:-$?}
   echo "[alias-ip][${h}] ◀ exit code=${rc}"
-  if [ "${rc}" -ne 0 ]; then
-    fail=1
-  fi
+  [ "${rc}" -eq 0 ] || fail=1
 done
+[ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
 [ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
 [ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
 [ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
