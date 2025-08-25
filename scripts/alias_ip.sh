@@ -13,7 +13,7 @@ MASK="${IP_CIDR#*/}"
 case "$MASK" in ''|*[!0-9]*) echo "[alias-ip] ❌ invalid mask: '$MASK'"; exit 2 ;; esac
 [ "$MASK" -ge 0 ] && [ "$MASK" -le 32 ] || { echo "[alias-ip] ❌ mask out of range: '$MASK'"; exit 2; }
 
-# Split and validate IPv4 octets
+# Split & validate IPv4 octets
 set -- $(printf "%s" "$IP_ONLY" | awk -F. 'NF==4{print $1,$2,$3,$4}')
 [ "$#" -eq 4 ] || { echo "[alias-ip] ❌ invalid IPv4: '$IP_ONLY'"; exit 2; }
 for o in "$1" "$2" "$3" "$4"; do
@@ -27,15 +27,16 @@ if ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY"
   exit 0
 fi
 
-# Candidate ifaces: default-route first, then physical-looking NICs (exclude virtual/container)
+# Candidate ifaces: default-route first, then physical NICs (exclude virtual/container)
 CANDIDATES=""
 DEFIF="$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')"
 [ -n "${DEFIF:-}" ] && CANDIDATES="$DEFIF"
-PHYS_NICS="$(ip -o link 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'       | grep -E '^(en|eth|ens|eno|em|bond|br)'       | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)')"
+PHYS_NICS="$(ip -o link 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' \
+  | grep -E '^(en|eth|ens|eno|em|bond|br)' \
+  | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)')"
 for nic in $PHYS_NICS; do [ -n "${DEFIF:-}" ] && [ "$nic" = "$DEFIF" ] && continue; CANDIDATES="$CANDIDATES $nic"; done
 [ -n "$(printf %s "$CANDIDATES" | tr -d ' ')" ] || { echo "[alias-ip] ❌ no suitable interface found"; exit 2; }
 
-# Try candidates
 ok=1
 for IFACE in $CANDIDATES; do
   ip link show "$IFACE" >/dev/null 2>&1 || continue
