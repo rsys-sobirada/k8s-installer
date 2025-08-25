@@ -498,47 +498,154 @@ exit $RC
       }
     }
 
-    // ---------- Health check after cluster install ----------
+    // ---------- Cluster health check (UPDATED: abort-safe remote kill + reinstall flow) ----------
     stage('Cluster health check') {
       steps {
-        timeout(time: 10, unit: 'MINUTES', activity: true) {
+        timeout(time: 45, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
-HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
-if [[ -z "${HOST}" ]]; then
-  echo "[cluster-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
-  exit 2
-fi
-echo "[cluster-health] Using host ${HOST} for kubectl checks"
 
-ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
-  set -euo pipefail
-  kubectl get nodes >/dev/null 2>&1 || { echo "[cluster-health] kubectl not yet available; treating as not-ready"; exit 0; }
-  check() {
-    local notok=0
-    while read -r ns name ready status rest; do
-      x="${ready%%/*}"; y="${ready##*/}"
-      if [[ "$status" != "Running" || "$x" != "$y" ]]; then
-        echo "[cluster-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
-        notok=1
-      fi
-    done < <(kubectl get pods -A --no-headers)
-    return $notok
-  }
-  if check; then
-    echo "[cluster-health] ✅ All pods Running & Ready."
-  else
-    echo "[cluster-health] Pods not healthy, waiting 300s and retrying..."
-    sleep 300
-    if check; then
-      echo "[cluster-health] ✅ Healthy after retry."
-    else
-      echo "[cluster-health] ❌ Pods still not healthy after 5 minutes."
-      kubectl get pods -A || true
-      exit 1
+IP_LIST="$(awk -F: 'NF && $1 !~ /^#/ {print ($2 ~ /^[0-9.]+$/)?$2:$1}' "${SERVER_FILE}" | sort -u)"
+K8S_VER="${K8S_VER:-1.31.4}"
+NEW_VERSION="${NEW_VERSION:?NEW_VERSION required}"
+NEW_BUILD_PATH="${NEW_BUILD_PATH:?NEW_BUILD_PATH required}"
+SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
+SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
+
+# --- Track active remote pgid files for cleanup on abort ---
+declare -a REMOTE_PGID_PTRS=()   # entries: "ip:/tmp/ci_<op>.pgid"
+on_abort_cleanup() {
+  echo "[abort] Cleanup: attempting to kill any running remote tasks..."
+  for ptr in "${REMOTE_PGID_PTRS[@]}"; do
+    ip="${ptr%%:*}"; file="${ptr#*:}"
+    pgid="$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "cat '$file' 2>/dev/null || true" | tr -d '[:space:]')" || true
+    if [[ -n "$pgid" ]]; then
+      echo "[abort][$ip] killing remote PGID $pgid"
+      ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "kill -TERM -$pgid 2>/dev/null || true; sleep 2; kill -KILL -$pgid 2>/dev/null || true" || true
     fi
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "rm -f '$file' 2>/dev/null || true" || true
+  done
+}
+trap on_abort_cleanup EXIT HUP INT TERM
+
+health_ok() {
+  local ip="$1"
+  # Nodes Ready?
+  if ! ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" kubectl get nodes >/dev/null 2>&1; then
+    return 1
+  fi
+  # Pods healthy? (no CrashLoopBackOff/BackOff/Error and READY m==n)
+  local script='
+set -euo pipefail
+kubectl get pods -A --no-headers 2>/dev/null | awk "
+  {
+    split(\$2,a,\"/\");
+    ready=(a[1]==a[2]);
+    bad = (\$3 ~ /(CrashLoopBackOff|ImagePullBackOff|BackOff|Error|Init:)/);
+    if (!ready || bad) exit 1
   }
+  END{ exit 0 }
+"
 '
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -lc "$script"
+}
+
+normalize_install_path() {
+  local ip="$1" base="$2" ver="$3"
+  local num="${ver%%_*}"
+  local tag=""; [[ "$ver" == *_* ]] && tag="${ver##*_}"
+  for cand in \
+    "$base" \
+    "$base/TRILLIUM_5GCN_CNF_REL_${num}${tag:+_${tag}}/common/tools/install/k8s-v${K8S_VER}" \
+    "$base/TRILLIUM_5GCN_CNF_REL_${num}/common/tools/install/k8s-v${K8S_VER}" \
+    "$base/${num}${tag:+/${tag}}/TRILLIUM_5GCN_CNF_REL_${num}${tag:+_${tag}}/common/tools/install/k8s-v${K8S_VER}" \
+    "$base/${num}${tag:+/${tag}}/TRILLIUM_5GCN_CNF_REL_${num}/common/tools/install/k8s-v${K8S_VER}"
+  do
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand" && { echo "$cand"; return; }
+  done
+  echo "$base/${num}${tag:+/${tag}}/TRILLIUM_5GCN_CNF_REL_${num}/common/tools/install/k8s-v${K8S_VER}"
+}
+
+# --- Run a remote script in its own process group, record PGID, and wait ---
+# Usage: run_remote_killable <ip> <path> <script_name> [yes_yes]
+run_remote_killable() {
+  local ip="$1" inst_path="$2" script="$3" feed_yes="${4:-yes}"
+  local tag="${script%%.sh}"
+  local pgid_file="/tmp/ci_${tag}.pgid"
+
+  REMOTE_PGID_PTRS+=("$ip:$pgid_file")
+
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -lc "
+    set -euo pipefail
+    cd '$inst_path'
+    sed -i 's/\\r\$//' '$script' 2>/dev/null || true
+    rm -f '$pgid_file' || true
+    (
+      setsid bash -lc \"${feed_yes} ${feed_yes} | bash './$script'\" & 
+      cpid=\$!
+      pgid=\$(ps -o pgid= -p \"\$cpid\" | tr -d ' ')
+      echo \"\$pgid\" > '$pgid_file'
+      wait \"\$cpid\"
+    )
+  "
+}
+
+do_uninstall_install() {
+  local ip="$1"
+  local inst_path
+  inst_path="$(normalize_install_path "$ip" "$NEW_BUILD_PATH" "$NEW_VERSION")"
+  echo "[health][$ip] using path: $inst_path"
+
+  echo "[health][$ip] ▶ uninstall_k8s.sh"
+  run_remote_killable "$ip" "$inst_path" "uninstall_k8s.sh"
+
+  echo "[health][$ip] ▶ install_k8s.sh"
+  run_remote_killable "$ip" "$inst_path" "install_k8s.sh"
+}
+
+for ip in $IP_LIST; do
+  echo "[health][$ip] Sleeping 5 minutes before checks..."
+  sleep 300
+
+  if health_ok "$ip"; then
+    echo "[health][$ip] ✅ healthy after initial wait"
+    continue
+  fi
+
+  echo "[health][$ip] ⚠️ not healthy, starting 15-minute stabilization window..."
+  deadline=$(( $(date +%s) + 15*60 ))
+  while [[ $(date +%s) -lt $deadline ]]; do
+    sleep 30
+    if health_ok "$ip"; then
+      echo "[health][$ip] ✅ healthy within stabilization window"
+      continue 2
+    fi
+  done
+
+  echo "[health][$ip] ❌ still not healthy after 15 min; uninstall → reinstall"
+  do_uninstall_install "$ip"
+
+  echo "[health][$ip] 🔁 post-reinstall: sleep 5 min, then re-check up to 15 min"
+  sleep 300
+  if health_ok "$ip"; then
+    echo "[health][$ip] ✅ healthy after reinstall initial wait"
+    continue
+  fi
+
+  deadline=$(( $(date +%s) + 15*60 ))
+  while [[ $(date +%s) -lt $deadline ]]; do
+    sleep 30
+    if health_ok "$ip"; then
+      echo "[health][$ip] ✅ healthy after reinstall stabilization"
+      continue 2
+    fi
+  done
+
+  echo "[health][$ip] ❌ unhealthy even after reinstall"
+  exit 1
+done
+
+echo "[health] 🎉 all hosts healthy"
 '''
         }
       }
