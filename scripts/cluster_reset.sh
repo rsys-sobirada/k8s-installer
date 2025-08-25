@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # scripts/cluster_reset.sh
-# Now takes OLD_BUILD_PATH per-server from server_pci_map.txt (ignores user OLD_BUILD_PATH).
-# Pre-check flow:
-# 1) Check kubectl status (nodes or pods)
+# Takes OLD_BUILD_PATH per-server from server_pci_map.txt (ignores UI OLD_BUILD_PATH).
+# Flow:
+# 1) Detect Kubernetes on host
 # 2) Ensure requirements.txt under old build's kubespray; if missing, start install_k8s.sh and monitor
-# 3) When requirements.txt appears, kill installer, swap in Jenkins reset.yml + inventory,
-#    run ./uninstall_k8s.sh with retries, restore swaps.
+# 3) When requirements.txt appears, stop installer, swap in Jenkins reset.yml + inventory,
+#    run ./uninstall_k8s.sh with retries; restore swaps.
 
 set -euo pipefail
 
@@ -15,10 +15,7 @@ SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
 SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}"   # lines: name:ip:path  |  ip:path
 KSPRAY_DIR="${KSPRAY_DIR:-kubespray-2.27.0}"
 K8S_VER="${K8S_VER:-1.31.4}"
-INSTALL_IP_ADDR="${INSTALL_IP_ADDR:-}"             # optional alias to enforce
-
-# Required: old version tag (e.g., 6.3.0_EA2 or 6.3.0)
-OLD_VERSION="${OLD_VERSION:-}"
+OLD_VERSION="${OLD_VERSION:-}"                     # e.g. 6.3.0_EA2 or 6.3.0
 
 RESET_YML_WS="${RESET_YML_WS:-$WORKSPACE/reset.yml}"
 REQ_WAIT_SECS="${REQ_WAIT_SECS:-360}"
@@ -104,44 +101,6 @@ if command -v kubectl >/dev/null 2>&1; then
 fi
 exit 1
 EOF
-}
-
-# Ensure alias IP exists on remote host (ADD ONLY IF MISSING)
-ensure_alias_ip_remote(){
-  local ip="$1" cidr="${INSTALL_IP_ADDR:-}"
-  [ -n "${cidr}" ] || { echo "[alias-ip][$ip] ⚠️ empty INSTALL_IP_ADDR; skipping"; return 0; }
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$cidr" <<'REMOTE'
-set -euo pipefail
-IP_CIDR="$1"
-# Validate CIDR
-if [ -z "${IP_CIDR:-}" ] || ! echo "${IP_CIDR}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]{1,2}$'; then
-  echo "[alias-ip] ❌ invalid or empty IP/CIDR: '${IP_CIDR}'"; exit 2
-fi
-# Already present anywhere?
-if ip -4 addr show | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}"; then
-  echo "[alias-ip] ✅ already present"
-  exit 0
-fi
-# Candidates: default route first, then physical NICs
-DEFIF=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')
-mapfile -t CANDS < <(
-  { [ -n "${DEFIF:-}" ] && echo "${DEFIF}";
-    ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
-      | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
-      | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
-      | sort -u; } | awk 'NF' | awk '!seen[$0]++'
-)
-for IF in "${CANDS[@]}"; do
-  [ -n "$IF" ] || continue
-  ip link set dev "$IF" up || true
-  if ip addr add "${IP_CIDR}" dev "${IF}" 2>"/tmp/ip_err_${IF}.log"; then
-    ip -4 addr show dev "${IF}" | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}" && { echo "[alias-ip] ✅ ${IP_CIDR} on ${IF}"; exit 0; }
-  fi
-done
-echo "[alias-ip] ❌ could not ensure ${IP_CIDR} on any iface"
-ip -4 addr show || true; ip route || true
-exit 2
-REMOTE
 }
 
 start_installer_bg(){
@@ -283,9 +242,6 @@ while IFS= read -r entry; do
 
   echo ""
   echo "🔧 Server: $ip"
-
-  # Ensure alias (add only if missing) if configured
-  ensure_alias_ip_remote "$ip" || { any_failed=1; continue; }
 
   if [[ -z "$pth" || "$pth" == "$ip" ]]; then
     echo "❌ No OLD_BUILD_PATH specified for $ip in $SERVER_FILE (UI param ignored by design). Skipping."
