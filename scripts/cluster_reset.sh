@@ -48,47 +48,67 @@ log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
 ver_num(){ echo "${1%%_*}"; }   # 6.3.0_EA1 -> 6.3.0
 ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }
 
-# Version-safe path normalizer (prevents double-versioning)
+# Version-safe path normalizer (prevents double-versioning; probes EA/non-EA)
 normalize_k8s_path() {
   local base="${1%/}" old_ver="$2"
 
   # 1) Already a full k8s root → return as-is
   if [[ "$base" =~ /common/tools/install/k8s-v[^/]+$ ]]; then
-    echo "$base"
-    return
+    echo "$base"; return
   fi
 
   # 2) Already at TRILLIUM install dir → just add k8s-v
   if [[ "$base" =~ /TRILLIUM_5GCN_CNF_REL_[0-9]+\.[0-9]+\.[0-9]+[^/]*/common/tools/install$ ]]; then
-    echo "$base/k8s-v${K8S_VER}"
-    return
+    echo "$base/k8s-v${K8S_VER}"; return
   fi
 
-  # 3) If base ends with ".../<num>[/EAx]" (e.g., /home/labadmin/6.3.0[/EA2]), prefer THAT version/tag from the path
+  # 3) If base ends with ".../<num>[/EAx]" (e.g., /home/labadmin/6.3.0[/EA2]),
+  #    prefer the version/tag *from the path*, but PROBE TRILLIUM with and without EA suffix.
   if [[ "$base" =~ /([0-9]+\.[0-9]+\.[0-9]+)(/(EA[0-9]+))?$ ]]; then
-    # Extract number and optional EA tag as they appear in the path
-    local num_in_path tag_in_path
+    local num_in_path tag_in_path rel_with rel_without
     num_in_path="$(printf '%s\n' "$base" | sed -n 's#.*/\([0-9]\+\.[0-9]\+\.[0-9]\+\)\(/\(EA[0-9]\+\)\)\?$#\1#p')"
     tag_in_path="$(printf '%s\n' "$base" | sed -n 's#.*/[0-9]\+\.[0-9]\+\.[0-9]\+\(/\(EA[0-9]\+\)\)\?$#\2#p' | sed 's#^/##')"
-    local rel="TRILLIUM_5GCN_CNF_REL_${num_in_path}"
-    [[ -n "$tag_in_path" ]] && rel="${rel}_${tag_in_path}"
-    echo "$base/${rel}/common/tools/install/k8s-v${K8S_VER}"
-    return
+
+    rel_with="TRILLIUM_5GCN_CNF_REL_${num_in_path}${tag_in_path:+_${tag_in_path}}"
+    rel_without="TRILLIUM_5GCN_CNF_REL_${num_in_path}"
+
+    local cand_with="$base/${rel_with}/common/tools/install/k8s-v${K8S_VER}"
+    local cand_wo="$base/${rel_without}/common/tools/install/k8s-v${K8S_VER}"
+
+    # Probe the remote host for which one actually exists
+    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_with"; then
+      echo "$cand_with"; return
+    elif ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_wo"; then
+      echo "$cand_wo"; return
+    else
+      # Neither exists; return non-EA for clearer errors later
+      echo "$cand_wo"; return
+    fi
   fi
 
   # 4) If base ends right at ".../common/tools/install" without k8s-v
   if [[ "$base" =~ /common/tools/install$ ]]; then
-    echo "$base/k8s-v${K8S_VER}"
-    return
+    echo "$base/k8s-v${K8S_VER}"; return
   fi
 
-  # 5) Fallback: use OLD_VERSION to build under base
-  local num tag rel
-  num="$(ver_num "$old_ver")"
-  tag="$(ver_tag "$old_ver")"
-  rel="TRILLIUM_5GCN_CNF_REL_${num}"
-  [[ -n "$tag" ]] && rel="${rel}_${tag}"
-  echo "$base/${num}${tag:+/${tag}}/${rel}/common/tools/install/k8s-v${K8S_VER}"
+  # 5) Fallback: use OLD_VERSION to build under base, then probe both TRILLIUM variants
+  local num tag rel_with rel_without parent cand_with cand_wo
+  num="${old_ver%%_*}"
+  tag=""; [[ "$old_ver" == *_* ]] && tag="${old_ver##*_}"
+  rel_with="TRILLIUM_5GCN_CNF_REL_${num}${tag:+_${tag}}"
+  rel_without="TRILLIUM_5GCN_CNF_REL_${num}"
+
+  parent="$base/${num}${tag:+/${tag}}"
+  cand_with="$parent/${rel_with}/common/tools/install/k8s-v${K8S_VER}"
+  cand_wo="$parent/${rel_without}/common/tools/install/k8s-v${K8S_VER}"
+
+  if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_with"; then
+    echo "$cand_with"
+  elif ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_wo"; then
+    echo "$cand_wo"
+  else
+    echo "$cand_wo"
+  fi
 }
 
 SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
@@ -129,6 +149,8 @@ RS
 # Read "ip|path" from server_pci_map.txt (supports name:ip:path or ip:path)
 read_server_entries(){
   awk 'NF && $1 !~ /^#/ {
+    gsub(/\r/,"");           # strip Windows CRs
+    sub(/[[:space:]]+$/,""); # strip trailing whitespace
     n=split($0,a,":")
     if(n==3){ printf "%s|%s\n", a[2], a[3] }      # name:ip:path
     else if(n==2){ printf "%s|%s\n", a[1], a[2] } # ip:path
