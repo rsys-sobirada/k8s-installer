@@ -303,7 +303,8 @@ start_ip_monitor(){
   IP_MON_IDS+=("$ip|$tag")
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$ip_cidr" "$iface" "$IP_MONITOR_INTERVAL" "$tag" <<'EOF'
 set -euo pipefail
-CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; TAG="$4"
+set -euo pipefail
+CIDR="${1:?}"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; TAG="${4:-ipmon_$RANDOM}"
 IP="${CIDR%%/*}"
 PGFILE="/tmp/${TAG}.pgid"
 
