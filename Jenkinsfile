@@ -1,4 +1,21 @@
 // ================== Parameters (Active Choices, ordered as requested) ==================
+
+ensure_alias_ip() {
+  local host="$1"
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
+    set -euo pipefail
+    IP_CIDR="'"${INSTALL_IP_ADDR}"'"
+    IFACE="$(ip route | awk "/^default/{print \$5; exit}")"
+    ip link set "$IFACE" up || true
+    if ! ip -4 addr show dev "$IFACE" | awk "/inet /{print \$2}" | grep -qx "$IP_CIDR"; then
+      ip addr replace "$IP_CIDR" dev "$IFACE"
+    fi
+    ip -4 addr show dev "$IFACE" | awk "/inet /{print \$2}" | grep -qx "$IP_CIDR" || { echo "[alias-ip] ❌ failed to ensure $IP_CIDR on $IFACE"; exit 2; }
+    echo "[alias-ip] ✅ $IP_CIDR on $IFACE"
+  '
+}
+
+
 properties([
   parameters([
     // 1) Deployment type
@@ -254,6 +271,14 @@ for h in ${HOSTS}; do
   echo "[preflight] Testing ${h}…"
   push_key_if_needed "${h}" || fail=1
 done
+
+echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
+fail=0
+for h in ${HOSTS}; do
+  ensure_alias_ip "$h" || fail=1
+done
+[ $fail -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
+
 
 if [ $fail -ne 0 ]; then
   echo "[preflight] ❌ One or more hosts failed SSH preflight."
