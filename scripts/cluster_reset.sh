@@ -293,30 +293,49 @@ EOF
   echo "❌ Uninstall failed after $RETRY_COUNT attempts on $ip"; return 1
 }
 
-# ===== NEW: IP monitor helpers (start/stop) =====
+# ===== NEW: IP monitor helpers (start/stop, hardened & logged) =====
 declare -a IP_MON_IDS=()  # "<ip>|<tag>"
 
 start_ip_monitor(){
   local ip="$1" ip_cidr="$2" iface="$3"
   [[ -z "$ip_cidr" ]] && { echo "[IPMON][$ip] skipped (INSTALL_IP_ADDR empty)"; return 0; }
-  local tag="ipmon_${RANDOM}_$$_$(date +%s)"
-  IP_MON_IDS+=("$ip|$tag")
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$ip_cidr" "$iface" "$IP_MONITOR_INTERVAL" "$tag" <<'EOF'
-set -euo pipefail
-set -euo pipefail
-CIDR="${1:?}"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; TAG="${4:-ipmon_$RANDOM}"
-IP="${CIDR%%/*}"
-PGFILE="/tmp/${TAG}.pgid"
 
-cat >/tmp/${TAG}.sh <<'MON'
+  # Stable one-per-host+CIDR tag to avoid duplicates
+  local cidr_sanitized="${ip_cidr//\//_}"               # e.g. 10.10.10.20_24
+  local tag="ipmon_${ip//./-}_${cidr_sanitized}"        # stable tag per host+cidr
+  IP_MON_IDS+=("$ip|$tag")
+
+  local remote="/tmp/${tag}"
+  local sh="${remote}.sh"
+  local pidf="${remote}.pid"
+  local pgf="${remote}.pgid"
+  local log="/var/log/alias_ipmon.log"
+
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$ip_cidr" "$iface" "$IP_MONITOR_INTERVAL" "$sh" "$pidf" "$pgf" "$log" <<'EOF'
+CIDR="${1:?}"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"
+SH="${4:?}"; PIDF="${5:?}"; PGF="${6:?}"; LOG="${7:?}"
+
+IP="${CIDR%%/*}"
+
+# If already running, keep it
+if [[ -s "$PIDF" ]] && ps -p "$(cat "$PIDF" 2>/dev/null)" >/dev/null 2>&1; then
+  echo "[IPMON] already running (PID=$(cat "$PIDF")) logging to $LOG"
+  exit 0
+fi
+
+cat >"$SH" <<'MON'
 #!/usr/bin/env bash
 set -euo pipefail
-CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"
+CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; LOG="$4"
 IP="${CIDR%%/*}"
-is_present(){ ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP"; }
+
+log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG"; }
+
+is_present(){ ip -4 addr show | awk "/inet /{print \$2}" | cut -d/ -f1 | grep -qx "$IP"; }
+
 pick_if(){
   [[ -n "$IFACE" ]] && { echo "$IFACE"; return; }
-  DEFIF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
+  DEFIF=$(ip route 2>/dev/null | awk "/^default/{print \$5; exit}" || true)
   if [[ -n "$DEFIF" ]]; then echo "$DEFIF"; return; fi
   ip -o link | awk -F': ' '{print $2}' \
     | sed 's/@.*//' \
@@ -324,42 +343,77 @@ pick_if(){
     | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
     | head -n1
 }
+
+ensure_once(){
+  local IF
+  IF="$(pick_if)"
+  if [[ -z "$IF" ]]; then log "no suitable iface"; return 1; fi
+  ip link set dev "$IF" up || true
+  if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ipmon_err.log; then
+    sleep 1
+    if is_present; then
+      log "added $CIDR on $IF"
+      return 0
+    fi
+  fi
+  local ERR="$(tr -d '\n' </tmp/ipmon_err.log 2>/dev/null || true)"
+  log "failed to add $CIDR on $IF: ${ERR:-unknown}"
+  return 1
+}
+
+mkdir -p "$(dirname "$LOG")"; touch "$LOG" || true
+log "watchdog start for $CIDR (IFACE=${IFACE:-auto})"
+
+# Ensure once at start
+if ! is_present; then
+  ensure_once || true
+fi
+
+# React to address changes immediately
+if command -v ip >/dev/null 2>&1; then
+  (
+    ip monitor address 2>/dev/null | while read -r _; do
+      if ! is_present; then
+        log "detected address change; re-adding $CIDR"
+        ensure_once || true
+      fi
+    done
+  ) &
+fi
+
+# Periodic safety check
 while true; do
   if ! is_present; then
-    IF=$(pick_if); [[ -n "$IF" ]] || { echo "[IPMON] no iface"; sleep "$SLEEP_SEC"; continue; }
-    ip link set dev "$IF" up || true
-    if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ipmon_err.log; then
-      echo "[IPMON] re-added $CIDR on $IF"
-    else
-      ERR=$(tr -d '\n' </tmp/ipmon_err.log 2>/dev/null || true)
-      echo "[IPMON] failed to add $CIDR on $IF: ${ERR:-unknown}"
-    fi
+    log "missing; re-adding $CIDR"
+    ensure_once || true
   fi
   sleep "$SLEEP_SEC"
 done
 MON
-chmod +x /tmp/${TAG}.sh
+chmod +x "$SH"
 
-( setsid bash -lc "bash /tmp/${TAG}.sh '$CIDR' '${IFACE:-}' '$SLEEP_SEC'" & echo $! > "/tmp/${TAG}.pid" )
-PGID="$(ps -o pgid= -p "$(cat /tmp/${TAG}.pid)" | tr -d ' ')"
-echo "$PGID" > "$PGFILE"
-echo "[IPMON] started TAG=$TAG pid=$(cat /tmp/${TAG}.pid) pgid=$PGID"
+# Launch detached; persist beyond SSH session; record PID+PGID
+nohup setsid bash -lc "bash '$SH' '$CIDR' '${IFACE:-}' '$SLEEP_SEC' '$LOG'" >/dev/null 2>&1 &
+echo $! >"$PIDF"
+PGID="$(ps -o pgid= -p "$(cat "$PIDF")" | tr -d ' ')"
+echo "$PGID" >"$PGF"
+echo "[IPMON] started PID=$(cat "$PIDF") PGID=$PGID → $LOG"
 EOF
 }
 
 stop_ip_monitor(){
   local ip="$1" tag="$2"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$tag" <<'EOF'
+  local remote="/tmp/${tag}"; local pidf="${remote}.pid"; local pgf="${remote}.pgid"; local sh="${remote}.sh"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$pidf" "$pgf" "$sh" <<'EOF'
 set +e
-TAG="$1"
-PG="/tmp/${TAG}.pgid"; PIDF="/tmp/${TAG}.pid"; SH="/tmp/${TAG}.sh"
-if [[ -f "$PG" ]]; then
-  PGID="$(tr -d ' ' < "$PG" 2>/dev/null)"
+PIDF="${1:?}"; PGF="${2:?}"; SH="${3:?}"
+if [[ -f "$PGF" ]]; then
+  PGID="$(tr -d ' ' < "$PGF" 2>/dev/null)"
   [[ -n "$PGID" ]] && { kill -TERM -"$PGID" 2>/dev/null; sleep 1; kill -KILL -"$PGID" 2>/dev/null; }
 fi
 [[ -f "$PIDF" ]] && { kill -TERM "$(cat "$PIDF")" 2>/dev/null; sleep 1; kill -KILL "$(cat "$PIDF")" 2>/dev/null; }
-rm -f "$PG" "$PIDF" "$SH" 2>/dev/null || true
-echo "[IPMON] stopped TAG=$TAG"
+rm -f "$PGF" "$PIDF" "$SH" 2>/dev/null || true
+echo "[IPMON] stopped"
 EOF
 }
 
