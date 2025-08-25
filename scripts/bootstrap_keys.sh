@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Re-assert alias IP just before doing work
+HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
+for h in ${HOSTS}; do
+  ensure_alias_ip "$h"
+done
 
 # Resolve IP the same way you’ve been passing it
 IP="${IP:-}"
