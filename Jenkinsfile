@@ -353,13 +353,6 @@ bash -euo pipefail scripts/fetch_build.sh
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 : "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
-
-if [ "${INSTALL_MODE:-}" = "Upgrade_with_cluster_reset" ] && [ ! -f "$WORKSPACE/.cluster_reset_done" ]; then
-  echo "[gate] INSTALL_MODE=Upgrade_with_cluster_reset but reset marker not found: $WORKSPACE/.cluster_reset_done"
-  echo "[gate] This usually means the reset stage didn't run or failed."
-  exit 2
-fi
-
 # Re-assert alias IP on all CNs before install
 HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
 ensure_alias_ip() {
@@ -375,6 +368,12 @@ ensure_alias_ip() {
   '
 }
 for h in ${HOSTS}; do ensure_alias_ip "$h"; done
+if [ "${INSTALL_MODE:-}" = "Upgrade_with_cluster_reset" ] && [ ! -f "$WORKSPACE/.cluster_reset_done" ]; then
+  echo "[gate] INSTALL_MODE=Upgrade_with_cluster_reset but reset marker not found: $WORKSPACE/.cluster_reset_done"
+  echo "[gate] This usually means the reset stage didn't run or failed."
+  exit 2
+fi
+
 
 echo ">>> Cluster install starting (mode: ${INSTALL_MODE})"
 sed -i 's/\r$//' scripts/cluster_install.sh || true
