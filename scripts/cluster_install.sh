@@ -102,19 +102,15 @@ echo "[IP] ERROR: Could not plumb ${IP_CIDR} (tried: ${CAND[*]})"
 exit 2
 RS
 
-# 2) Ensure ONLY TRILLIUM is extracted under <ROOT>/<BASE>/<TAG>; returns DIR path
+# 2) Always (re)extract TRILLIUM under <ROOT>/<BASE>/<TAG>; returns DIR path
 read -r -d '' ENSURE_TRILLIUM_EXTRACTED <<'RS' || true
 set -euo pipefail
 ROOT="$1"; BASE="$2"; TAG="$3"; WAIT="${4:-0}"
 DEST_DIR="$ROOT/$BASE/$TAG"
 mkdir -p "$DEST_DIR"
 shopt -s nullglob
-# already extracted? directory with prefix
-dir_candidates=( "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*/ )
-if (( ${#dir_candidates[@]} )); then
-  echo "${dir_candidates[0]%/}"; exit 0
-fi
-# wait for tar
+
+# locate tarball
 exact="$DEST_DIR/TRILLIUM_5GCN_CNF_REL_${BASE}.tar.gz"
 wild=( "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*.tar.gz )
 elapsed=0; interval=3; tarfile=""
@@ -125,12 +121,16 @@ while :; do
   echo "[TRIL] Waiting for tar in $DEST_DIR ... (${elapsed}/${WAIT}s)"; sleep "$interval"; elapsed=$((elapsed+interval))
 done
 [[ -n "$tarfile" ]] || { echo "[ERROR] No TRILLIUM tar found in $DEST_DIR after ${WAIT}s"; exit 2; }
+
+# Always untar, even if directory already exists
 echo "[TRIL] Extracting $(basename "$tarfile") into $DEST_DIR ..."
 tar -C "$DEST_DIR" -xzf "$tarfile"
+
 dir_candidates=( "$DEST_DIR"/TRILLIUM_5GCN_CNF_REL_${BASE}*/ )
 [[ ${#dir_candidates[@]} -gt 0 ]] || { echo "[ERROR] Extraction completed but directory not found under $DEST_DIR"; exit 2; }
 echo "${dir_candidates[0]%/}"
 RS
+
 
 # 3) LOW capacity tweak BEFORE install
 read -r -d '' LOW_CAPACITY_TWEAK <<'RS' || true
