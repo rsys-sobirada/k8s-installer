@@ -29,6 +29,9 @@ REL_SUFFIX="${REL_SUFFIX:-}"                       # optional suffix in TRILLIUM
 : "${INSTALL_IP_ADDR:=}"                           # e.g. 10.10.10.20/24 ; if empty, skipped
 : "${INSTALL_IP_IFACE:=}"                          # optional explicit iface
 
+# ---- NEW (IP Monitor) ----
+IP_MONITOR_INTERVAL="${IP_MONITOR_INTERVAL:-30}"   # seconds between checks
+
 # ===== Gate & validation =====
 shopt -s nocasematch
 if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
@@ -48,6 +51,8 @@ log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
 ver_num(){ echo "${1%%_*}"; }   # 6.3.0_EA1 -> 6.3.0
 ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }
 
+SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
+
 # Version-safe path normalizer (prevents double-versioning; probes EA/non-EA)
 normalize_k8s_path() {
   local base="${1%/}" old_ver="$2"
@@ -62,8 +67,7 @@ normalize_k8s_path() {
     echo "$base/k8s-v${K8S_VER}"; return
   fi
 
-  # 3) If base ends with ".../<num>[/EAx]" (e.g., /home/labadmin/6.3.0[/EA2]),
-  #    prefer the version/tag *from the path*, but PROBE TRILLIUM with and without EA suffix.
+  # 3) If base ends with ".../<num>[/EAx]" use version/tag from path and PROBE remote
   if [[ "$base" =~ /([0-9]+\.[0-9]+\.[0-9]+)(/(EA[0-9]+))?$ ]]; then
     local num_in_path tag_in_path rel_with rel_without
     num_in_path="$(printf '%s\n' "$base" | sed -n 's#.*/\([0-9]\+\.[0-9]\+\.[0-9]\+\)\(/\(EA[0-9]\+\)\)\?$#\1#p')"
@@ -75,13 +79,11 @@ normalize_k8s_path() {
     local cand_with="$base/${rel_with}/common/tools/install/k8s-v${K8S_VER}"
     local cand_wo="$base/${rel_without}/common/tools/install/k8s-v${K8S_VER}"
 
-    # Probe the remote host for which one actually exists
     if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_with"; then
       echo "$cand_with"; return
     elif ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_wo"; then
       echo "$cand_wo"; return
     else
-      # Neither exists; return non-EA for clearer errors later
       echo "$cand_wo"; return
     fi
   fi
@@ -110,8 +112,6 @@ normalize_k8s_path() {
     echo "$cand_wo"
   fi
 }
-
-SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
 
 # Robust alias-IP ensure snippet (present → no-op; missing → add)
 read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
@@ -293,7 +293,76 @@ EOF
   echo "❌ Uninstall failed after $RETRY_COUNT attempts on $ip"; return 1
 }
 
-# ===== Ensure swaps are restored on exit =====
+# ===== NEW: IP monitor helpers (start/stop) =====
+declare -a IP_MON_IDS=()  # "<ip>|<tag>"
+
+start_ip_monitor(){
+  local ip="$1" ip_cidr="$2" iface="$3"
+  [[ -z "$ip_cidr" ]] && { echo "[IPMON][$ip] skipped (INSTALL_IP_ADDR empty)"; return 0; }
+  local tag="ipmon_${RANDOM}_$$_$(date +%s)"
+  IP_MON_IDS+=("$ip|$tag")
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$ip_cidr" "$iface" "$IP_MONITOR_INTERVAL" "$tag" <<'EOF'
+set -euo pipefail
+CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; TAG="$4"
+IP="${CIDR%%/*}"
+PGFILE="/tmp/${TAG}.pgid"
+
+cat >/tmp/${TAG}.sh <<'MON'
+#!/usr/bin/env bash
+set -euo pipefail
+CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"
+IP="${CIDR%%/*}"
+is_present(){ ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP"; }
+pick_if(){
+  [[ -n "$IFACE" ]] && { echo "$IFACE"; return; }
+  DEFIF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
+  if [[ -n "$DEFIF" ]]; then echo "$DEFIF"; return; fi
+  ip -o link | awk -F': ' '{print $2}' \
+    | sed 's/@.*//' \
+    | grep -E '^(en|eth|ens|eno|em|bond|br)' \
+    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
+    | head -n1
+}
+while true; do
+  if ! is_present; then
+    IF=$(pick_if); [[ -n "$IF" ]] || { echo "[IPMON] no iface"; sleep "$SLEEP_SEC"; continue; }
+    ip link set dev "$IF" up || true
+    if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ipmon_err.log; then
+      echo "[IPMON] re-added $CIDR on $IF"
+    else
+      ERR=$(tr -d '\n' </tmp/ipmon_err.log 2>/dev/null || true)
+      echo "[IPMON] failed to add $CIDR on $IF: ${ERR:-unknown}"
+    fi
+  fi
+  sleep "$SLEEP_SEC"
+done
+MON
+chmod +x /tmp/${TAG}.sh
+
+( setsid bash -lc "bash /tmp/${TAG}.sh '$CIDR' '${IFACE:-}' '$SLEEP_SEC'" & echo $! > "/tmp/${TAG}.pid" )
+PGID="$(ps -o pgid= -p "$(cat /tmp/${TAG}.pid)" | tr -d ' ')"
+echo "$PGID" > "$PGFILE"
+echo "[IPMON] started TAG=$TAG pid=$(cat /tmp/${TAG}.pid) pgid=$PGID"
+EOF
+}
+
+stop_ip_monitor(){
+  local ip="$1" tag="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$tag" <<'EOF'
+set +e
+TAG="$1"
+PG="/tmp/${TAG}.pgid"; PIDF="/tmp/${TAG}.pid"; SH="/tmp/${TAG}.sh"
+if [[ -f "$PG" ]]; then
+  PGID="$(tr -d ' ' < "$PG" 2>/dev/null)"
+  [[ -n "$PGID" ]] && { kill -TERM -"$PGID" 2>/dev/null; sleep 1; kill -KILL -"$PGID" 2>/dev/null; }
+fi
+[[ -f "$PIDF" ]] && { kill -TERM "$(cat "$PIDF")" 2>/dev/null; sleep 1; kill -KILL "$(cat "$PIDF")" 2>/dev/null; }
+rm -f "$PG" "$PIDF" "$SH" 2>/dev/null || true
+echo "[IPMON] stopped TAG=$TAG"
+EOF
+}
+
+# ===== Ensure swaps are restored & monitors stopped on exit =====
 declare -a SWAP_IDS=()   # "<ip>|<id>"
 on_exit_restore_all(){
   local item ip id
@@ -303,7 +372,14 @@ on_exit_restore_all(){
     restore_inventory_override "$ip" "$id" || true
   done
 }
-trap on_exit_restore_all EXIT
+on_exit_stop_ipmon(){
+  local item ip tag
+  for item in "${IP_MON_IDS[@]}"; do
+    ip="${item%%|*}"; tag="${item#*|}"
+    stop_ip_monitor "$ip" "$tag" || true
+  done
+}
+trap 'on_exit_restore_all; on_exit_stop_ipmon' EXIT
 
 # ===== Main =====
 log "Jenkins reset.yml: $RESET_YML_WS"
@@ -320,6 +396,8 @@ while IFS= read -r entry; do
   # Ensure alias IP (only if configured)
   if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
     ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET" || true
+    # ---- NEW: start a watchdog that re-adds the IP if removed ----
+    start_ip_monitor "$ip" "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE"
   else
     echo "[IP] Skipping ensure; INSTALL_IP_ADDR is empty"
   fi
@@ -379,6 +457,12 @@ while IFS= read -r entry; do
 
   restore_reset_override     "$ip" "$swap_id"
   restore_inventory_override "$ip" "$swap_id"
+
+  # ---- NEW: stop the per-host IP monitor now that this host's reset flow is done ----
+  for _it in "${IP_MON_IDS[@]}"; do
+    [[ "${_it%%|*}" == "$ip" ]] || continue
+    stop_ip_monitor "$ip" "${_it#*|}" || true
+  done
 
 done < <(read_server_entries)
 
