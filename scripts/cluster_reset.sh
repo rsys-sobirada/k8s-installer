@@ -25,6 +25,10 @@ INSTALL_NAME="${INSTALL_NAME:-install_k8s.sh}"
 UNINSTALL_NAME="${UNINSTALL_NAME:-uninstall_k8s.sh}"
 REL_SUFFIX="${REL_SUFFIX:-}"                       # optional suffix in TRILLIUM dir name
 
+# 🔹 NEW (optional inputs for alias IP ensure)
+: "${INSTALL_IP_ADDR:=}"                           # e.g. 10.10.10.20/24 ; if empty, skipped
+: "${INSTALL_IP_IFACE:=}"                          # optional explicit iface
+
 # ===== Gate & validation =====
 shopt -s nocasematch
 if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
@@ -49,30 +53,58 @@ normalize_k8s_path(){
   local base="${1%/}" ver="$2" num tag
   num="$(ver_num "$ver")"; tag="$(ver_tag "$ver")"
 
-  # Full k8s root provided
   if [[ "$base" =~ /common/tools/install/k8s-v[^/]+$ ]]; then
     echo "$base"; return
   fi
-  # TRILLIUM root up to common/tools/install provided
   if [[ "$base" =~ /TRILLIUM_5GCN_CNF_REL_${num}[^/]*/common/tools/install$ ]]; then
     echo "$base/k8s-v${K8S_VER}"; return
   fi
-  # If pointed at kubespray dir, trim back to k8s root
   if [[ "$base" =~ /common/tools/install/k8s-v[^/]+/kubespray(-[^/]+)?$ ]]; then
     echo "${base%/kubespray*}"; return
   fi
-  # Versioned base already ends with /<num> or /<num>/<tag>
   if [[ "$base" =~ /${num}(/${tag})?$ ]]; then
     echo "$base/TRILLIUM_5GCN_CNF_REL_${num}${REL_SUFFIX}/common/tools/install/k8s-v${K8S_VER}"
     return
   fi
-  # Plain base: build full hierarchy
   local p="$base/${num}"
   [[ -n "$tag" ]] && p="$p/${tag}"
   echo "$p/TRILLIUM_5GCN_CNF_REL_${num}${REL_SUFFIX}/common/tools/install/k8s-v${K8S_VER}"
 }
 
 SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
+
+# 🔹 NEW: robust alias-IP ensure snippet (same semantics as install)
+read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
+set -euo pipefail
+IP_CIDR="$1"; FORCE_IFACE="${2-}"
+IP_ONLY="${IP_CIDR%%/*}"
+is_present(){ ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY"; }
+echo "[IP] Ensuring ${IP_CIDR}"
+if is_present; then
+  echo "[IP] Already present: ${IP_ONLY}"
+  exit 0
+fi
+declare -a CAND=()
+[[ -n "$FORCE_IFACE" ]] && CAND+=("$FORCE_IFACE")
+DEF_IF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
+[[ -n "${DEF_IF:-}" ]] && CAND+=("$DEF_IF")
+while IFS= read -r ifc; do CAND+=("$ifc"); done < <(
+  ip -o link | awk -F': ' '{print $2}' \
+    | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
+    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
+    | sort -u
+)
+for IF in "${CAND[@]}"; do
+  [[ -z "$IF" ]] && continue
+  echo "[IP] Trying ${IP_CIDR} on iface ${IF}..."
+  ip link set dev "$IF" up || true
+  if ip addr replace "$IP_CIDR" dev "$IF" 2>"/tmp/ip_err_${IF}.log"; then
+    ip -4 addr show dev "$IF" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY" && { echo "[IP] OK on ${IF}"; exit 0; }
+  fi
+done
+echo "[IP] ERROR: Could not plumb ${IP_CIDR} (tried: ${CAND[*]})"
+exit 2
+RS
 
 # Read "ip|path" from server_pci_map.txt (supports name:ip:path or ip:path)
 read_server_entries(){
@@ -242,6 +274,13 @@ while IFS= read -r entry; do
 
   echo ""
   echo "🔧 Server: $ip"
+
+  # 🔹 NEW: ensure alias IP (only if configured)
+  if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET" || true
+  else
+    echo "[IP] Skipping ensure; INSTALL_IP_ADDR is empty"
+  fi
 
   if [[ -z "$pth" || "$pth" == "$ip" ]]; then
     echo "❌ No OLD_BUILD_PATH specified for $ip in $SERVER_FILE (UI param ignored by design). Skipping."
