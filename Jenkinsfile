@@ -249,12 +249,19 @@ push_key_if_needed() {
   fi
 }
 
+# --- SSH key preflight ---
 fail=0
 for h in ${HOSTS}; do
   echo "[preflight] Testing ${h}…"
   push_key_if_needed "${h}" || fail=1
 done
 
+if [ "${fail}" -ne 0 ]; then
+  echo "[preflight] ❌ One or more hosts failed SSH preflight."
+  exit 1
+fi
+
+# --- Alias IP ensure (Option B: stream logs; capture SSH rc) ---
 echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
 fail=0
 for h in ${HOSTS}; do
@@ -267,19 +274,10 @@ for h in ${HOSTS}; do
   echo "[alias-ip][${h}] ◀ exit code=${rc}"
   [ "${rc}" -eq 0 ] || fail=1
 done
-[ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
-[ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
-[ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
+
 [ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
 
-[ $fail -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
-
-if [ $fail -ne 0 ]; then
-  echo "[preflight] ❌ One or more hosts failed SSH preflight."
-  exit 1
-fi
-
-echo "[preflight] ✅ All CNs accept Jenkins key. Proceeding."
+echo "[preflight] ✅ All CNs accept Jenkins key & alias IP ensured. Proceeding."
 '''
         }
       }
