@@ -259,6 +259,8 @@ echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
 for h in ${HOSTS}; do
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -s -- "${INSTALL_IP_ADDR}" <<'REMOTE' || fail=1
 set -euo pipefail
+export PATH="/sbin:/usr/sbin:/bin:/usr/bin:$PATH"
+command -v ip >/dev/null 2>&1 || { echo "[alias-ip] ❌ ip(8) not found in PATH: $PATH"; exit 2; }
 IP_CIDR="$1"
 IP_ONLY="${IP_CIDR%%/*}"
 
@@ -310,8 +312,7 @@ done
 if [ $ok -ne 0 ]; then
   echo "[alias-ip] ❌ Failed to add ${IP_CIDR}. Kernel says: $(tr -d '\\n' </tmp/ip_alias_err.log 2>/dev/null || true)"
   exit 2
-fi
-REMOTE
+fiREMOTE
 done
 
 [ $fail -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
