@@ -265,7 +265,7 @@ for h in ${HOSTS}; do
   else
     rc=$?
   fi
-  sed "s/^/[alias-ip][${h}] /" "${tmplog}"
+  sed "s/^/[alias-ip][${h}] /" "${tmplog}" || true || true
   rm -f "${tmplog}"
   echo "[alias-ip][${h}] ◀ exit code=${rc}"
   if [ "${rc}" -ne 0 ]; then
