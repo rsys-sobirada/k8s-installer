@@ -15,7 +15,7 @@ properties([
       description: 'Select installation mode'
     ),
 
-    // 3) OLD_BUILD_PATH shown only for Upgrade_* modes (kept for UI, but ignored by reset script)
+    // 3) OLD_BUILD_PATH shown only for Upgrade_* modes (kept for UI; reset script ignores it now)
     [
       $class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
@@ -51,7 +51,7 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
     // 6) Old version
     choice(name: 'OLD_VERSION',
            choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2\n6.3.0_EA3',
-           description: 'Existing bundle (used if resetting/upgrading)'),
+           description: 'Existing bundle (used if upgrading)'),
 
     // 7) Fetch toggle
     booleanParam(name: 'FETCH_BUILD',
@@ -188,7 +188,7 @@ pipeline {
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // root key used to reach CN
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'
-    INSTALL_IP_ADDR  = "${params.INSTALL_IP_ADDR}"      // param overrides
+    INSTALL_IP_ADDR  = "${params.INSTALL_IP_ADDR}"      // ensure param override is available
   }
 
   stages {
@@ -202,13 +202,13 @@ pipeline {
       }
     }
 
-    // ✅ SSH readiness; ensures alias IP via robust heredoc (no -lc)
+    // ✅ Preflight: ensure SSH + ensure alias IP (add only if missing)
     stage('Preflight SSH to CNs') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
-: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"
+: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
 
 PUB_KEY_FILE="${SSH_KEY}.pub"
 if [ ! -s "${PUB_KEY_FILE}" ]; then
@@ -249,29 +249,6 @@ push_key_if_needed() {
   fi
 }
 
-ensure_alias_ip() {
-  local host="$1"
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -s -- "${INSTALL_IP_ADDR}" <<'REMOTE'
-set -euo pipefail
-IP_CIDR="$1"
-[ -n "${IP_CIDR:-}" ] || { echo "[alias-ip] ❌ empty IP/CIDR"; exit 2; }
-
-DEFIF="$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')"
-IFACE="${DEFIF:-$(ip -o link | awk -F': ' '{print $2}' \
-  | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
-  | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
-  | head -n1)}"
-[ -n "${IFACE:-}" ] || { echo "[alias-ip] ❌ no suitable interface found"; exit 2; }
-ip link set "$IFACE" up || true
-if ! ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}' | grep -qx "$IP_CIDR"; then
-  ip addr replace "$IP_CIDR" dev "$IFACE"
-fi
-ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}' | grep -qx "$IP_CIDR" \
-  || { echo "[alias-ip] ❌ failed to ensure $IP_CIDR on $IFACE"; exit 2; }
-echo "[alias-ip] ✅ $IP_CIDR on $IFACE"
-REMOTE
-}
-
 fail=0
 for h in ${HOSTS}; do
   echo "[preflight] Testing ${h}…"
@@ -280,8 +257,41 @@ done
 
 echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
 for h in ${HOSTS}; do
-  ensure_alias_ip "$h" || fail=1
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -s -- "${INSTALL_IP_ADDR}" <<'REMOTE' || fail=1
+set -euo pipefail
+IP_CIDR="$1"
+
+# Validate CIDR
+if [ -z "${IP_CIDR:-}" ] || ! echo "${IP_CIDR}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]{1,2}$'; then
+  echo "[alias-ip] ❌ invalid or empty IP/CIDR: '${IP_CIDR}'"; exit 2
+fi
+
+# Preferred iface: default route; fallback to first physical NIC
+DEFIF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+IFACE="${DEFIF}"
+if [ -z "${IFACE:-}" ]; then
+  IFACE=$(ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
+    | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
+    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
+    | head -n1)
+fi
+[ -n "${IFACE:-}" ] || { echo "[alias-ip] ❌ no candidate interface"; exit 2; }
+ip link set "${IFACE}" up || true
+
+# Add only if missing
+if ip -4 addr show dev "${IFACE}" | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}"; then
+  echo "[alias-ip] ✅ Already present: ${IP_CIDR} on ${IFACE}"
+  exit 0
+fi
+if ip addr add "${IP_CIDR}" dev "${IFACE}" 2>/tmp/ip_alias_err.log; then
+  ip -4 addr show dev "${IFACE}" | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}" \
+    && echo "[alias-ip] ✅ Added ${IP_CIDR} on ${IFACE}" && exit 0
+fi
+echo "[alias-ip] ❌ Failed to add ${IP_CIDR} on ${IFACE}: $(tr -d '\n' </tmp/ip_alias_err.log || true)"
+exit 2
+REMOTE
 done
+
 [ $fail -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
 
 if [ $fail -ne 0 ]; then
@@ -289,7 +299,7 @@ if [ $fail -ne 0 ]; then
   exit 1
 fi
 
-echo "[preflight] ✅ All CNs accept Jenkins key and alias IP is present. Proceeding."
+echo "[preflight] ✅ All CNs accept Jenkins key. Proceeding."
 '''
         }
       }
@@ -313,6 +323,7 @@ echo "[preflight] ✅ All CNs accept Jenkins key and alias IP is present. Procee
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
+
 : "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
 ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
 
@@ -324,6 +335,7 @@ bootstrap_one() {
   local host="$1"
   echo ""
   echo "─── Host ${host} ───────────────────────────────────────"
+
   SCRIPT_CONTENT='#!/usr/bin/env bash
 set -euo pipefail
 IP="$1"
@@ -334,6 +346,7 @@ cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
 ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}"
 systemctl restart sshd
 '
+
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
     set -euo pipefail
     cat > /root/bootstrap_keys.sh <<'"'"'EOF'"'"'
@@ -352,7 +365,7 @@ for h in ${HOSTS}; do
     ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "'"${INSTALL_IP_ADDR}"'" || {
       DEFIF=$(ip route | awk "/^default/{print \\$5; exit}")
       ip link set dev "${DEFIF}" up || true
-      ip addr replace "'"${INSTALL_IP_ADDR}"'" dev "${DEFIF}"
+      ip addr add "'"${INSTALL_IP_ADDR}"'" dev "${DEFIF}"
     }
     ip -4 addr show | grep -q "'"${INSTALL_IP_ADDR}"'" && echo "[IP] Present: ${INSTALL_IP_ADDR}" || { echo "[IP] Failed to plumb ${INSTALL_IP_ADDR}"; exit 2; }
   '
@@ -378,12 +391,12 @@ chmod +x scripts/cluster_reset.sh
 env \
   CLUSTER_RESET=true \
   OLD_VERSION="${OLD_VERSION}" \
+  OLD_BUILD_PATH="${OLD_BUILD_PATH_UI}" \
   K8S_VER="${K8S_VER}" \
   KSPRAY_DIR="kubespray-2.27.0" \
   RESET_YML_WS="$WORKSPACE/reset.yml" \
   SSH_KEY="${SSH_KEY}" \
   SERVER_FILE="${SERVER_FILE}" \
-  INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
   REQ_WAIT_SECS="360" \
   RETRY_COUNT="3" \
   RETRY_DELAY_SECS="10" \
@@ -450,28 +463,6 @@ echo ">>> Cluster install starting (mode: ${INSTALL_MODE})"
 sed -i 's/\r$//' scripts/cluster_install.sh || true
 chmod +x scripts/cluster_install.sh
 
-# Re-assert alias IP on all CNs before install (quick, idempotent)
-HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
-ensure_alias_ip() {
-  local host="$1"
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -s -- "${INSTALL_IP_ADDR}" <<'REMOTE'
-set -euo pipefail
-IP_CIDR="$1"
-[ -n "${IP_CIDR:-}" ] || { echo "[alias-ip] ❌ empty IP/CIDR"; exit 2; }
-DEFIF="$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')"
-IFACE="${DEFIF:-$(ip -o link | awk -F': ' '{print $2}' \
-  | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
-  | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
-  | head -n1)}"
-[ -n "${IFACE:-}" ] || { echo "[alias-ip] ❌ no suitable interface found"; exit 2; }
-ip link set "$IFACE" up || true
-ip addr replace "$IP_CIDR" dev "$IFACE"
-ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}' | grep -qx "$IP_CIDR" || { echo "[alias-ip] ❌ failed to ensure $IP_CIDR on $IFACE"; exit 2; }
-echo "[alias-ip] ✅ $IP_CIDR on $IFACE"
-REMOTE
-}
-for h in ${HOSTS}; do ensure_alias_ip "$h" || { echo "[alias-ip] ❌ failed on $h"; exit 1; }; done
-
 run_install() {
   env \
     NEW_VERSION="${NEW_VERSION}" \
@@ -497,6 +488,7 @@ set -e
 if grep -q "Permission denied (publickey,password)" /tmp/cluster_install.out; then
   echo "[auto-recovery] SSH permission denied detected → re-running bootstrap on each host and retrying install once."
   ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
+  HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
   for h in ${HOSTS}; do
     ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
       set -euo pipefail
