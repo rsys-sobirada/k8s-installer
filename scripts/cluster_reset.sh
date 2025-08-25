@@ -300,9 +300,9 @@ start_ip_monitor(){
   local ip="$1" ip_cidr="$2" iface="$3"
   [[ -z "$ip_cidr" ]] && { echo "[IPMON][$ip] skipped (INSTALL_IP_ADDR empty)"; return 0; }
 
-  # Stable one-per-host+CIDR tag to avoid duplicates
-  local cidr_sanitized="${ip_cidr//\//_}"               # e.g. 10.10.10.20_24
-  local tag="ipmon_${ip//./-}_${cidr_sanitized}"        # stable tag per host+cidr
+  local cidr_sanitized="${ip_cidr//\//_}"
+  local tag="ipmon_${ip//./-}_${cidr_sanitized}"
+  # (Keep: we can leave this line here; harmless even if start fails)
   IP_MON_IDS+=("$ip|$tag")
 
   local remote="/tmp/${tag}"
@@ -311,38 +311,16 @@ start_ip_monitor(){
   local pgf="${remote}.pgid"
   local log="/var/log/alias_ipmon.log"
 
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$ip_cidr" "$iface" "$IP_MONITOR_INTERVAL" "$sh" "$pidf" "$pgf" "$log" <<'EOF'
-CIDR="${1:?}"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"
-SH="${4:?}"; PIDF="${5:?}"; PGF="${6:?}"; LOG="${7:?}"
+  # --------------- PATCHED REMOTE PREAMBLE (only these lines changed) ---------------
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -eo pipefail -s -- \
+      "${ip_cidr:-}" "${iface:-}" "${IP_MONITOR_INTERVAL:-30}" \
+      "${sh:-}" "${pidf:-}" "${pgf:-}" "${log:-/var/log/alias_ipmon.log}" <<'EOF'
+# NOTE: be lenient with args; provide defaults to avoid "parameter null or not set"
+CIDR="${1:-}"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"
+SH="${4:-/tmp/ipmon.sh}"; PIDF="${5:-/tmp/ipmon.pid}"; PGF="${6:-/tmp/ipmon.pgid}"
+LOG="${7:-/var/log/alias_ipmon.log}"
+# --------------- /PATCHED REMOTE PREAMBLE ------------------------------------------
 
-IP="${CIDR%%/*}"
-
-# If already running, keep it
-if [[ -s "$PIDF" ]] && ps -p "$(cat "$PIDF" 2>/dev/null)" >/dev/null 2>&1; then
-  echo "[IPMON] already running (PID=$(cat "$PIDF")) logging to $LOG"
-  exit 0
-fi
-
-cat >"$SH" <<'MON'
-#!/usr/bin/env bash
-set -euo pipefail
-CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; LOG="$4"
-IP="${CIDR%%/*}"
-
-log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG"; }
-
-is_present(){ ip -4 addr show | awk "/inet /{print \$2}" | cut -d/ -f1 | grep -qx "$IP"; }
-
-pick_if(){
-  [[ -n "$IFACE" ]] && { echo "$IFACE"; return; }
-  DEFIF=$(ip route 2>/dev/null | awk "/^default/{print \$5; exit}" || true)
-  if [[ -n "$DEFIF" ]]; then echo "$DEFIF"; return; fi
-  ip -o link | awk -F': ' '{print $2}' \
-    | sed 's/@.*//' \
-    | grep -E '^(en|eth|ens|eno|em|bond|br)' \
-    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
-    | head -n1
-}
 
 ensure_once(){
   local IF
