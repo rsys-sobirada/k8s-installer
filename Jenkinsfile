@@ -188,7 +188,7 @@ pipeline {
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // root key used to reach CN
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'
-    INSTALL_IP_ADDR  = "${params.INSTALL_IP_ADDR}"      // param override available to shell
+    INSTALL_IP_ADDR  = "${params.INSTALL_IP_ADDR}"      // ensure param override is available
   }
 
   stages {
@@ -202,7 +202,7 @@ pipeline {
       }
     }
 
-    // ✅ Preflight: ensure SSH + ensure alias IP (add only if missing; IP-only match)
+    // ✅ Preflight: ensure SSH + ensure alias IP (add only if missing; IP-only check)
     stage('Preflight SSH to CNs') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
@@ -260,15 +260,21 @@ for h in ${HOSTS}; do
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -s -- "${INSTALL_IP_ADDR}" <<'REMOTE' || fail=1
 set -euo pipefail
 IP_CIDR="$1"
+IP_ONLY="${IP_CIDR%%/*}"
 
 # Validate CIDR
 if [ -z "${IP_CIDR:-}" ] || ! echo "${IP_CIDR}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]{1,2}$'; then
   echo "[alias-ip] ❌ invalid or empty IP/CIDR: '${IP_CIDR}'"; exit 2
 fi
-IP_ONLY="${IP_CIDR%%/*}"
+
+# If the IP is already present anywhere, skip
+if ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "${IP_ONLY}"; then
+  echo "[alias-ip] ✅ Already present: ${IP_ONLY}"
+  exit 0
+fi
 
 # Preferred iface: default route; fallback to first physical NIC
-DEFIF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+DEFIF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
 IFACE="${DEFIF}"
 if [ -z "${IFACE:-}" ]; then
   IFACE=$(ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
@@ -279,16 +285,14 @@ fi
 [ -n "${IFACE:-}" ] || { echo "[alias-ip] ❌ no candidate interface"; exit 2; }
 ip link set "${IFACE}" up || true
 
-# Add only if missing (IP-only presence check)
-if ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "${IP_ONLY}"; then
-  echo "[alias-ip] ✅ Already present: ${IP_ONLY}"
-  exit 0
+# Add only if missing
+if ip addr add "${IP_CIDR}" dev "${IFACE}" 2>/tmp/ip_alias_err.log; then
+  if ip -4 addr show dev "${IFACE}" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "${IP_ONLY}"; then
+    echo "[alias-ip] ✅ Added ${IP_CIDR} on ${IFACE}"
+    exit 0
+  fi
 fi
-if ip addr replace "${IP_CIDR}" dev "${IFACE}" 2>/tmp/ip_alias_err.log; then
-  ip -4 addr show dev "${IFACE}" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "${IP_ONLY}" \
-    && echo "[alias-ip] ✅ ${IP_CIDR} ensured on ${IFACE}" && exit 0
-fi
-echo "[alias-ip] ❌ Failed to ensure ${IP_CIDR} on ${IFACE}: $(tr -d '\n' </tmp/ip_alias_err.log || true)"
+echo "[alias-ip] ❌ Failed to add ${IP_CIDR} on ${IFACE}: $(tr -d '\n' </tmp/ip_alias_err.log || true)"
 exit 2
 REMOTE
 done
@@ -360,17 +364,15 @@ EOF
 }
 
 for h in ${HOSTS}; do
-  # ensure alias exists first so the ssh-copy-id step can reach it (IP-only check)
+  # ensure alias exists first so the ssh-copy-id step can reach it
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
     set -euo pipefail
-    IP_CIDR="'"${INSTALL_IP_ADDR}"'"
-    IP_ONLY="${IP_CIDR%%/*}"
-    DEFIF=$(ip route | awk "/^default/{print \\$5; exit}")
-    ip link set dev "${DEFIF}" up || true
-    if ! ip -4 addr show | awk "/inet /{print \\$2}" | cut -d/ -f1 | grep -qx "${IP_ONLY}"; then
-      ip addr replace "'"${INSTALL_IP_ADDR}"'" dev "${DEFIF}"
-    fi
-    ip -4 addr show | awk "/inet /{print \\$2}" | cut -d/ -f1 | grep -qx "${IP_ONLY}" && echo "[IP] Present: ${IP_ONLY}" || { echo "[IP] Failed to ensure ${IP_CIDR}"; exit 2; }
+    ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "'"${INSTALL_IP_ADDR}"'" || {
+      DEFIF=$(ip route | awk "/^default/{print \\$5; exit}")
+      ip link set dev "${DEFIF}" up || true
+      ip addr add "'"${INSTALL_IP_ADDR}"'" dev "${DEFIF}"
+    }
+    ip -4 addr show | grep -q "'"${INSTALL_IP_ADDR}"'" && echo "[IP] Present: ${INSTALL_IP_ADDR}" || { echo "[IP] Failed to plumb ${INSTALL_IP_ADDR}"; exit 2; }
   '
   bootstrap_one "$h"
 done
@@ -598,7 +600,7 @@ bash -euo pipefail scripts/ps_config.sh
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
-HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
+HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print $1; exit } else { print $1; exit } }' "${SERVER_FILE}")"
 if [[ -z "${HOST}" ]]; then
   echo "[ps-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
   exit 2
