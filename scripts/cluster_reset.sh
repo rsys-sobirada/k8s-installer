@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Uses OLD_VERSION and per-server OLD_BUILD_PATH from server_pci_map.txt (ignores UI path).
+# scripts/cluster_reset.sh
+# Now takes OLD_BUILD_PATH per-server from server_pci_map.txt (ignores user OLD_BUILD_PATH).
+# Pre-check flow:
+# 1) Check kubectl status (nodes or pods)
+# 2) Ensure requirements.txt under old build's kubespray; if missing, start install_k8s.sh and monitor
+# 3) When requirements.txt appears, kill installer, swap in Jenkins reset.yml + inventory,
+#    run ./uninstall_k8s.sh with retries, restore swaps.
+
 set -euo pipefail
 
 # ===== Inputs =====
@@ -8,7 +15,10 @@ SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
 SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}"   # lines: name:ip:path  |  ip:path
 KSPRAY_DIR="${KSPRAY_DIR:-kubespray-2.27.0}"
 K8S_VER="${K8S_VER:-1.31.4}"
-OLD_VERSION="${OLD_VERSION:-}"                     # e.g. 6.3.0_EA2 or 6.3.0
+INSTALL_IP_ADDR="${INSTALL_IP_ADDR:-}"             # optional alias to enforce
+
+# Required: old version tag (e.g., 6.3.0_EA2 or 6.3.0)
+OLD_VERSION="${OLD_VERSION:-}"
 
 RESET_YML_WS="${RESET_YML_WS:-$WORKSPACE/reset.yml}"
 REQ_WAIT_SECS="${REQ_WAIT_SECS:-360}"
@@ -17,7 +27,6 @@ RETRY_DELAY_SECS="${RETRY_DELAY_SECS:-10}"
 INSTALL_NAME="${INSTALL_NAME:-install_k8s.sh}"
 UNINSTALL_NAME="${UNINSTALL_NAME:-uninstall_k8s.sh}"
 REL_SUFFIX="${REL_SUFFIX:-}"                       # optional suffix in TRILLIUM dir name
-INSTALL_IP_ADDR="${INSTALL_IP_ADDR:-}"
 
 # ===== Gate & validation =====
 shopt -s nocasematch
@@ -38,24 +47,29 @@ log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
 ver_num(){ echo "${1%%_*}"; }   # 6.3.0_EA1 -> 6.3.0
 ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }
 
-# Accepts: base path (may be base/BASE[/TAG] or full k8s root) + version
+# Smart normalizer: accepts base, versioned, TRILLIUM root, full k8s root, or kubespray dir
 normalize_k8s_path(){
   local base="${1%/}" ver="$2" num tag
   num="$(ver_num "$ver")"; tag="$(ver_tag "$ver")"
 
+  # Full k8s root provided
   if [[ "$base" =~ /common/tools/install/k8s-v[^/]+$ ]]; then
     echo "$base"; return
   fi
+  # TRILLIUM root up to common/tools/install provided
   if [[ "$base" =~ /TRILLIUM_5GCN_CNF_REL_${num}[^/]*/common/tools/install$ ]]; then
     echo "$base/k8s-v${K8S_VER}"; return
   fi
+  # If pointed at kubespray dir, trim back to k8s root
   if [[ "$base" =~ /common/tools/install/k8s-v[^/]+/kubespray(-[^/]+)?$ ]]; then
     echo "${base%/kubespray*}"; return
   fi
+  # Versioned base already ends with /<num> or /<num>/<tag>
   if [[ "$base" =~ /${num}(/${tag})?$ ]]; then
     echo "$base/TRILLIUM_5GCN_CNF_REL_${num}${REL_SUFFIX}/common/tools/install/k8s-v${K8S_VER}"
     return
   fi
+  # Plain base: build full hierarchy
   local p="$base/${num}"
   [[ -n "$tag" ]] && p="$p/${tag}"
   echo "$p/TRILLIUM_5GCN_CNF_REL_${num}${REL_SUFFIX}/common/tools/install/k8s-v${K8S_VER}"
@@ -92,25 +106,42 @@ exit 1
 EOF
 }
 
-# Ensure alias IP exists on remote host (idempotent)
+# Ensure alias IP exists on remote host (ADD ONLY IF MISSING)
 ensure_alias_ip_remote(){
-  local ip="$1"
-  [[ -n "${INSTALL_IP_ADDR:-}" ]] || return 0
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "${INSTALL_IP_ADDR}" <<'EOF'
+  local ip="$1" cidr="${INSTALL_IP_ADDR:-}"
+  [ -n "${cidr}" ] || { echo "[alias-ip][$ip] ⚠️ empty INSTALL_IP_ADDR; skipping"; return 0; }
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$cidr" <<'REMOTE'
 set -euo pipefail
 IP_CIDR="$1"
-[ -n "${IP_CIDR:-}" ] || exit 0
-DEFIF="$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')"
-IFACE="${DEFIF:-$(ip -o link | awk -F': ' '{print $2}' \
-  | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
-  | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
-  | head -n1)}"
-[ -n "${IFACE:-}" ] || { echo "[alias-ip] ❌ no suitable interface found"; exit 2; }
-ip link set "$IFACE" up || true
-ip addr replace "$IP_CIDR" dev "$IFACE"
-ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}' | grep -qx "$IP_CIDR" || { echo "[alias-ip] ❌ failed to ensure $IP_CIDR on $IFACE"; exit 2; }
-echo "[alias-ip] ✅ $IP_CIDR on $IFACE"
-EOF
+# Validate CIDR
+if [ -z "${IP_CIDR:-}" ] || ! echo "${IP_CIDR}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]{1,2}$'; then
+  echo "[alias-ip] ❌ invalid or empty IP/CIDR: '${IP_CIDR}'"; exit 2
+fi
+# Already present anywhere?
+if ip -4 addr show | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}"; then
+  echo "[alias-ip] ✅ already present"
+  exit 0
+fi
+# Candidates: default route first, then physical NICs
+DEFIF=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')
+mapfile -t CANDS < <(
+  { [ -n "${DEFIF:-}" ] && echo "${DEFIF}";
+    ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
+      | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
+      | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
+      | sort -u; } | awk 'NF' | awk '!seen[$0]++'
+)
+for IF in "${CANDS[@]}"; do
+  [ -n "$IF" ] || continue
+  ip link set dev "$IF" up || true
+  if ip addr add "${IP_CIDR}" dev "${IF}" 2>"/tmp/ip_err_${IF}.log"; then
+    ip -4 addr show dev "${IF}" | awk '/inet /{print $2}' | grep -qx "${IP_CIDR}" && { echo "[alias-ip] ✅ ${IP_CIDR} on ${IF}"; exit 0; }
+  fi
+done
+echo "[alias-ip] ❌ could not ensure ${IP_CIDR} on any iface"
+ip -4 addr show || true; ip route || true
+exit 2
+REMOTE
 }
 
 start_installer_bg(){
@@ -253,14 +284,14 @@ while IFS= read -r entry; do
   echo ""
   echo "🔧 Server: $ip"
 
+  # Ensure alias (add only if missing) if configured
+  ensure_alias_ip_remote "$ip" || { any_failed=1; continue; }
+
   if [[ -z "$pth" || "$pth" == "$ip" ]]; then
-    echo "❌ No OLD_BUILD_PATH specified for $ip in $SERVER_FILE. Skipping."
+    echo "❌ No OLD_BUILD_PATH specified for $ip in $SERVER_FILE (UI param ignored by design). Skipping."
     any_failed=1
     continue
   fi
-
-  # Ensure alias IP first (idempotent)
-  ensure_alias_ip_remote "$ip" || { any_failed=1; continue; }
 
   server_path="$(normalize_k8s_path "$pth" "$OLD_VERSION")"
   echo "📁 Using (normalized): $server_path"
