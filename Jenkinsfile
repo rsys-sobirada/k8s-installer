@@ -312,7 +312,8 @@ done
 if [ $ok -ne 0 ]; then
   echo "[alias-ip] ❌ Failed to add ${IP_CIDR}. Kernel says: $(tr -d '\\n' </tmp/ip_alias_err.log 2>/dev/null || true)"
   exit 2
-fiREMOTE
+fi
+REMOTE
 done
 
 [ $fail -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
