@@ -1,1 +1,1 @@
-server1:172.27.28.193
+server1:172.27.28.193:/home/labadmin/6.3.0/EA2
