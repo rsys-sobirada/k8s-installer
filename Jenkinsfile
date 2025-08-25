@@ -1,21 +1,4 @@
 // ================== Parameters (Active Choices, ordered as requested) ==================
-
-ensure_alias_ip() {
-  local host="$1"
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
-    set -euo pipefail
-    IP_CIDR="'"${INSTALL_IP_ADDR}"'"
-    IFACE="$(ip route | awk "/^default/{print \$5; exit}")"
-    ip link set "$IFACE" up || true
-    if ! ip -4 addr show dev "$IFACE" | awk "/inet /{print \$2}" | grep -qx "$IP_CIDR"; then
-      ip addr replace "$IP_CIDR" dev "$IFACE"
-    fi
-    ip -4 addr show dev "$IFACE" | awk "/inet /{print \$2}" | grep -qx "$IP_CIDR" || { echo "[alias-ip] ❌ failed to ensure $IP_CIDR on $IFACE"; exit 2; }
-    echo "[alias-ip] ✅ $IP_CIDR on $IFACE"
-  '
-}
-
-
 properties([
   parameters([
     // 1) Deployment type
@@ -25,32 +8,28 @@ properties([
       description: 'Deployment type'
     ),
 
-    // 2) Install mode (controls OLD_BUILD_PATH visibility)
+    // 2) Install mode
     choice(
       name: 'INSTALL_MODE',
       choices: 'Upgrade_with_cluster_reset\nUpgrade_without_cluster_reset\nFresh_installation',
       description: 'Select installation mode'
     ),
 
-    // 3) OLD_BUILD_PATH shown only for Upgrade_* modes
+    // 3) OLD_BUILD_PATH (kept for UI but no longer used by reset script)
     [
       $class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
-      description: 'Base dir of OLD_VERSION (shown only for Upgrade modes)',
+      description: 'Base dir of OLD_VERSION (not used by reset; paths now come from server_pci_map.txt)',
       referencedParameters: 'INSTALL_MODE',
       choiceType: 'ET_FORMATTED_HTML',
       omitValueField: true,
       script: [
         $class: 'GroovyScript',
-        script: [
-          script: '''
+        script: [ script: '''
 def mode = (INSTALL_MODE ?: "").toString()
 if (mode == 'Fresh_installation') return ""
 return """<input class='setting-input' name='value' type='text' value='/home/labadmin'/>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
+''', sandbox: true, classpath: [] ],
         fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
       ]
     ],
@@ -65,7 +44,7 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
            choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2\n6.3.0_EA3',
            description: 'Target bundle (may have suffix, e.g., 6.3.0_EA2)'),
 
-    // 6) Old version
+    // 6) Old version (used by reset script)
     choice(name: 'OLD_VERSION',
            choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2\n6.3.0_EA3',
            description: 'Existing bundle (used if upgrading)'),
@@ -85,8 +64,7 @@ return """<input class='setting-input' name='value' type='text' value='/home/lab
       omitValueField: true,
       script: [
         $class: 'GroovyScript',
-        script: [
-          script: '''
+        script: [ script: '''
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
@@ -94,10 +72,7 @@ return """<select class='setting-input' name='value'>
            <option value="172.26.2.96">172.26.2.96</option>
            <option value="172.26.2.95">172.26.2.95</option>
          </select>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
+''', sandbox: true, classpath: [] ],
         fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
       ]
     ],
@@ -112,8 +87,7 @@ return """<select class='setting-input' name='value'>
       omitValueField: true,
       script: [
         $class: 'GroovyScript',
-        script: [
-          script: '''
+        script: [ script: '''
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
@@ -121,10 +95,7 @@ return """<select class='setting-input' name='value'>
            <option value="sobirada">sobirada</option>
            <option value="labadmin">labadmin</option>
          </select>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
+''', sandbox: true, classpath: [] ],
         fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
       ]
     ],
@@ -139,8 +110,7 @@ return """<select class='setting-input' name='value'>
       omitValueField: true,
       script: [
         $class: 'GroovyScript',
-        script: [
-          script: '''
+        script: [ script: '''
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
@@ -150,15 +120,12 @@ return """<select class='setting-input' name='value'>
            <option value="/CNBuild/6.3.0">/CNBuild/6.3.0</option>
            <option value="/CNBuild/6.3.0_EA1">/CNBuild/6.3.0_EA1</option>
          </select>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
+''', sandbox: true, classpath: [] ],
         fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
       ]
     ],
 
-    // 11) Password (Active Choices; conditional; visually masked)
+    // 11) Password (Active Choices; conditional; masked input)
     [
       $class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_PASS',
@@ -168,16 +135,12 @@ return """<select class='setting-input' name='value'>
       omitValueField: true,
       script: [
         $class: 'GroovyScript',
-        script: [
-          script: '''
+        script: [ script: '''
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
 return """<input type='password' class='setting-input' name='value' value=''/>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
+''', sandbox: true, classpath: [] ],
         fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
       ]
     ],
@@ -205,7 +168,8 @@ pipeline {
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'   // root key used to reach CN
     K8S_VER     = '1.31.4'
     EXTRACT_BUILD_TARBALLS = 'false'
-    INSTALL_IP_ADDR  = '10.10.10.20/24'                 // default; param overrides
+    // param wins:
+    INSTALL_IP_ADDR  = "${params.INSTALL_IP_ADDR}"
   }
 
   stages {
@@ -215,17 +179,17 @@ pipeline {
 
     stage('Show inputs') {
       steps {
-        echo "INSTALL_MODE='${params.INSTALL_MODE}'  FETCH_BUILD='${params.FETCH_BUILD}'  NEW_VERSION='${params.NEW_VERSION}'  OLD_VERSION='${params.OLD_VERSION}'"
+        echo "INSTALL_MODE='${params.INSTALL_MODE}'  FETCH_BUILD='${params.FETCH_BUILD}'  NEW_VERSION='${params.NEW_VERSION}'  OLD_VERSION='${params.OLD_VERSION}'  INSTALL_IP_ADDR='${params.INSTALL_IP_ADDR}'"
       }
     }
 
-    // ✅ Single source of truth for SSH readiness; also pushes key via CN_BOOTSTRAP_PASS if needed
+    // ✅ Single source of truth for SSH readiness; pushes key via CN_BOOTSTRAP_PASS if needed; enforces alias IP
     stage('Preflight SSH to CNs') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
-: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"
+: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
 
 PUB_KEY_FILE="${SSH_KEY}.pub"
 if [ ! -s "${PUB_KEY_FILE}" ]; then
@@ -247,116 +211,55 @@ push_key_if_needed() {
   if [ -n "${CN_BOOTSTRAP_PASS:-}" ]; then
     if ! command -v sshpass >/dev/null 2>&1; then
       echo "[preflight] ERROR: sshpass required but not installed on the Jenkins agent."
-      exit 2
+      return 2
     fi
     echo "[preflight] ${host}: ⛏️ pushing Jenkins key via password…"
     sshpass -p "${CN_BOOTSTRAP_PASS}" \
       ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
       "root@${host}" 'install -m700 -d /root/.ssh; touch /root/.ssh/authorized_keys; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys'
-    sshpass -p "${CN_BOOTSTRAP_PASS}" \
-      scp -o StrictHostKeyChecking=no "${PUB_KEY_FILE}" "root@${host}:/root/.jenkins_key.pub.tmp"
+    sshpass -p "${CN_BOOTSTRAP_PASS}" scp -o StrictHostKeyChecking=no "${PUB_KEY_FILE}" "root@${host}:/root/.jenkins_key.pub.tmp"
     sshpass -p "${CN_BOOTSTRAP_PASS}" \
       ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
       "root@${host}" 'grep -Fxf /root/.jenkins_key.pub.tmp /root/.ssh/authorized_keys >/dev/null || cat /root/.jenkins_key.pub.tmp >> /root/.ssh/authorized_keys; rm -f /root/.jenkins_key.pub.tmp'
     ssh-keygen -R "${host}" >/dev/null 2>&1 || true
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" 'echo "[preflight] ✅ key login OK on $(hostname)"'
+    return 0
   else
     echo "[preflight] ${host}: ❌ key login failed and CN_BOOTSTRAP_PASS not provided"
     return 1
   fi
 }
 
-fail=0
-for h in ${HOSTS}; do
-  echo "[preflight] Testing ${h}…"
-  push_key_if_needed "${h}" || fail=1
-done
-
-echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
-fail=0
-for h in ${HOSTS}; do
-  ensure_alias_ip "$h" || fail=1
-done
-[ $fail -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
-
-
-if [ $fail -ne 0 ]; then
-  echo "[preflight] ❌ One or more hosts failed SSH preflight."
-  exit 1
-fi
-
-echo "[preflight] ✅ All CNs accept Jenkins key. Proceeding."
-'''
-        }
-      }
-    }
-
-    stage('Validate inputs') {
-      steps {
-        script {
-          if ((params.INSTALL_MODE ?: '').toString().trim() != 'Fresh_installation' &&
-              !((params.OLD_BUILD_PATH_UI ?: '').toString().trim())) {
-            error "OLD_BUILD_PATH is required for ${params.INSTALL_MODE}"
-          }
-        }
-      }
-    }
-
-    // -------- Pre-bootstrap: Fresh_installation only --------
-    stage('Pre-bootstrap keys (Fresh only)') {
-      when { expression { (params.INSTALL_MODE ?: '').toString().trim() == 'Fresh_installation' } }
-      steps {
-        timeout(time: 10, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
-set -euo pipefail
-
-: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
-ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
-
-HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
-echo "[bootstrap][runner] Hosts: ${HOSTS}"
-echo "[bootstrap][runner] Alias IP: ${ALIAS_IP}  (from ${INSTALL_IP_ADDR})"
-
-bootstrap_one() {
+ensure_alias_ip() {
   local host="$1"
-  echo ""
-  echo "─── Host ${host} ───────────────────────────────────────"
-
-  SCRIPT_CONTENT='#!/usr/bin/env bash
-set -euo pipefail
-IP="$1"
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa
-ssh-copy-id root@"${IP}"
-cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
-ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}"
-systemctl restart sshd
-'
-
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
     set -euo pipefail
-    cat > /root/bootstrap_keys.sh <<'"'"'EOF'"'"'
-'"${SCRIPT_CONTENT}"'
-EOF
-    chmod +x /root/bootstrap_keys.sh
-    [[ -s /root/bootstrap_keys.sh ]] && echo "✅ Script integrity OK on ${HOSTNAME}" || { echo "❌ Script not present"; exit 2; }
-    /root/bootstrap_keys.sh "'"${ALIAS_IP}"'"
+    IP_CIDR="'"${INSTALL_IP_ADDR}"'"
+    IFACE="$(ip route | awk "/^default/{print \\$5; exit}")"
+    ip link set "$IFACE" up || true
+    ip addr replace "$IP_CIDR" dev "$IFACE"
+    ip -4 addr show dev "$IFACE" | awk "/inet /{print \\$2}" | grep -qx "$IP_CIDR"
+    echo "[alias-ip] ✅ $IP_CIDR on $IFACE"
   '
 }
 
+# 1) Key preflight
+fail_keys=0
 for h in ${HOSTS}; do
-  # ensure alias exists first so the ssh-copy-id step can reach it
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
-    set -euo pipefail
-    ip -4 addr show | awk "/inet /{print \\$2}" | grep -qx "'"${INSTALL_IP_ADDR}"'" || {
-      DEFIF=$(ip route | awk "/^default/{print \\$5; exit}")
-      ip link set dev "${DEFIF}" up || true
-      ip addr replace "'"${INSTALL_IP_ADDR}"'" dev "${DEFIF}"
-    }
-    ip -4 addr show | grep -q "'"${INSTALL_IP_ADDR}"'" && echo "[IP] Present: ${INSTALL_IP_ADDR}" || { echo "[IP] Failed to plumb ${INSTALL_IP_ADDR}"; exit 2; }
-  '
-  bootstrap_one "$h"
+  echo "[preflight] Testing ${h}…"
+  push_key_if_needed "${h}" || fail_keys=1
 done
+[ $fail_keys -eq 0 ] || { echo "[preflight] ❌ One or more hosts failed SSH preflight."; exit 1; }
+
+# 2) Alias IP enforcement
+echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
+fail_alias=0
+for h in ${HOSTS}; do
+  ensure_alias_ip "$h" || fail_alias=1
+done
+[ $fail_alias -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
+
+echo "[preflight] ✅ All CNs ready."
 '''
         }
       }
@@ -377,12 +280,12 @@ chmod +x scripts/cluster_reset.sh
 env \
   CLUSTER_RESET=true \
   OLD_VERSION="${OLD_VERSION}" \
-  OLD_BUILD_PATH="${OLD_BUILD_PATH_UI}" \
   K8S_VER="${K8S_VER}" \
   KSPRAY_DIR="kubespray-2.27.0" \
   RESET_YML_WS="$WORKSPACE/reset.yml" \
   SSH_KEY="${SSH_KEY}" \
   SERVER_FILE="${SERVER_FILE}" \
+  INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
   REQ_WAIT_SECS="360" \
   RETRY_COUNT="3" \
   RETRY_DELAY_SECS="10" \
@@ -438,12 +341,29 @@ bash -euo pipefail scripts/fetch_build.sh
         timeout(time: 20, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
+: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
 
 if [ "${INSTALL_MODE:-}" = "Upgrade_with_cluster_reset" ] && [ ! -f "$WORKSPACE/.cluster_reset_done" ]; then
   echo "[gate] INSTALL_MODE=Upgrade_with_cluster_reset but reset marker not found: $WORKSPACE/.cluster_reset_done"
   echo "[gate] This usually means the reset stage didn't run or failed."
   exit 2
 fi
+
+# Re-assert alias IP on all CNs before install
+HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
+ensure_alias_ip() {
+  local host="$1"
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" bash -lc '
+    set -euo pipefail
+    IP_CIDR="'"${INSTALL_IP_ADDR}"'"
+    IFACE="$(ip route | awk "/^default/{print \\$5; exit}")"
+    ip link set "$IFACE" up || true
+    ip addr replace "$IP_CIDR" dev "$IFACE"
+    ip -4 addr show dev "$IFACE" | awk "/inet /{print \\$2}" | grep -qx "$IP_CIDR"
+    echo "[alias-ip] ✅ $IP_CIDR on $IFACE"
+  '
+}
+for h in ${HOSTS}; do ensure_alias_ip "$h"; done
 
 echo ">>> Cluster install starting (mode: ${INSTALL_MODE})"
 sed -i 's/\r$//' scripts/cluster_install.sh || true
@@ -474,7 +394,6 @@ set -e
 if grep -q "Permission denied (publickey,password)" /tmp/cluster_install.out; then
   echo "[auto-recovery] SSH permission denied detected → re-running bootstrap on each host and retrying install once."
   ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
-  HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
   for h in ${HOSTS}; do
     ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
       set -euo pipefail
@@ -506,18 +425,30 @@ exit $RC
       }
     }
 
-    // ---------- Health check after cluster install ----------
+    // ---------- Cluster health check ----------
     stage('Cluster health check') {
       steps {
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
+: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
+
 HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
 if [[ -z "${HOST}" ]]; then
   echo "[cluster-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
   exit 2
 fi
 echo "[cluster-health] Using host ${HOST} for kubectl checks"
+
+# Re-assert alias on the primary host (safe & quick)
+ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
+  set -euo pipefail
+  IP_CIDR="'"${INSTALL_IP_ADDR}"'"
+  IFACE="$(ip route | awk "/^default/{print \\$5; exit}")"
+  ip link set "$IFACE" up || true
+  ip addr replace "$IP_CIDR" dev "$IFACE"
+  ip -4 addr show dev "$IFACE" | awk "/inet /{print \\$2}" | grep -qx "$IP_CIDR"
+'
 
 ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
   set -euo pipefail
@@ -581,12 +512,24 @@ bash -euo pipefail scripts/ps_config.sh
         timeout(time: 10, unit: 'MINUTES', activity: true) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
+: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
+
 HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
 if [[ -z "${HOST}" ]]; then
   echo "[ps-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
   exit 2
 fi
 echo "[ps-health] Using host ${HOST} for kubectl checks"
+
+# Re-assert alias on the primary host (safe & quick)
+ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
+  set -euo pipefail
+  IP_CIDR="'"${INSTALL_IP_ADDR}"'"
+  IFACE="$(ip route | awk "/^default/{print \\$5; exit}")"
+  ip link set "$IFACE" up || true
+  ip addr replace "$IP_CIDR" dev "$IFACE"
+  ip -4 addr show dev "$IFACE" | awk "/inet /{print \\$2}" | grep -qx "$IP_CIDR"
+'
 
 ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
   set -euo pipefail
