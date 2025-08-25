@@ -56,3 +56,4 @@ if [ $ok -ne 0 ]; then
   echo "[alias-ip] ❌ Failed to add $IP_CIDR. Kernel says: ${ERR:-unknown error}"
   exit 2
 fi
+exit 0
