@@ -113,33 +113,29 @@ return """<select class='setting-input' name='value'>
     ],
 
     // 10) Base path (visible only if FETCH_BUILD truthy)
-    [
-      $class: 'DynamicReferenceParameter',
-      name: 'BUILD_SRC_BASE',
-      description: 'Path on build host containing the tar.gz files',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
+[
+  $class: 'DynamicReferenceParameter',
+  name: 'BUILD_SRC_BASE',
+  description: 'Path on build host containing the tar.gz files',
+  referencedParameters: 'FETCH_BUILD',
+  choiceType: 'ET_FORMATTED_HTML',
+  omitValueField: true,
+  script: [
+    $class: 'GroovyScript',
+    script: [
+      script: '''
 def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
 def enabled = ['true','on','1','yes','y'].contains(fb)
 if (!enabled) return ""
-return """<select class='setting-input' name='value'>
-           <option value="/CNBuild/6.3.0_EA2">/CNBuild/6.3.0_EA2</option>
-           <option value="/CNBuild/6.3.0_EA3/x86>/CNBuild/6.3.0_EA3/x86</option>
-           <option value="/CNBuild/6.3.0">/CNBuild/6.3.0</option>
-           <option value="/CNBuild/6.3.0_EA1">/CNBuild/6.3.0_EA1</option>
-         </select>"""
+return """<input class='setting-input' name='value' type='text' value='/CNBuild/6.3.0_EA2'/>"""
 ''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
+      sandbox: true,
+      classpath: []
     ],
+    fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
+  ]
+],
+
 
     // 11) Password (Active Choices; conditional; visually masked)
     [
