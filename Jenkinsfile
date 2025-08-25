@@ -256,118 +256,24 @@ for h in ${HOSTS}; do
 done
 
 echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
+fail=0
 for h in ${HOSTS}; do
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" sh -s -- "${INSTALL_IP_ADDR}" <<'REMOTE' || fail=1
-set -eu
-# safer: avoid -o pipefail (not POSIX), emulate careful checks
-export PATH="/sbin:/usr/sbin:/bin:/usr/bin:$PATH"
-
-IP_CIDR="$1"
-IP_ONLY="${IP_CIDR%%/*}"
-
-# Check required tools
-if ! command -v ip >/dev/null 2>&1; then
-  echo "[alias-ip] ❌ ip(8) not found in PATH: $PATH"
-  exit 2
-fi
-
-# --- Robust CIDR validation (POSIX sh) ---
-# Split into IP and MASK; verify mask is integer 0..32; verify IP has 4 octets 0..255
-case "$IP_CIDR" in
-  */*) : ;;
-  *) echo "[alias-ip] ❌ invalid CIDR (missing mask): '$IP_CIDR'"; exit 2 ;;
-esac
-IP_ONLY="${IP_CIDR%/*}"
-MASK="${IP_CIDR#*/}"
-
-# MASK must be integer 0..32
-case "$MASK" in
-  ''|*[!0-9]*) echo "[alias-ip] ❌ invalid mask: '$MASK'"; exit 2 ;;
-esac
-if [ "$MASK" -lt 0 ] || [ "$MASK" -gt 32 ]; then
-  echo "[alias-ip] ❌ mask out of range (0..32): '$MASK'"; exit 2
-fi
-
-# IP must be 4 dot octets 0..255
-oct_ok=1
-set -- $(printf "%s" "$IP_ONLY" | awk -F. 'NF==4{print $1,$2,$3,$4}')
-if [ $# -ne 4 ]; then oct_ok=0; fi
-for o in "$1" "$2" "$3" "$4"; do
-  case "$o" in ''|*[!0-9]*) oct_ok=0 ;; esac
-  if [ "$oct_ok" -eq 1 ]; then
-    if [ "$o" -lt 0 ] || [ "$o" -gt 255 ]; then oct_ok=0; fi
+  echo "[alias-ip][${h}] ▶ start"
+  tmplog="$(mktemp)"
+  # Push and run the repo script on the remote via stdin (no heredoc in Jenkinsfile)
+  if ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -s -- "${INSTALL_IP_ADDR}" 2>&1 < scripts/alias_ip.sh | tee "${tmplog}"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  sed -e "s/^/[alias-ip][${h}] /" -n 'p' "${tmplog}"
+  rm -f "${tmplog}"
+  echo "[alias-ip][${h}] ◀ exit code=${rc}"
+  if [ "${rc}" -ne 0 ]; then
+    fail=1
   fi
 done
-if [ "$oct_ok" -ne 1 ]; then
-  echo "[alias-ip] ❌ invalid IPv4 address: '$IP_ONLY'"; exit 2
-fi
-# --- End validation ---
-
-
-echo "$IP_CIDR" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]{1,2}$' || {
-  echo "[alias-ip] ❌ invalid or empty IP/CIDR: '$IP_CIDR'"
-  exit 2
-}
-
-# If the IP is already present anywhere, skip
-if ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY"; then
-  echo "[alias-ip] ✅ Already present: $IP_ONLY"
-  exit 0
-fi
-
-# Build candidate list: default route iface first
-CANDIDATES=""
-DEFIF="$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')"
-if [ -n "${DEFIF:-}" ]; then
-  CANDIDATES="$DEFIF"
-fi
-
-# Append other physical-looking NICs, excluding virtual/container links and DEFIF duplicate
-PHYS_NICS="$(ip -o link 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' \
-  | grep -E '^(en|eth|ens|eno|em|bond|br)' \
-  | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)')"
-
-for nic in $PHYS_NICS; do
-  if [ -n "${DEFIF:-}" ] && [ "$nic" = "$DEFIF" ]; then
-    continue
-  fi
-  CANDIDATES="$CANDIDATES $nic"
-done
-
-# No candidates?
-if [ -z "$(echo $CANDIDATES)" ]; then
-  echo "[alias-ip] ❌ no suitable interface found"
-  exit 2
-fi
-
-# Try each candidate until success
-ok=1
-for IFACE in $CANDIDATES; do
-  # confirm iface exists
-  if ! ip link show "$IFACE" >/dev/null 2>&1; then
-    continue
-  fi
-  ip link set dev "$IFACE" up >/dev/null 2>&1 || true
-  echo "[alias-ip] …trying $IP_CIDR on $IFACE"
-  if ip addr replace "$IP_CIDR" dev "$IFACE" 2>/tmp/ip_alias_err.log; then
-    # verify on that iface
-    sleep 1
-    if ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY"; then
-      echo "[alias-ip] ✅ $IP_CIDR present on $IFACE"
-      ok=0
-      break
-    fi
-  fi
-done
-
-if [ $ok -ne 0 ]; then
-  ERR="$(tr -d '\n' </tmp/ip_alias_err.log 2>/dev/null || true)"
-  echo "[alias-ip] ❌ Failed to add $IP_CIDR. Kernel says: ${ERR:-unknown error}"
-  exit 2
-fi
-
-REMOTE
-done
+[ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
 
 [ $fail -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
 
