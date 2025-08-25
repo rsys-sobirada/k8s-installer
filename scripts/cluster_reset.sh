@@ -25,7 +25,7 @@ INSTALL_NAME="${INSTALL_NAME:-install_k8s.sh}"
 UNINSTALL_NAME="${UNINSTALL_NAME:-uninstall_k8s.sh}"
 REL_SUFFIX="${REL_SUFFIX:-}"                       # optional suffix in TRILLIUM dir name
 
-# 🔹 NEW (optional inputs for alias IP ensure)
+# Optional inputs for alias IP ensure (same semantics as install)
 : "${INSTALL_IP_ADDR:=}"                           # e.g. 10.10.10.20/24 ; if empty, skipped
 : "${INSTALL_IP_IFACE:=}"                          # optional explicit iface
 
@@ -48,32 +48,52 @@ log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
 ver_num(){ echo "${1%%_*}"; }   # 6.3.0_EA1 -> 6.3.0
 ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }
 
-# Smart normalizer: accepts base, versioned, TRILLIUM root, full k8s root, or kubespray dir
-normalize_k8s_path(){
-  local base="${1%/}" ver="$2" num tag
-  num="$(ver_num "$ver")"; tag="$(ver_tag "$ver")"
+# Version-safe path normalizer (prevents double-versioning)
+normalize_k8s_path() {
+  local base="${1%/}" old_ver="$2"
 
+  # 1) Already a full k8s root → return as-is
   if [[ "$base" =~ /common/tools/install/k8s-v[^/]+$ ]]; then
-    echo "$base"; return
-  fi
-  if [[ "$base" =~ /TRILLIUM_5GCN_CNF_REL_${num}[^/]*/common/tools/install$ ]]; then
-    echo "$base/k8s-v${K8S_VER}"; return
-  fi
-  if [[ "$base" =~ /common/tools/install/k8s-v[^/]+/kubespray(-[^/]+)?$ ]]; then
-    echo "${base%/kubespray*}"; return
-  fi
-  if [[ "$base" =~ /${num}(/${tag})?$ ]]; then
-    echo "$base/TRILLIUM_5GCN_CNF_REL_${num}${REL_SUFFIX}/common/tools/install/k8s-v${K8S_VER}"
+    echo "$base"
     return
   fi
-  local p="$base/${num}"
-  [[ -n "$tag" ]] && p="$p/${tag}"
-  echo "$p/TRILLIUM_5GCN_CNF_REL_${num}${REL_SUFFIX}/common/tools/install/k8s-v${K8S_VER}"
+
+  # 2) Already at TRILLIUM install dir → just add k8s-v
+  if [[ "$base" =~ /TRILLIUM_5GCN_CNF_REL_[0-9]+\.[0-9]+\.[0-9]+[^/]*/common/tools/install$ ]]; then
+    echo "$base/k8s-v${K8S_VER}"
+    return
+  fi
+
+  # 3) If base ends with ".../<num>[/EAx]" (e.g., /home/labadmin/6.3.0[/EA2]), prefer THAT version/tag from the path
+  if [[ "$base" =~ /([0-9]+\.[0-9]+\.[0-9]+)(/(EA[0-9]+))?$ ]]; then
+    # Extract number and optional EA tag as they appear in the path
+    local num_in_path tag_in_path
+    num_in_path="$(printf '%s\n' "$base" | sed -n 's#.*/\([0-9]\+\.[0-9]\+\.[0-9]\+\)\(/\(EA[0-9]\+\)\)\?$#\1#p')"
+    tag_in_path="$(printf '%s\n' "$base" | sed -n 's#.*/[0-9]\+\.[0-9]\+\.[0-9]\+\(/\(EA[0-9]\+\)\)\?$#\2#p' | sed 's#^/##')"
+    local rel="TRILLIUM_5GCN_CNF_REL_${num_in_path}"
+    [[ -n "$tag_in_path" ]] && rel="${rel}_${tag_in_path}"
+    echo "$base/${rel}/common/tools/install/k8s-v${K8S_VER}"
+    return
+  fi
+
+  # 4) If base ends right at ".../common/tools/install" without k8s-v
+  if [[ "$base" =~ /common/tools/install$ ]]; then
+    echo "$base/k8s-v${K8S_VER}"
+    return
+  fi
+
+  # 5) Fallback: use OLD_VERSION to build under base
+  local num tag rel
+  num="$(ver_num "$old_ver")"
+  tag="$(ver_tag "$old_ver")"
+  rel="TRILLIUM_5GCN_CNF_REL_${num}"
+  [[ -n "$tag" ]] && rel="${rel}_${tag}"
+  echo "$base/${num}${tag:+/${tag}}/${rel}/common/tools/install/k8s-v${K8S_VER}"
 }
 
 SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
 
-# 🔹 NEW: robust alias-IP ensure snippet (same semantics as install)
+# Robust alias-IP ensure snippet (present → no-op; missing → add)
 read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
 set -euo pipefail
 IP_CIDR="$1"; FORCE_IFACE="${2-}"
@@ -275,7 +295,7 @@ while IFS= read -r entry; do
   echo ""
   echo "🔧 Server: $ip"
 
-  # 🔹 NEW: ensure alias IP (only if configured)
+  # Ensure alias IP (only if configured)
   if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
     ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET" || true
   else
