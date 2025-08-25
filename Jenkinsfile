@@ -523,25 +523,29 @@ on_abort_cleanup() {
   done
 }
 trap on_abort_cleanup EXIT HUP INT TERM
-
 health_ok() {
   local ip="$1"
-  # Nodes Ready?
+
+  # Nodes reachable?
   if ! ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" kubectl get nodes >/dev/null 2>&1; then
     return 1
   fi
-  # Pods healthy? (no CrashLoopBackOff/BackOff/Error and READY m==n)
-  local script='
+
+  # Pods healthy? READY m==n and no CrashLoopBackOff/ImagePullBackOff/BackOff/Error/Init:
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s <<'REMOTE'
 set -euo pipefail
-kubectl get pods -A --no-headers 2>/dev/null | awk "
-  {
-    split(\$2,a,\"/\");
-    ready=(a[1]==a[2]);
-    bad = (\$3 ~ /(CrashLoopBackOff|ImagePullBackOff|BackOff|Error|Init:)/);
-    if (!ready || bad) exit 1
-  }
-  END{ exit 0 }
-"
+kubectl get pods -A --no-headers 2>/dev/null | awk '
+{
+  # Columns: 1=NAMESPACE 2=NAME 3=READY 4=STATUS 5=RESTARTS 6=AGE
+  split($3,a,"/");               # <-- use READY column
+  ready=(a[1]==a[2]);
+  bad = ($4 ~ /(CrashLoopBackOff|ImagePullBackOff|BackOff|Error|Init:)/);  # <-- use STATUS column
+  if (!ready || bad) exit 1
+}
+END { exit 0 }'
+REMOTE
+}
+
 '
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -lc "$script"
 }
