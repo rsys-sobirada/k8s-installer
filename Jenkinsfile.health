@@ -1,4 +1,4 @@
-// Jenkinsfile.health — Health check ➜ PS install
+// Jenkinsfile.health — Health check ➜ PS install (robust param passing)
 
 pipeline {
   agent any
@@ -11,7 +11,6 @@ pipeline {
     PS_SCRIPT   = 'scripts/ps_config.sh'
   }
 
-  // Build-time inputs (defaults set; change in "Build with Parameters")
   parameters {
     // Health check knobs
     string(name: 'HEALTH_RETRY_WAIT_SECS', defaultValue: '300', description: 'Wait between retries (secs)')
@@ -62,9 +61,24 @@ bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.log
         script {
           def psTimeout = params.PS_STAGE_TIMEOUT_MIN as Integer
           timeout(time: psTimeout, unit: 'MINUTES') {
-            sh '''#!/usr/bin/env bash
+            // Explicitly inject parameters into the shell environment
+            withEnv([
+              "NEW_BUILD_PATH=${params.NEW_BUILD_PATH}",
+              "NEW_VERSION=${params.NEW_VERSION}",
+              "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}",
+              "DEPLOYMENT_TYPE=${params.DEPLOYMENT_TYPE}",
+              "HOST_USER=${params.HOST_USER}"
+            ]) {
+              sh '''#!/usr/bin/env bash
 set -euo pipefail
 : "${PS_SCRIPT:=scripts/ps_config.sh}"
+
+# ---- Safe defaults (first run / Replay resilience) ----
+: "${NEW_BUILD_PATH:=/home/labadmin/6.3.0/EA3}"
+: "${NEW_VERSION:=6.3.0_EA3}"
+: "${INSTALL_IP_ADDR:=10.10.10.20/24}"
+: "${DEPLOYMENT_TYPE:=Low}"
+: "${HOST_USER:=root}"
 
 # Show what we will pass
 echo "[pipeline] NEW_BUILD_PATH=${NEW_BUILD_PATH}"
@@ -88,6 +102,7 @@ env \
   HOST_USER="${HOST_USER}" \
 bash -euo pipefail "${PS_SCRIPT}" |& tee ps_config.log
 '''
+            }
           }
         }
       }
