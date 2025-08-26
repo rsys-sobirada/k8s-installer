@@ -4,7 +4,7 @@ set -euo pipefail
 # --- required env (exported by Jenkins stage) ---
 : "${SERVER_FILE:?missing}"          # path to server list
 : "${SSH_KEY:?missing}"              # private key on Jenkins node
-: "${NEW_VERSION:?missing}"          # e.g. 6.3.0_EA3 (we will use only 6.3.0)
+: "${NEW_VERSION:?missing}"          # e.g. 6.3.0_EA3 (we use only 6.3.0)
 : "${NEW_BUILD_PATH:?missing}"       # e.g. /home/labadmin/6.3.0/EA3
 : "${DEPLOYMENT_TYPE:?missing}"      # Low|Medium|High
 HOST_USER="${HOST_USER:-root}"
@@ -42,10 +42,10 @@ ps_update_and_install_on_host() {
 set -euo pipefail
 NEW_VERSION="$1"
 BASE="$2"
-TARGET_IP="$3"     # <-- use the server IP, not INSTALL_IP_ADDR
+TARGET_IP="$3"     # <-- use the server IP from SERVER_FILE
 CAP="$4"
 
-# Build PS_ROOT from BASE + version-only (strip tag)
+# --- Build PS_ROOT from BASE + version-only (strip tag after '_') ---
 VER="${NEW_VERSION%%_*}"             # 6.3.0_EA3 -> 6.3.0 ; 6.3.0 -> 6.3.0
 BASE="${BASE%/}"
 PS_ROOT="${BASE}/TRILLIUM_5GCN_CNF_REL_${VER}/platform-services/scripts"
@@ -59,6 +59,17 @@ if [[ ! -d "${PS_ROOT}" ]]; then
   echo "[remote] ERROR: PS_ROOT not found: ${PS_ROOT}" >&2
   exit 2
 fi
+
+# Helpers
+has_image_pull_backoff() {
+  # Return 0 if any pod is in ImagePullBackOff
+  kubectl get pods -A --no-headers 2>/dev/null | grep -q "ImagePullBackOff"
+}
+
+show_backoff_pods() {
+  echo "[remote] Pods in ImagePullBackOff:"
+  kubectl get pods -A --no-headers | awk '$4 ~ /ImagePullBackOff/ {printf "%-20s %-50s %-7s %-20s\n",$1,$2,$3,$4}'
+}
 
 # find the yaml (support two common names)
 YAML=""
@@ -115,7 +126,7 @@ awk -v ip="${TARGET_IP}" '
 echo "[remote] Diff:"
 diff -u "${YAML}.bak" "${YAML}" || true
 
-# run the installer
+# ---- Run installer ----
 cd "${PS_ROOT}"
 if [[ -x ./install_ps.sh ]]; then
   echo "[remote] Running ./install_ps.sh"
@@ -125,7 +136,38 @@ else
   exit 3
 fi
 
-echo "[remote] PS install complete."
+# ---- Post-install ImagePullBackOff handling ----
+echo "[remote] Waiting 60s before health check…"
+sleep 60
+if has_image_pull_backoff; then
+  echo "[remote] Detected ImagePullBackOff after install. Showing pods:"
+  show_backoff_pods
+  echo "[remote] Waiting 10 minutes to allow images to pull…"
+  sleep 600
+
+  if has_image_pull_backoff; then
+    echo "[remote] Still ImagePullBackOff after additional 10 minutes — attempting uninstall/reinstall"
+    [[ -x ./uninstall_ps.sh ]] || { echo "[remote] ERROR: uninstall_ps.sh missing or not executable"; exit 4; }
+    ./uninstall_ps.sh
+
+    echo "[remote] Re-running install_ps.sh"
+    ./install_ps.sh
+
+    echo "[remote] Waiting 60s before re-check…"
+    sleep 60
+    if has_image_pull_backoff; then
+      echo "[remote] Backoff persists after reinstall; waiting 10 minutes one more time…"
+      sleep 600
+      if has_image_pull_backoff; then
+        echo "[remote] ❌ ImagePullBackOff still present after reinstall + wait. Aborting."
+        show_backoff_pods
+        exit 5
+      fi
+    fi
+  fi
+fi
+
+echo "[remote] ✅ No ImagePullBackOff detected (final)."
 EOSSH
 
   echo "[ps_config][$host] done"
