@@ -62,7 +62,7 @@ fi
 echo "[remote:cs] YAML=${YAML}"
 cp -a "${YAML}" "${YAML}.bak"
 
-# If DEPLOYMENT_TYPE is LOW, set capacitySetup: "LOW" (MEDIUM stays unchanged)
+# If DEPLOYMENT_TYPE is LOW, set capacitySetup: "LOW" (MEDIUM/other unchanged)
 case "${DEPLOYMENT_TYPE}" in
   [Ll]ow)
     sed -i -E 's|^(\s*capacitySetup:\s*).*$|\1"LOW"|' "${YAML}"
@@ -71,8 +71,7 @@ case "${DEPLOYMENT_TYPE}" in
   *)  echo "[remote:cs] capacitySetup left unchanged (DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE})" ;;
 esac
 
-# --- NEW: update cs-1-values.yaml: replace whole-word 'v1' with version-only (e.g., 6.3.0) ---
-# Find the file (commonly near CS_ROOT). Search depth-limited to avoid surprises.
+# Update cs-1-values.yaml: replace whole-word 'v1' with version-only (e.g., 6.3.0)
 CSV_FILE="$(find -L "${CS_ROOT}" -maxdepth 3 -type f -name 'cs-1-values.yaml' | head -n1 || true)"
 if [[ -z "${CSV_FILE}" ]]; then
   echo "[remote:cs] ERROR: cs-1-values.yaml not found under ${CS_ROOT}" >&2
@@ -81,10 +80,9 @@ fi
 echo "[remote:cs] cs-1-values.yaml=${CSV_FILE}"
 cp -a "${CSV_FILE}" "${CSV_FILE}.bak"
 
-# Use GNU sed word boundary \b to replace v1 → VER (e.g., 6.3.0). Keep their style.
-# Example they gave: sed -i 's/\\bv1\\b/'"6.3.0"'/g' *
-# We apply it only to the target file to avoid unintended edits.
-sed -i -E "s/\\bv1\\b/${VER}/g" "${CSV_FILE}"
+# Use a word-boundary emulation in sed (portable to GNU sed) to replace only standalone 'v1'
+# Replaces (^|non-word) v1 (non-word|$) with \1<VER>\2
+sed -i -E "s/(^|[^[:alnum:]_])v1([^[:alnum:]_]|$)/\\1${VER}\\2/g" "${CSV_FILE}"
 
 echo "[remote:cs] Diff (global-values.yaml):"
 diff -u "${YAML}.bak" "${YAML}" || true
@@ -100,8 +98,63 @@ else
   echo "[remote:cs] ERROR: install_cs.sh not executable or missing in ${CS_ROOT}" >&2
   exit 3
 fi
-
 echo "[remote:cs] CS install complete."
+
+# ---- Post-install health check after 2 minutes ----
+command -v kubectl >/dev/null 2>&1 || { echo "[remote:cs] ERROR: kubectl not found"; exit 3; }
+
+pods_ok() {
+  # Healthy if:
+  # - STATUS Running and READY m/n with m==n
+  # - Ignore Completed/Succeeded
+  # - Ignore ipam pods that are Running and exactly 1/2
+  # - Fail on obvious bad states
+  kubectl get pods -A --no-headers 2>/dev/null | awk '
+    {
+      # 1=NS 2=NAME 3=READY 4=STATUS 5=RESTARTS 6=AGE
+      split($3,a,"/"); m=a[1]; n=a[2];
+      status=$4; name=$2;
+
+      if (status ~ /(Completed|Succeeded)/) next;              # ignore finished jobs
+
+      lname=tolower(name);
+      if (lname ~ /ipam/ && status ~ /Running/ && m==1 && n==2) next;  # special-case ipam 1/2
+
+      if (status ~ /Running/ && m!=n) exit 1;                  # running but not fully ready
+      if (status ~ /(CrashLoopBackOff|ImagePullBackOff|ErrImagePull|BackOff|Error|Init:|Pending|Unknown|CreateContainerConfigError|Terminating)/)
+        exit 1;
+    }
+    END { exit 0 }'
+}
+
+dump_bad() {
+  echo "[remote:cs] --- Unhealthy pods (excluding ipam Running 1/2) ---"
+  kubectl get pods -A --no-headers | awk '
+    {
+      split($3,a,"/"); m=a[1]; n=a[2];
+      status=$4; ns=$1; name=$2;
+
+      if (status ~ /(Completed|Succeeded)/) next;
+
+      lname=tolower(name);
+      if (lname ~ /ipam/ && status ~ /Running/ && m==1 && n==2) next;
+
+      if ((status ~ /Running/ && m!=n) || status ~ /(CrashLoopBackOff|ImagePullBackOff|ErrImagePull|BackOff|Error|Init:|Pending|Unknown|CreateContainerConfigError|Terminating)/)
+        printf "%-20s %-50s %-7s %-20s\n", ns, name, $3, status;
+    }' || true
+}
+
+echo "[remote:cs] Waiting 120s before health check…"
+sleep 120
+
+if pods_ok; then
+  echo "[remote:cs] ✅ Cluster healthy after CS install (pods Running/Ready)."
+else
+  echo "[remote:cs] ❌ Pods not healthy after CS install."
+  dump_bad
+  kubectl get pods -A || true
+  exit 1
+fi
 EOSSH
 
   echo "[cs_config][$host] done"
