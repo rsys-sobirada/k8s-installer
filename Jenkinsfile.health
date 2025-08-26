@@ -1,26 +1,31 @@
-// Jenkinsfile.health — Health check ➜ PS install (with NEW_BUILD_PATH/NEW_VERSION)
+// Jenkinsfile.health — Health check ➜ PS install
 
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
 
   environment {
-    // Health-check inputs
-    SERVER_FILE   = 'server_pci_map.txt'
-    SSH_KEY       = '/var/lib/jenkins/.ssh/jenkins_key'
-
-    // PS install script path
-    PS_SCRIPT     = 'scripts/ps_config.sh'
-
-    // TEMP defaults (you can later convert these to parameters)
-    NEW_BUILD_PATH = '/home/labadmin/6.3.0/EA3/'
-    NEW_VERSION    = '6.3.0'
+    // Required by both stages
+    SERVER_FILE = 'server_pci_map.txt'
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'
+    PS_SCRIPT   = 'scripts/ps_config.sh'
   }
 
+  // Build-time inputs (defaults set; change in "Build with Parameters")
   parameters {
+    // Health check knobs
     string(name: 'HEALTH_RETRY_WAIT_SECS', defaultValue: '300', description: 'Wait between retries (secs)')
     string(name: 'HEALTH_RETRIES',          defaultValue: '1',   description: 'Retry count for health check')
-    string(name: 'PS_STAGE_TIMEOUT_MIN',    defaultValue: '60',  description: 'Timeout for PS install stage (minutes)')
+
+    // PS stage timeout
+    string(name: 'PS_STAGE_TIMEOUT_MIN',    defaultValue: '60',  description: 'Timeout for PS install (minutes)')
+
+    // PS install inputs
+    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/6.3.0/EA3', description: 'Base path containing this build (no trailing slash)')
+    string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3',     description: 'Version with tag; script uses only the part before "_" (e.g., 6.3.0)')
+    string(name: 'INSTALL_IP_ADDR',defaultValue: '10.10.10.20/24',description: 'PS external IP/CIDR used in YAML and MetalLB')
+    choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'], description: 'Capacity setup to write into global-values.yaml')
+    string(name: 'HOST_USER',      defaultValue: 'root',          description: 'SSH user on CN hosts')
   }
 
   stages {
@@ -61,17 +66,16 @@ bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.log
 set -euo pipefail
 : "${PS_SCRIPT:=scripts/ps_config.sh}"
 
-# TEMP: ensure these exist even if Jenkins env is missing
-: "${NEW_BUILD_PATH:=/home/labadmin/6.3.0/EA3/}"
-: "${NEW_VERSION:=6.3.0}"
+# Show what we will pass
+echo "[pipeline] NEW_BUILD_PATH=${NEW_BUILD_PATH}"
+echo "[pipeline] NEW_VERSION=${NEW_VERSION}"
+echo "[pipeline] INSTALL_IP_ADDR=${INSTALL_IP_ADDR}"
+echo "[pipeline] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}"
+echo "[pipeline] HOST_USER=${HOST_USER}"
 
 test -f "${PS_SCRIPT}" || { echo "PS script not found at ${PS_SCRIPT}"; exit 2; }
 sed -i 's/\\r$//' "${PS_SCRIPT}" || true
 chmod +x "${PS_SCRIPT}"
-
-echo "[pipeline] Running ${PS_SCRIPT} with:"
-echo "  NEW_BUILD_PATH=${NEW_BUILD_PATH}"
-echo "  NEW_VERSION=${NEW_VERSION}"
 
 set -o pipefail
 env \
@@ -79,6 +83,9 @@ env \
   SSH_KEY="${SSH_KEY}" \
   NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
   NEW_VERSION="${NEW_VERSION}" \
+  INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
+  DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+  HOST_USER="${HOST_USER}" \
 bash -euo pipefail "${PS_SCRIPT}" |& tee ps_config.log
 '''
           }
