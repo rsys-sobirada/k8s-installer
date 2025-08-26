@@ -1,0 +1,75 @@
+pipeline {
+  agent any
+  options {
+    ansiColor('xterm')
+    timestamps()
+    timeout(time: 45, unit: 'MINUTES')
+  }
+  parameters {
+    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/6.3.0/EA3', description: 'Base path like /home/labadmin/<VER>/<TAG>')
+    string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3', description: 'Version (tag optional), e.g. 6.3.0_EA3')
+    choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'], description: 'Capacity profile')
+    string(name: 'SERVER_FILE',         defaultValue: 'server_pci_map.txt', description: 'Hosts list (colon format)')
+    string(name: 'SERVER_PCI_MAP',      defaultValue: 'server_pci_map.txt', description: 'PCI/mode map data file')
+    string(name: 'SERVER_IP_RANGE_MAP', defaultValue: 'server_map.txt', description: 'Per-server N4 base (ends with .0, optional /mask)')
+    string(name: 'HOST_USER', defaultValue: 'root', description: 'SSH username on target hosts')
+    // Optional overrides if you don’t want to rely on map files:
+    string(name: 'CN_DEPLOYMENT', defaultValue: '', description: 'VM or SRIOV (leave empty to use map)')
+    string(name: 'N3_PCI',        defaultValue: '', description: 'e.g. 0000:08:00.0 (leave empty to use map)')
+    string(name: 'N6_PCI',        defaultValue: '', description: 'e.g. 0000:09:00.0 (leave empty to use map)')
+  }
+  environment {
+    NF_SCRIPT = 'scripts/nf_config.sh'
+  }
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+    stage('Prep') {
+      steps {
+        sh '''
+          set -euo pipefail
+          test -f "${NF_SCRIPT}" || { echo "ERROR: ${NF_SCRIPT} not found"; exit 2; }
+          sed -i 's/\r$//' "${NF_SCRIPT}" || true
+          chmod +x "${NF_SCRIPT}"
+        '''
+      }
+    }
+    stage('NF services config') {
+      steps {
+        withCredentials([sshUserPrivateKey(credentialsId: 'ssh_key', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER_IGNORE')]) {
+          sh '''
+            set -euo pipefail
+            echo "[pipeline] Running ${NF_SCRIPT}…"
+
+            # Ensure map files exist (warn only)
+            for f in "${SERVER_FILE}" "${SERVER_PCI_MAP}" "${SERVER_IP_RANGE_MAP}"; do
+              if [ ! -f "$f" ]; then echo "[pipeline] WARNING: data file $f not present in repo"; fi
+            done
+
+            env \
+              SERVER_FILE="${SERVER_FILE}" \
+              SSH_KEY="${SSH_KEY}" \
+              NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+              NEW_VERSION="${NEW_VERSION}" \
+              DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+              SERVER_PCI_MAP="${SERVER_PCI_MAP}" \
+              SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP}" \
+              HOST_USER="${HOST_USER}" \
+              CN_DEPLOYMENT="${CN_DEPLOYMENT}" \
+              N3_PCI="${N3_PCI}" \
+              N6_PCI="${N6_PCI}" \
+            bash -euo pipefail "${NF_SCRIPT}" |& tee nf_config.log
+          '''
+        }
+      }
+    }
+  }
+  post {
+    always {
+      archiveArtifacts artifacts: 'nf_config.log', allowEmptyArchive: true
+    }
+  }
+}
