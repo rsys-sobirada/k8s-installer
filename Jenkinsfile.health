@@ -1,21 +1,16 @@
-// Jenkinsfile.health — run ONLY the k8s health check
+// Jenkinsfile.health — run ONLY the k8s health check (with safe defaults)
 
 pipeline {
   agent any
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-  }
+  options { timestamps(); disableConcurrentBuilds() }
 
-  // Minimum env the script needs
   environment {
-    SERVER_FILE = 'server_pci_map.txt'                 // adjust if your host list lives elsewhere
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'  // path on the Jenkins node
+    SERVER_FILE = 'server_pci_map.txt'                 // adjust if needed
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'  // adjust if needed
   }
 
-  // Handy knobs (no code changes needed to tune)
   parameters {
-    string(name: 'HEALTH_RETRY_WAIT_SECS', defaultValue: '10', description: 'Wait between retries (secs)')
+    string(name: 'HEALTH_RETRY_WAIT_SECS', defaultValue: '300', description: 'Wait between retries (secs)')
     string(name: 'HEALTH_RETRIES',          defaultValue: '1',   description: 'Number of retries (0 = none)')
   }
 
@@ -30,12 +25,23 @@ pipeline {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 
-# Ensure script exists, normalize line endings, and mark executable
+# ---- defaults so first run works even if Jenkins hasn't injected params yet ----
+: "${HEALTH_RETRY_WAIT_SECS:=300}"
+: "${HEALTH_RETRIES:=1}"
+: "${SERVER_FILE:=server_pci_map.txt}"
+: "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
+
+# Normalize line endings & ensure executable
 test -f scripts/k8s_health_check.sh || { echo "scripts/k8s_health_check.sh not found"; exit 2; }
-sed -i 's/\r$//' scripts/k8s_health_check.sh || true
+sed -i 's/\\r$//' scripts/k8s_health_check.sh || true
 chmod +x scripts/k8s_health_check.sh
 
-# Run the health check (propagates its exit codes 0/1/2/3 to Jenkins)
+echo "[pipeline] SERVER_FILE=${SERVER_FILE}"
+echo "[pipeline] SSH_KEY=${SSH_KEY}"
+echo "[pipeline] HEALTH_RETRY_WAIT_SECS=${HEALTH_RETRY_WAIT_SECS}"
+echo "[pipeline] HEALTH_RETRIES=${HEALTH_RETRIES}"
+
+# Run the health check; exit codes (0/1/2/3) propagate to Jenkins
 env \
   SERVER_FILE="${SERVER_FILE}" \
   SSH_KEY="${SSH_KEY}" \
