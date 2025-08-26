@@ -2,18 +2,18 @@
 set -euo pipefail
 
 # --- required env (exported by Jenkins stage) ---
-: "${SERVER_FILE:?missing}"          # hosts/IPs list (e.g. server_pci_map.txt used earlier)
-: "${SSH_KEY:?missing}"              # Jenkins node private key
+: "${SERVER_FILE:?missing}"          # host list (we support server_pci_map.txt format)
+: "${SSH_KEY:?missing}"              # Jenkins node private key path
 : "${NEW_VERSION:?missing}"          # e.g. 6.3.0_EA3 (we use only 6.3.0)
 : "${NEW_BUILD_PATH:?missing}"       # e.g. /home/labadmin/6.3.0/EA3
 : "${DEPLOYMENT_TYPE:?missing}"      # Low|Medium|High
 
-# Optional overrides (beat map files):
+# Optional overrides (beat map file values if provided)
 #   CN_DEPLOYMENT=VM|SRIOV
 #   N3_PCI=0000:08:00.0
-#   N6_PCI=0000:09:00.0
-SERVER_PCI_MAP="${SERVER_PCI_MAP:-server_pci_map.txt}"  # PCI + mode map (DATA file)
-SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP:-server_map.txt}"  # N4 base network per server (DATA file)
+#   N6_PCI=0000:08:01.1
+SERVER_PCI_MAP="${SERVER_PCI_MAP:-${SERVER_FILE}}"
+SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP:-${SERVER_FILE}}"
 HOST_USER="${HOST_USER:-root}"
 
 # capacity from DEPLOYMENT_TYPE
@@ -27,13 +27,18 @@ esac
 echo "[nf_config] NEW_BUILD_PATH=${NEW_BUILD_PATH}"
 echo "[nf_config] NEW_VERSION=${NEW_VERSION}"
 echo "[nf_config] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE} (${cap})"
+echo "[nf_config] SERVER_FILE=${SERVER_FILE}"
 echo "[nf_config] SERVER_PCI_MAP=${SERVER_PCI_MAP}"
 echo "[nf_config] SERVER_IP_RANGE_MAP=${SERVER_IP_RANGE_MAP}"
 
-# Parse hosts from SERVER_FILE (supports "name:ip:..." or just "ip/name")
+# ----- read target host IPs from SERVER_FILE -----
+# supports:
+#   name:IP:path:VM|SRIOV:PCI:PCI:...  (we take 2nd field)
+#   IP                                 (takes the line)
 mapfile -t HOSTS < <(awk '
   NF && $1 !~ /^#/ {
-    if (index($0,":")>0) { n=split($0,a,":"); print a[2] } else { print $1 }
+    if (index($0,":")>0) { n=split($0,a,":"); print a[2] }
+    else                 { print $1 }
   }' "${SERVER_FILE}")
 
 if ((${#HOSTS[@]}==0)); then
@@ -45,9 +50,9 @@ configure_on_host() {
   local host="$1"
   echo "[nf_config][$host] start"
 
-  # best-effort: ship the data files to the host
-  [[ -f "${SERVER_PCI_MAP}" ]] && scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${SERVER_PCI_MAP}" "${HOST_USER}@${host}:/tmp/server_pci_map.txt" || true
-  [[ -f "${SERVER_IP_RANGE_MAP}" ]] && scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${SERVER_IP_RANGE_MAP}" "${HOST_USER}@${host}:/tmp/server_map.txt" || true
+  # ship maps to remote (best effort)
+  [[ -f "${SERVER_PCI_MAP}" ]] && scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${SERVER_PCI_MAP}"      "${HOST_USER}@${host}:/tmp/server_pci_map.txt" || true
+  [[ -f "${SERVER_IP_RANGE_MAP}" ]] && scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${SERVER_IP_RANGE_MAP}" "${HOST_USER}@${host}:/tmp/server_map.txt"     || true
 
   ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i "${SSH_KEY}" \
       "${HOST_USER}@${host}" bash -euo pipefail -s -- \
@@ -61,25 +66,28 @@ CN_DEPLOYMENT_IN="$5"
 N3_PCI_IN="${6:-}"
 N6_PCI_IN="${7:-}"
 
-# --- derive paths ---
+# ---- derive paths ----
 VER="${NEW_VERSION%%_*}"                 # 6.3.0_EA3 -> 6.3.0
 BASE="${BASE%/}"
 NF_ROOT="${BASE}/TRILLIUM_5GCN_CNF_REL_${VER}/nf-services/scripts"
-
 echo "[remote:nf] NF_ROOT=${NF_ROOT}"
 [[ -d "${NF_ROOT}" ]] || { echo "[remote:nf] ERROR: NF_ROOT not found"; exit 2; }
 
-# --- read /tmp/server_pci_map.txt (mode + PCI) ---
+# ---- parse server_pci_map.txt for this IP (mode + PCI + optional build path + optional N4 base) ----
 CN_DEPLOYMENT="${CN_DEPLOYMENT_IN}"
 N3_PCI="${N3_PCI_IN}"
 N6_PCI="${N6_PCI_IN}"
 
 if [[ -z "${CN_DEPLOYMENT}" || -z "${N3_PCI}" || -z "${N6_PCI}" ]]; then
   if [[ -f /tmp/server_pci_map.txt ]]; then
-    map_line="$(grep -E "^[[:space:]]*[^#].*:[[:space:]]*${TARGET_IP}[[:space:]]*:" /tmp/server_pci_map.txt | head -n1 || true)"
+    # match line containing :<IP>:
+    map_line="$(grep -E "^[[:space:]]*[^#]*:[[:space:]]*${TARGET_IP}[[:space:]]*:" /tmp/server_pci_map.txt | head -n1 || true)"
     if [[ -n "${map_line}" ]]; then
-      CN_DEPLOYMENT="${CN_DEPLOYMENT:-$(printf '%s\n' "${map_line}" | awk -F: '{print toupper($4)}')}"
+      # Field 3 = old build path, field 4 = mode (safe: PCI fields come later)
       OLD_BUILD_PATH="$(printf '%s\n' "${map_line}" | awk -F: '{print $3}')"
+      CN_DEPLOYMENT="$(printf '%s\n' "${map_line}" | awk -F: '{print toupper($4)}')"
+
+      # Extract first two valid PCI tokens anywhere on the line
       readarray -t _pcis < <(printf '%s\n' "${map_line}" | grep -Eo '[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]')
       N3_PCI="${N3_PCI:-${_pcis[0]:-}}"
       N6_PCI="${N6_PCI:-${_pcis[1]:-}}"
@@ -89,21 +97,22 @@ if [[ -z "${CN_DEPLOYMENT}" || -z "${N3_PCI}" || -z "${N6_PCI}" ]]; then
     fi
   fi
 fi
-[[ -n "${CN_DEPLOYMENT}" ]] && CN_DEPLOYMENT="$(echo "${CN_DEPLOYMENT}" | tr '[:lower:]' '[:upper:]')"
+[[ -n "${CN_DEPLOYMENT:-}" ]] && CN_DEPLOYMENT="$(echo "${CN_DEPLOYMENT}" | tr '[:lower:]' '[:upper:]')"
 echo "[remote:nf] CN_DEPLOYMENT=${CN_DEPLOYMENT:-unknown}  N3_PCI=${N3_PCI:-unset}  N6_PCI=${N6_PCI:-unset}"
 
-# --- read /tmp/server_map.txt (per-server N4 base net) ---
+# ---- read N4 base (prefer /tmp/server_map.txt, else fallback to server_pci_map.txt) ----
 N4_BASE_CIDR=""
 if [[ -f /tmp/server_map.txt ]]; then
-  # find first non-comment line containing :<IP>:
-  map_line2="$(grep -E "^[[:space:]]*[^#].*:[[:space:]]*${TARGET_IP}[[:space:]]*:" /tmp/server_map.txt | head -n1 || true)"
-  if [[ -n "${map_line2}" ]]; then
-    # extract first IPv4 ending with .0, with optional /mask
-    N4_BASE_CIDR="$(printf '%s\n' "${map_line2}" | grep -Eo '([0-9]{1,3}\.){3}0(/[0-9]{1,2})?' | head -n1 || true)"
-  fi
+  map_line2="$(grep -E "^[[:space:]]*[^#]*:[[:space:]]*${TARGET_IP}[[:space:]]*:" /tmp/server_map.txt | head -n1 || true)"
+  [[ -n "${map_line2}" ]] && N4_BASE_CIDR="$(printf '%s\n' "${map_line2}" | grep -Eo '([0-9]{1,3}\.){3}0(/[0-9]{1,2})?' | head -n1 || true)"
 fi
+if [[ -z "${N4_BASE_CIDR}" && -f /tmp/server_pci_map.txt ]]; then
+  map_line3="$(grep -E "^[[:space:]]*[^#]*:[[:space:]]*${TARGET_IP}[[:space:]]*:" /tmp/server_pci_map.txt | head -n1 || true)"
+  [[ -n "${map_line3}" ]] && N4_BASE_CIDR="$(printf '%s\n' "${map_line3}" | grep -Eo '([0-9]{1,3}\.){3}0(/[0-9]{1,2})?' | head -n1 || true)"
+fi
+
 if [[ -z "${N4_BASE_CIDR}" ]]; then
-  echo "[remote:nf] WARNING: No N4 base found for ${TARGET_IP} in /tmp/server_map.txt; skipping SMF/UPF N4 ipam edits"
+  echo "[remote:nf] WARNING: No N4 base found for ${TARGET_IP}; skipping SMF/UPF N4 ipam edits"
 fi
 
 # normalize N4 base; default mask /30 if missing
@@ -115,7 +124,6 @@ if [[ -n "${N4_BASE_CIDR}" ]]; then
   else
     N4_BASE="${N4_BASE_CIDR}"
   fi
-  # force last octet to .0
   IFS='.' read -r a b c d <<<"${N4_BASE}"
   N4_BASE="${a}.${b}.${c}.0"
   N4_RANGE="${N4_BASE}/${N4_MASK}"
@@ -124,7 +132,7 @@ if [[ -n "${N4_BASE_CIDR}" ]]; then
   echo "[remote:nf] N4_RANGE=${N4_RANGE}  (SMF exclude ${SMF_EXCL} / UPF exclude ${UPF_EXCL})"
 fi
 
-# --- locate global-values.yaml ---
+# ---- locate global-values.yaml under NF_ROOT ----
 NF_YAML=""
 for f in "${NF_ROOT}/global-values.yaml" "${NF_ROOT}/global-value.yaml"; do
   [[ -f "$f" ]] && { NF_YAML="$f"; break; }
@@ -132,7 +140,7 @@ done
 [[ -n "${NF_YAML}" ]] || { echo "[remote:nf] ERROR: global-values.yaml not found"; exit 2; }
 cp -a "${NF_YAML}" "${NF_YAML}.bak"
 
-# 1) capacitySetup
+# 1) capacitySetup based on DEPLOYMENT_TYPE
 sed -i -E "s|^(\s*capacitySetup:\s*).*$|\1\"${CAP}\"|" "${NF_YAML}"
 
 # 2) ingressExtFQDN: <server-ip>.nip.io
@@ -164,31 +172,18 @@ else
   echo "[remote:nf] WARNING: amf-1-values.yaml not found (skipping externalIP)"
 fi
 
-# --- helper to replace first IPv4 range and first IPv4 exclude under an ipam block ---
+# helper to replace first "range": "<cidr>" and first IPv4 /32 inside exclude array
 replace_ipam_range_and_exclude() {
   local file="$1" new_range="$2" new_excl="$3"
   [[ -n "${new_range}" && -n "${new_excl}" ]] || return 0
   awk -v rng="${new_range}" -v ex="${new_excl}" '
-    function is_ipv4range(s){ return (s ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) }
-    function is_ipv4ex(s){ return (s ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/) }
-    BEGIN{ doneR=0; doneE=0; inEx=0 }
+    function is_ipv4range(){ return ($0 ~ /"range":[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) }
+    BEGIN{ inEx=0; doneR=0; doneE=0 }
     {
-      line=$0
-      # detect entering exclude array
-      if ($0 ~ /^[[:space:]]*"?exclude"?:[[:space:]]*\[/) { inEx=1 }
-      # detect leaving exclude array
-      if (inEx && $0 ~ /\]/) { inEx=0 }
-
-      if (!doneR && $0 ~ /"range":[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
-        sub(/"range":[[:space:]]*"[^"]+"/, "\"range\": \"" rng "\"")
-        doneR=1
-        print; next
-      }
-      if (inEx && !doneE && $0 ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/) {
-        sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/, "\"" ex "\"")
-        doneE=1
-        print; next
-      }
+      if ($0 ~ /^[[:space:]]*"?exclude"?:[[:space:]]*\[/) inEx=1
+      if (inEx && $0 ~ /\]/) inEx=0
+      if (!doneR && is_ipv4range()) { sub(/"range":[[:space:]]*"[^"]+"/, "\"range\": \"" rng "\""); doneR=1; print; next }
+      if (inEx && !doneE && $0 ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/) { sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/, "\"" ex "\""); doneE=1; print; next }
       print
     }' "${file}" > "${file}.tmp" && mv "${file}.tmp" "${file}"
 }
@@ -219,8 +214,8 @@ if [[ -n "${N4_RANGE:-}" ]]; then
   fi
 fi
 
-# 8) UPF VM-based tweaks (devPassthrough + PCI wiring) — unchanged
-if [[ "${CN_DEPLOYMENT}" == "VM" || "${CN_DEPLOYMENT}" == "VM-BASED" || "${CN_DEPLOYMENT}" == "VMB" ]]; then
+# 8) UPF VM-based tweaks (devPassthrough + PCI wiring)
+if [[ "${CN_DEPLOYMENT:-}" == "VM" || "${CN_DEPLOYMENT:-}" == "VM-BASED" || "${CN_DEPLOYMENT:-}" == "VMB" ]]; then
   UPF_FILE="$(find -L "${NF_ROOT}" -maxdepth 3 -type f -name 'upf-1-values.yaml' | head -n1 || true)"
   if [[ -z "${UPF_FILE}" ]]; then
     echo "[remote:nf] WARNING: upf-1-values.yaml not found; skipping UPF PCI edits"
@@ -243,10 +238,10 @@ if [[ "${CN_DEPLOYMENT}" == "VM" || "${CN_DEPLOYMENT}" == "VM-BASED" || "${CN_DE
             if ($0 ~ /^[[:space:]]*[A-Za-z0-9_]+:[[:space:]]*$/ && indent($0) <= ic_indent+2) { sec="" }
             if (sec=="ngu") {
               if ($0 ~ /^[[:space:]]*pciDeviceName:/) { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciDeviceName: PCIDEVICE_INTEL_COM_SRIOV_NETDEVICE_NGU_UPF"; print; next }
-              if ($0 ~ /^[[:space:]]*pciAddress:/) { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciAddress: " n3; print; next }
+              if ($0 ~ /^[[:space:]]*pciAddress:/)    { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciAddress: " n3; print; next }
             } else if (sec=="n6_0") {
               if ($0 ~ /^[[:space:]]*pciDeviceName:/) { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciDeviceName: PCIDEVICE_INTEL_COM_SRIOV_NETDEVICE_N6_UPF"; print; next }
-              if ($0 ~ /^[[:space:]]*pciAddress:/) { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciAddress: " n6; print; next }
+              if ($0 ~ /^[[:space:]]*pciAddress:/)    { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciAddress: " n6; print; next }
             }
             print; next
           }
