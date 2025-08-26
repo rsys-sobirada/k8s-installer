@@ -1,54 +1,77 @@
-// Jenkinsfile.health — run ONLY the k8s health check (with safe defaults)
+// Jenkinsfile.health — Health check ➜ PS install
 
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
 
+  // Minimum env used by scripts (tweak if your paths differ)
   environment {
-    SERVER_FILE = 'server_pci_map.txt'                 // adjust if needed
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'  // adjust if needed
+    SERVER_FILE = 'server_pci_map.txt'
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'
+    PS_SCRIPT   = 'scripts/ps_config.sh'      // path to your PS installer script
   }
 
+  // Knobs you can change at build time
   parameters {
     string(name: 'HEALTH_RETRY_WAIT_SECS', defaultValue: '300', description: 'Wait between retries (secs)')
-    string(name: 'HEALTH_RETRIES',          defaultValue: '1',   description: 'Number of retries (0 = none)')
+    string(name: 'HEALTH_RETRIES',          defaultValue: '1',   description: 'Retry count for health check')
+    string(name: 'PS_STAGE_TIMEOUT_MIN',    defaultValue: '60',  description: 'Timeout for PS install stage (minutes)')
   }
 
   stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
+    stage('Checkout') { steps { checkout scm } }
 
     stage('K8s health check') {
       steps {
         timeout(time: 20, unit: 'MINUTES') {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
-
-# ---- defaults so first run works even if Jenkins hasn't injected params yet ----
+# safe defaults so first run doesn’t fail on unbound vars
 : "${HEALTH_RETRY_WAIT_SECS:=300}"
 : "${HEALTH_RETRIES:=1}"
 : "${SERVER_FILE:=server_pci_map.txt}"
 : "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
 
-# Normalize line endings & ensure executable
 test -f scripts/k8s_health_check.sh || { echo "scripts/k8s_health_check.sh not found"; exit 2; }
 sed -i 's/\\r$//' scripts/k8s_health_check.sh || true
 chmod +x scripts/k8s_health_check.sh
 
-echo "[pipeline] SERVER_FILE=${SERVER_FILE}"
-echo "[pipeline] SSH_KEY=${SSH_KEY}"
-echo "[pipeline] HEALTH_RETRY_WAIT_SECS=${HEALTH_RETRY_WAIT_SECS}"
-echo "[pipeline] HEALTH_RETRIES=${HEALTH_RETRIES}"
-
-# Run the health check; exit codes (0/1/2/3) propagate to Jenkins
+set -o pipefail
 env \
   SERVER_FILE="${SERVER_FILE}" \
   SSH_KEY="${SSH_KEY}" \
   HEALTH_RETRY_WAIT_SECS="${HEALTH_RETRY_WAIT_SECS}" \
   HEALTH_RETRIES="${HEALTH_RETRIES}" \
-bash -euo pipefail scripts/k8s_health_check.sh
+bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.log
 '''
+        }
+      }
+    }
+
+    stage('PS config & install') {
+      // If the health check failed, the pipeline would have stopped already.
+      steps {
+        script {
+          // Convert parameter string to integer for timeout
+          def psTimeout = params.PS_STAGE_TIMEOUT_MIN as Integer
+          timeout(time: psTimeout, unit: 'MINUTES') {
+            sh '''#!/usr/bin/env bash
+set -euo pipefail
+: "${PS_SCRIPT:=scripts/ps_config.sh}"
+
+test -f "${PS_SCRIPT}" || { echo "PS script not found at ${PS_SCRIPT}"; exit 2; }
+sed -i 's/\\r$//' "${PS_SCRIPT}" || true
+chmod +x "${PS_SCRIPT}"
+
+echo "[pipeline] Running ${PS_SCRIPT}…"
+set -o pipefail
+# Pass along common envs in case the script needs them
+env \
+  SERVER_FILE="${SERVER_FILE}" \
+  SSH_KEY="${SSH_KEY}" \
+bash -euo pipefail "${PS_SCRIPT}" |& tee ps_config.log
+'''
+          }
         }
       }
     }
@@ -56,7 +79,7 @@ bash -euo pipefail scripts/k8s_health_check.sh
 
   post {
     always {
-      archiveArtifacts artifacts: '**/*.log', allowEmptyArchive: true
+      archiveArtifacts artifacts: 'health_check.log, ps_config.log', allowEmptyArchive: true
     }
   }
 }
