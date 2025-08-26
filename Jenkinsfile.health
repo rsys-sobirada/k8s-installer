@@ -1,30 +1,28 @@
-// Jenkinsfile.health — Health check ➜ PS install (robust param passing)
+// Jenkinsfile.health — Health check ➜ PS install (server IP used in YAML)
 
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
 
   environment {
-    // Required by both stages
     SERVER_FILE = 'server_pci_map.txt'
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'
     PS_SCRIPT   = 'scripts/ps_config.sh'
   }
 
   parameters {
-    // Health check knobs
-    string(name: 'HEALTH_RETRY_WAIT_SECS', defaultValue: '300', description: 'Wait between retries (secs)')
-    string(name: 'HEALTH_RETRIES',          defaultValue: '1',   description: 'Retry count for health check')
+    // Health check
+    string(name: 'HEALTH_RETRY_WAIT_SECS', defaultValue: '300')
+    string(name: 'HEALTH_RETRIES',          defaultValue: '1')
 
-    // PS stage timeout
-    string(name: 'PS_STAGE_TIMEOUT_MIN',    defaultValue: '60',  description: 'Timeout for PS install (minutes)')
-
-    // PS install inputs
-    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/6.3.0/EA3', description: 'Base path containing this build (no trailing slash)')
-    string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3',     description: 'Version with tag; script uses only the part before "_" (e.g., 6.3.0)')
-    string(name: 'INSTALL_IP_ADDR',defaultValue: '10.10.10.20/24',description: 'PS external IP/CIDR used in YAML and MetalLB')
-    choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'], description: 'Capacity setup to write into global-values.yaml')
-    string(name: 'HOST_USER',      defaultValue: 'root',          description: 'SSH user on CN hosts')
+    // PS stage
+    string(name: 'PS_STAGE_TIMEOUT_MIN',    defaultValue: '60')
+    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/6.3.0/EA3',
+           description: 'Base path that contains TRILLIUM_5GCN_CNF_REL_<VER>/...')
+    string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3',
+           description: 'Script uses only the part before "_" (e.g. 6.3.0)')
+    choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'])
+    string(name: 'HOST_USER',      defaultValue: 'root')
   }
 
   stages {
@@ -61,11 +59,9 @@ bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.log
         script {
           def psTimeout = params.PS_STAGE_TIMEOUT_MIN as Integer
           timeout(time: psTimeout, unit: 'MINUTES') {
-            // Explicitly inject parameters into the shell environment
             withEnv([
               "NEW_BUILD_PATH=${params.NEW_BUILD_PATH}",
               "NEW_VERSION=${params.NEW_VERSION}",
-              "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}",
               "DEPLOYMENT_TYPE=${params.DEPLOYMENT_TYPE}",
               "HOST_USER=${params.HOST_USER}"
             ]) {
@@ -73,17 +69,14 @@ bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.log
 set -euo pipefail
 : "${PS_SCRIPT:=scripts/ps_config.sh}"
 
-# ---- Safe defaults (first run / Replay resilience) ----
+# Safe defaults (first run / Replay)
 : "${NEW_BUILD_PATH:=/home/labadmin/6.3.0/EA3}"
 : "${NEW_VERSION:=6.3.0_EA3}"
-: "${INSTALL_IP_ADDR:=10.10.10.20/24}"
 : "${DEPLOYMENT_TYPE:=Low}"
 : "${HOST_USER:=root}"
 
-# Show what we will pass
 echo "[pipeline] NEW_BUILD_PATH=${NEW_BUILD_PATH}"
 echo "[pipeline] NEW_VERSION=${NEW_VERSION}"
-echo "[pipeline] INSTALL_IP_ADDR=${INSTALL_IP_ADDR}"
 echo "[pipeline] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}"
 echo "[pipeline] HOST_USER=${HOST_USER}"
 
@@ -97,7 +90,6 @@ env \
   SSH_KEY="${SSH_KEY}" \
   NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
   NEW_VERSION="${NEW_VERSION}" \
-  INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
   DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
   HOST_USER="${HOST_USER}" \
 bash -euo pipefail "${PS_SCRIPT}" |& tee ps_config.log
