@@ -6,12 +6,8 @@ set -euo pipefail
 : "${SSH_KEY:?missing}"              # private key on Jenkins node
 : "${NEW_VERSION:?missing}"          # e.g. 6.3.0_EA3 (we will use only 6.3.0)
 : "${NEW_BUILD_PATH:?missing}"       # e.g. /home/labadmin/6.3.0/EA3
-: "${INSTALL_IP_ADDR:?missing}"      # e.g. 10.10.10.20/24
 : "${DEPLOYMENT_TYPE:?missing}"      # Low|Medium|High
-
 HOST_USER="${HOST_USER:-root}"
-
-ip_only="${INSTALL_IP_ADDR%%/*}"
 
 # capacity from DEPLOYMENT_TYPE
 case "${DEPLOYMENT_TYPE}" in
@@ -21,9 +17,9 @@ case "${DEPLOYMENT_TYPE}" in
   *)         cap="MEDIUM" ;;
 esac
 
-echo "[ps_config] Using TARGET_IP=${ip_only}, capacitySetup=${cap}"
 echo "[ps_config] NEW_BUILD_PATH=${NEW_BUILD_PATH}"
 echo "[ps_config] NEW_VERSION=${NEW_VERSION}"
+echo "[ps_config] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE} (${cap})"
 
 # Parse hosts (supports "name:ip:..." or just "ip/name")
 mapfile -t HOSTS < <(awk '
@@ -37,26 +33,26 @@ if ((${#HOSTS[@]}==0)); then
 fi
 
 ps_update_and_install_on_host() {
-  local host="$1"
+  local host="$1"           # expected to be an IP from SERVER_FILE
   echo "[ps_config][$host] start"
 
   ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i "${SSH_KEY}" \
       "${HOST_USER}@${host}" bash -euo pipefail -s -- \
-      "${NEW_VERSION}" "${NEW_BUILD_PATH}" "${ip_only}" "${cap}" <<'EOSSH'
+      "${NEW_VERSION}" "${NEW_BUILD_PATH}" "${host}" "${cap}" <<'EOSSH'
 set -euo pipefail
 NEW_VERSION="$1"
 BASE="$2"
-TARGET_IP="$3"
+TARGET_IP="$3"     # <-- use the server IP, not INSTALL_IP_ADDR
 CAP="$4"
 
-# --- Build PS_ROOT exactly as requested ---
-# Take only the version part before '_' from NEW_VERSION
+# Build PS_ROOT from BASE + version-only (strip tag)
 VER="${NEW_VERSION%%_*}"             # 6.3.0_EA3 -> 6.3.0 ; 6.3.0 -> 6.3.0
-BASE="${BASE%/}"                     # trim trailing slash
+BASE="${BASE%/}"
 PS_ROOT="${BASE}/TRILLIUM_5GCN_CNF_REL_${VER}/platform-services/scripts"
 
 echo "[remote] BASE=${BASE}"
 echo "[remote] NEW_VERSION=${NEW_VERSION} (VER=${VER})"
+echo "[remote] TARGET_IP=${TARGET_IP}"
 echo "[remote] PS_ROOT=${PS_ROOT}"
 
 if [[ ! -d "${PS_ROOT}" ]]; then
@@ -78,11 +74,29 @@ echo "[remote] YAML=${YAML}"
 cp -a "${YAML}" "${YAML}.bak"
 
 # update scalars (preserve indentation)
+# elasticHost: <server IP>
 sed -i -E "s|^(\s*elasticHost:\s*).*$|\1${TARGET_IP}|"            "${YAML}"
+# capacitySetup: "LOW|MEDIUM|HIGH"
 sed -i -E "s|^(\s*capacitySetup:\s*).*$|\1\"${CAP}\"|"           "${YAML}"
+# ingressExtFQDN: <server IP>.nip.io
 sed -i -E "s|^(\s*ingressExtFQDN:\s*).*$|\1${TARGET_IP}.nip.io|" "${YAML}"
 
-# update metallb.L2Pool first list entry to "<IP>/32"
+# update global.registry: docker.io -> rsys-dockerproxy.radisys.com (only inside `global:` block)
+awk -v reg="rsys-dockerproxy.radisys.com" '
+  BEGIN{ in_g=0 }
+  {
+    if ($0 ~ /^[[:space:]]*global:[[:space:]]*$/) { in_g=1; print; next }
+    if (in_g && $0 ~ /^[^[:space:]]/) { in_g=0 }   # left the global block
+    if (in_g && $0 ~ /^[[:space:]]*registry:[[:space:]]*/) {
+      match($0, /^[[:space:]]*/); indent=substr($0,1,RLENGTH);
+      print indent "registry: " reg;
+      next
+    }
+    print
+  }
+' "${YAML}" > "${YAML}.tmp" && mv "${YAML}.tmp" "${YAML}"
+
+# update metallb.L2Pool first list entry to "<server IP>/32"
 awk -v ip="${TARGET_IP}" '
   BEGIN{ in_m=0; in_l=0; replaced=0 }
   {
