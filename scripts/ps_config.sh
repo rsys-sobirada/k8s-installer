@@ -9,7 +9,7 @@ set -euo pipefail
 : "${DEPLOYMENT_TYPE:?missing}"      # Low|Medium|High
 HOST_USER="${HOST_USER:-root}"
 
-# capacity from DEPLOYMENT_TYPE
+# Map DEPLOYMENT_TYPE → capacity
 case "${DEPLOYMENT_TYPE}" in
   [Ll]ow)    cap="LOW" ;;
   [Mm]edium) cap="MEDIUM" ;;
@@ -21,7 +21,7 @@ echo "[ps_config] NEW_BUILD_PATH=${NEW_BUILD_PATH}"
 echo "[ps_config] NEW_VERSION=${NEW_VERSION}"
 echo "[ps_config] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE} (${cap})"
 
-# Parse hosts (supports "name:ip:..." or just "ip/name")
+# Parse hosts from SERVER_FILE (supports "name:ip:..." or just "ip/name")
 mapfile -t HOSTS < <(awk '
   NF && $1 !~ /^#/ {
     if (index($0,":")>0) { n=split($0,a,":"); print a[2] } else { print $1 }
@@ -33,7 +33,7 @@ if ((${#HOSTS[@]}==0)); then
 fi
 
 ps_update_and_install_on_host() {
-  local host="$1"           # expected to be an IP from SERVER_FILE
+  local host="$1"
   echo "[ps_config][$host] start"
 
   ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i "${SSH_KEY}" \
@@ -42,10 +42,10 @@ ps_update_and_install_on_host() {
 set -euo pipefail
 NEW_VERSION="$1"
 BASE="$2"
-TARGET_IP="$3"     # <-- use the server IP from SERVER_FILE
+TARGET_IP="$3"     # server IP from SERVER_FILE
 CAP="$4"
 
-# --- Build PS_ROOT from BASE + version-only (strip tag after '_') ---
+# Derive version-only and paths
 VER="${NEW_VERSION%%_*}"             # 6.3.0_EA3 -> 6.3.0 ; 6.3.0 -> 6.3.0
 BASE="${BASE%/}"
 PS_ROOT="${BASE}/TRILLIUM_5GCN_CNF_REL_${VER}/platform-services/scripts"
@@ -60,16 +60,35 @@ if [[ ! -d "${PS_ROOT}" ]]; then
   exit 2
 fi
 
-# Helpers
+# ---- helpers ----
+command -v kubectl >/dev/null 2>&1 || { echo "[remote] ERROR: kubectl not found"; exit 3; }
+
 has_image_pull_backoff() {
   kubectl get pods -A --no-headers 2>/dev/null | grep -q "ImagePullBackOff"
 }
+
 show_backoff_pods() {
   echo "[remote] Pods in ImagePullBackOff:"
   kubectl get pods -A --no-headers | awk '$4 ~ /ImagePullBackOff/ {printf "%-20s %-50s %-7s %-20s\n",$1,$2,$3,$4}'
 }
 
-# find the yaml (support two common names)
+mongo_pods_ok() {
+  # All pods in namespace "mongodb" must be Running and m==n
+  kubectl get pods -n mongodb --no-headers 2>/dev/null | awk '
+    {
+      # Columns with -n: 1=NAME 2=READY 3=STATUS 4=RESTARTS 5=AGE
+      split($2,a,"/"); m=a[1]; n=a[2]; status=$3;
+      if (status !~ /Running/ || m!=n) exit 1
+    }
+    END { exit 0 }'
+}
+
+dump_mongo_pods() {
+  echo "[remote] --- MongoDB pods ---"
+  kubectl get pods -n mongodb -o wide || true
+}
+
+# ---- locate YAML and update ----
 YAML=""
 for f in "${PS_ROOT}/global-values.yaml" "${PS_ROOT}/global-value.yaml"; do
   if [[ -f "$f" ]]; then YAML="$f"; break; fi
@@ -82,17 +101,19 @@ echo "[remote] YAML=${YAML}"
 
 cp -a "${YAML}" "${YAML}.bak"
 
-# update scalars (preserve indentation)
+# elasticHost: <server IP>
 sed -i -E "s|^(\s*elasticHost:\s*).*$|\1${TARGET_IP}|"            "${YAML}"
+# capacitySetup: "LOW|MEDIUM|HIGH"
 sed -i -E "s|^(\s*capacitySetup:\s*).*$|\1\"${CAP}\"|"           "${YAML}"
+# ingressExtFQDN: <server IP>.nip.io
 sed -i -E "s|^(\s*ingressExtFQDN:\s*).*$|\1${TARGET_IP}.nip.io|" "${YAML}"
 
-# update global.registry: docker.io -> rsys-dockerproxy.radisys.com (inside `global:` block)
+# global.registry: docker.io -> rsys-dockerproxy.radisys.com (inside `global:` block only)
 awk -v reg="rsys-dockerproxy.radisys.com" '
   BEGIN{ in_g=0 }
   {
     if ($0 ~ /^[[:space:]]*global:[[:space:]]*$/) { in_g=1; print; next }
-    if (in_g && $0 ~ /^[^[:space:]]/) { in_g=0 }
+    if (in_g && $0 ~ /^[^[:space:]]/) { in_g=0 }   # left the global block
     if (in_g && $0 ~ /^[[:space:]]*registry:[[:space:]]*/) {
       match($0, /^[[:space:]]*/); indent=substr($0,1,RLENGTH);
       print indent "registry: " reg; next
@@ -101,7 +122,7 @@ awk -v reg="rsys-dockerproxy.radisys.com" '
   }
 ' "${YAML}" > "${YAML}.tmp" && mv "${YAML}.tmp" "${YAML}"
 
-# update metallb.L2Pool first list entry to "<server IP>/32"
+# metallb.L2Pool first entry -> "<IP>/32"
 awk -v ip="${TARGET_IP}" '
   BEGIN{ in_m=0; in_l=0; replaced=0 }
   {
@@ -116,10 +137,10 @@ awk -v ip="${TARGET_IP}" '
   }
 ' "${YAML}" > "${YAML}.tmp" && mv "${YAML}.tmp" "${YAML}"
 
-echo "[remote] Diff:"
+echo "[remote] Diff (PS global-values.yaml):"
 diff -u "${YAML}.bak" "${YAML}" || true
 
-# ---- Run installer ----
+# ---- Run PS installer ----
 cd "${PS_ROOT}"
 if [[ -x ./install_ps.sh ]]; then
   echo "[remote] Running ./install_ps.sh"
@@ -129,45 +150,98 @@ else
   exit 3
 fi
 
-# ---- Post-install ImagePullBackOff handling ----
-echo "[remote] Waiting 60s before health check…"
+# ---- Post-PS ImagePullBackOff handling ----
+echo "[remote] Waiting 60s before PS health check…"
 sleep 60
 if has_image_pull_backoff; then
-  echo "[remote] Detected ImagePullBackOff after install. Showing pods:"
+  echo "[remote] Detected ImagePullBackOff after PS install. Showing pods:"
   show_backoff_pods
   echo "[remote] Waiting 10 minutes to allow images to pull…"
   sleep 600
 
   if has_image_pull_backoff; then
-    echo "[remote] Still ImagePullBackOff after additional 10 minutes — attempting uninstall/reinstall"
+    echo "[remote] Still ImagePullBackOff after additional 10 minutes — attempting PS uninstall/reinstall"
     [[ -x ./uninstall_ps.sh ]] || { echo "[remote] ERROR: uninstall_ps.sh missing or not executable"; exit 4; }
     ./uninstall_ps.sh
 
     echo "[remote] Re-running install_ps.sh"
     ./install_ps.sh
 
-    echo "[remote] Waiting 60s before re-check…"
+    echo "[remote] Waiting 60s before PS re-check…"
     sleep 60
     if has_image_pull_backoff; then
-      echo "[remote] Backoff persists after reinstall; waiting 10 minutes one more time…"
+      echo "[remote] Backoff persists after PS reinstall; waiting 10 minutes one more time…"
       sleep 600
       if has_image_pull_backoff; then
-        echo "[remote] ❌ ImagePullBackOff still present after reinstall + wait. Aborting."
+        echo "[remote] ❌ ImagePullBackOff still present after PS reinstall + wait. Aborting."
         show_backoff_pods
         exit 5
       fi
     fi
   fi
 fi
-echo "[remote] ✅ No ImagePullBackOff detected (final)."
+echo "[remote] ✅ No ImagePullBackOff detected for PS (final)."
 
-# ---- Copy & run load.sh (using NEW_BUILD_PATH + version-only) ----
+# ---- MongoDB install & checks (with post-reinstall 100s delay) ----
+if [[ -x ./install_mongodb.sh ]]; then
+  echo "[remote] Installing MongoDB…"
+  ./install_mongodb.sh
+else
+  echo "[remote] ERROR: install_mongodb.sh not found or not executable in ${PS_ROOT}" >&2
+  exit 6
+fi
+
+echo "[remote] Waiting 100s for MongoDB pods…"
+sleep 100
+
+if ! mongo_pods_ok; then
+  echo "[remote] ❌ MongoDB pods not healthy after first wait. Current state:"
+  dump_mongo_pods
+
+  if [[ -x ./uninstall_mongodb.sh ]]; then
+    echo "[remote] Attempting MongoDB uninstall/reinstall…"
+    ./uninstall_mongodb.sh
+    ./install_mongodb.sh
+    echo "[remote] Waiting 100s after MongoDB reinstall…"
+    sleep 100
+  else
+    echo "[remote] ERROR: uninstall_mongodb.sh missing or not executable" >&2
+    exit 7
+  fi
+
+  if ! mongo_pods_ok; then
+    echo "[remote] ❌ MongoDB pods still not healthy after reinstall; aborting."
+    dump_mongo_pods
+    exit 8
+  fi
+fi
+echo "[remote] ✅ MongoDB pods healthy (namespace mongodb: all pods Running & Ready)."
+
+# ---- Make one Mongo PRIMARY via addmongoreplica.sh (two attempts, 8s apart) ----
+if [[ -x ./addmongoreplica.sh ]]; then
+  echo "[remote] Running addmongoreplica.sh (first pass)…"
+  ./addmongoreplica.sh | tee /tmp/addreplica1.log || true
+  echo "[remote] Waiting 8s before second attempt…"
+  sleep 8
+  echo "[remote] Running addmongoreplica.sh (second pass)…"
+  ./addmongoreplica.sh | tee /tmp/addreplica2.log || true
+
+  if grep -Eq "PRIMARY" /tmp/addreplica1.log /tmp/addreplica2.log; then
+    echo "[remote] ✅ PRIMARY detected in addmongoreplica output."
+  else
+    echo "[remote] ⚠️  PRIMARY not detected in addmongoreplica output; continuing but please verify."
+  fi
+else
+  echo "[remote] WARNING: addmongoreplica.sh not found or not executable; skipping PRIMARY setup."
+fi
+
+# ---- Copy & run load.sh ----
 LOAD_SRC="${BASE}/TRILLIUM_5GCN_CNF_REL_${VER}/common/tools/install/load.sh"
 LOAD_DST="${BASE}/load.sh"
 
 if [[ ! -f "${LOAD_SRC}" ]]; then
   echo "[remote] ERROR: load.sh not found at ${LOAD_SRC}" >&2
-  exit 6
+  exit 9
 fi
 
 echo "[remote] Copying load.sh: ${LOAD_SRC} -> ${LOAD_DST}"
@@ -183,7 +257,7 @@ EOSSH
   echo "[ps_config][$host] done"
 }
 
-# iterate hosts with simple retry
+# Iterate hosts with simple retry
 for h in "${HOSTS[@]}"; do
   ok=0
   for attempt in 1 2 3; do
