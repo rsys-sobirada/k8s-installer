@@ -1,4 +1,4 @@
-// Jenkinsfile.health — Health check ➜ PS install (server IP used in YAML)
+// Jenkinsfile.health — Health check ➜ PS install (+ auto ImagePullBackOff recovery)
 
 pipeline {
   agent any
@@ -20,7 +20,7 @@ pipeline {
     string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/6.3.0/EA3',
            description: 'Base path that contains TRILLIUM_5GCN_CNF_REL_<VER>/...')
     string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3',
-           description: 'Script uses only the part before "_" (e.g. 6.3.0)')
+           description: 'Script uses only the part before "_" (e.g., 6.3.0)')
     choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'])
     string(name: 'HOST_USER',      defaultValue: 'root')
   }
@@ -68,8 +68,6 @@ bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.log
               sh '''#!/usr/bin/env bash
 set -euo pipefail
 : "${PS_SCRIPT:=scripts/ps_config.sh}"
-
-# Safe defaults (first run / Replay)
 : "${NEW_BUILD_PATH:=/home/labadmin/6.3.0/EA3}"
 : "${NEW_VERSION:=6.3.0_EA3}"
 : "${DEPLOYMENT_TYPE:=Low}"
