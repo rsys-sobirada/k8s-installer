@@ -1,3 +1,8 @@
+// Jenkinsfile.nf_config — runs ONLY nf_config.sh
+// - No color plugins required
+// - Uses a key file on the Jenkins node (SSH_KEY_PATH) instead of Jenkins credentials
+// - Auto-finds nf_config.sh if not at scripts/nf_config.sh
+
 pipeline {
   agent any
   options {
@@ -5,24 +10,27 @@ pipeline {
     timeout(time: 45, unit: 'MINUTES')
   }
   parameters {
+    // Where nf_config.sh lives (change if you placed it elsewhere)
+    string(name: 'NF_SCRIPT', defaultValue: 'scripts/nf_config.sh', description: 'Path to nf_config.sh in repo (auto-detects if missing)')
+
+    // Required inputs to build NF path
     string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/6.3.0/EA3', description: 'Base path like /home/labadmin/<VER>/<TAG>')
-    string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3', description: 'Version (tag optional), e.g. 6.3.0_EA3')
+    string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3',       description: 'Version (tag optional), e.g. 6.3.0_EA3')
     choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'], description: 'Capacity profile')
 
-    // Data files in repo:
-    string(name: 'SERVER_FILE',         defaultValue: 'server_pci_map.txt', description: 'Hosts list (colon format)')
-    string(name: 'SERVER_PCI_MAP',      defaultValue: 'server_pci_map.txt', description: 'PCI/mode map data file')
-    string(name: 'SERVER_IP_RANGE_MAP', defaultValue: 'server_map.txt',     description: 'Per-server N4 base (ends with .0, optional /mask)')
+    // Host/IP + data maps (use one file for all by default)
+    string(name: 'SERVER_FILE',         defaultValue: 'server_pci_map.txt', description: 'Hosts list (colon format); field #2 is IP')
+    string(name: 'SERVER_PCI_MAP',      defaultValue: 'server_pci_map.txt', description: 'PCI/mode map (same file by default)')
+    string(name: 'SERVER_IP_RANGE_MAP', defaultValue: 'server_pci_map.txt', description: 'Per-server N4 base (.0[/mask]); same file by default')
 
-    // SSH and optional overrides:
-    string(name: 'HOST_USER', defaultValue: 'root', description: 'SSH username on target hosts')
+    // SSH + optional overrides
+    string(name: 'HOST_USER',    defaultValue: 'root', description: 'SSH username on target hosts')
+    string(name: 'SSH_KEY_PATH', defaultValue: '/var/lib/jenkins/.ssh/id_rsa', description: 'Private key path on Jenkins node')
     string(name: 'CN_DEPLOYMENT', defaultValue: '', description: 'VM or SRIOV (leave empty to use map)')
     string(name: 'N3_PCI',        defaultValue: '', description: 'e.g. 0000:08:00.0 (leave empty to use map)')
     string(name: 'N6_PCI',        defaultValue: '', description: 'e.g. 0000:09:00.0 (leave empty to use map)')
   }
-  environment {
-    NF_SCRIPT = 'scripts/nf_config.sh'
-  }
+
   stages {
     stage('Checkout') {
       steps { checkout scm }
@@ -31,51 +39,73 @@ pipeline {
     stage('Prep') {
       steps {
         sh '''
-          # POSIX sh (no pipefail here)
+          #!/bin/sh
           set -eu
-          test -f "${NF_SCRIPT}" || { echo "ERROR: ${NF_SCRIPT} not found"; exit 2; }
-          # Normalize CRLF if any
-          sed -i 's/\\r$//' "${NF_SCRIPT}" || true
-          chmod +x "${NF_SCRIPT}"
-          # Warn if data files missing (non-fatal)
-          for f in "${SERVER_FILE}" "${SERVER_PCI_MAP}" "${SERVER_IP_RANGE_MAP}"; do
-            if [ ! -f "$f" ]; then echo "[pipeline] WARNING: data file $f not present in repo"; fi
-          done
+          # Resolve nf_config.sh path or auto-discover
+          path_candidate="${NF_SCRIPT}"
+          if [ -f "$path_candidate" ]; then
+            nf_path="$path_candidate"
+          else
+            echo "[pipeline] ${path_candidate} not found — searching repo for nf_config.sh ..."
+            nf_path="$(find . -maxdepth 4 -type f -name nf_config.sh | head -n1 || true)"
+            if [ -z "$nf_path" ]; then
+              echo "ERROR: nf_config.sh not found in repo (looked for ${path_candidate})."
+              echo "[pipeline] Repo file list (top 2 levels):"
+              find . -maxdepth 2 -type f | sed 's|^\\./||'
+              exit 2
+            fi
+          fi
+
+          # Normalize CRLF, mark executable, persist path for next stage
+          sed -i 's/\\r$//' "$nf_path" || true
+          chmod +x "$nf_path"
+          echo "$nf_path" > .nf_script_path
+
+          # Data files — warn (non-fatal) if missing
+          [ -f "${SERVER_FILE}" ]         || echo "[pipeline] WARNING: ${SERVER_FILE} not present in repo"
+          [ -f "${SERVER_PCI_MAP}" ]      || echo "[pipeline] WARNING: ${SERVER_PCI_MAP} not present in repo"
+          [ -f "${SERVER_IP_RANGE_MAP}" ] || echo "[pipeline] WARNING: ${SERVER_IP_RANGE_MAP} not present in repo"
         '''
       }
     }
 
     stage('NF services config') {
       steps {
-        // Use your Jenkins SSH credentials ID below:
-        withCredentials([sshUserPrivateKey(credentialsId: 'ssh_key', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER_IGNORED')]) {
-          sh '''
-            # Run under bash so we can use pipefail and PIPESTATUS with tee
-            bash -lc '
-              set -euo pipefail
-              echo "[pipeline] Running ${NF_SCRIPT}…"
+        sh '''
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-              env \
-                SERVER_FILE="${SERVER_FILE}" \
-                SSH_KEY="${SSH_KEY}" \
-                NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-                NEW_VERSION="${NEW_VERSION}" \
-                DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-                SERVER_PCI_MAP="${SERVER_PCI_MAP}" \
-                SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP}" \
-                HOST_USER="${HOST_USER}" \
-                CN_DEPLOYMENT="${CN_DEPLOYMENT}" \
-                N3_PCI="${N3_PCI}" \
-                N6_PCI="${N6_PCI}" \
-              bash -euo pipefail "${NF_SCRIPT}" 2>&1 | tee nf_config.log
+          # Ensure SSH key exists
+          if [ ! -f "${SSH_KEY_PATH}" ]; then
+            echo "ERROR: SSH key not found at ${SSH_KEY_PATH}"
+            exit 3
+          fi
 
-              exit ${PIPESTATUS[0]}
-            '
-          '''
-        }
+          script="$(cat .nf_script_path)"
+          echo "[pipeline] Running ${script} …"
+          echo "[pipeline] Using SSH key: ${SSH_KEY_PATH}"
+          echo "[pipeline] NEW_BUILD_PATH=${NEW_BUILD_PATH}  NEW_VERSION=${NEW_VERSION}  DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}"
+
+          env \
+            SERVER_FILE="${SERVER_FILE}" \
+            SSH_KEY="${SSH_KEY_PATH}" \
+            NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+            NEW_VERSION="${NEW_VERSION}" \
+            DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+            SERVER_PCI_MAP="${SERVER_PCI_MAP}" \
+            SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP}" \
+            HOST_USER="${HOST_USER}" \
+            CN_DEPLOYMENT="${CN_DEPLOYMENT}" \
+            N3_PCI="${N3_PCI}" \
+            N6_PCI="${N6_PCI}" \
+          bash -euo pipefail "${script}" 2>&1 | tee nf_config.log
+
+          exit ${PIPESTATUS[0]}
+        '''
       }
     }
   }
+
   post {
     always {
       archiveArtifacts artifacts: 'nf_config.log', allowEmptyArchive: true
