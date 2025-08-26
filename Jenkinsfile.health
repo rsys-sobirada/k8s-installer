@@ -1,17 +1,22 @@
-// Jenkinsfile.health — Health check ➜ PS install
+// Jenkinsfile.health — Health check ➜ PS install (with NEW_BUILD_PATH/NEW_VERSION)
 
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
 
-  // Minimum env used by scripts (tweak if your paths differ)
   environment {
-    SERVER_FILE = 'server_pci_map.txt'
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'
-    PS_SCRIPT   = 'scripts/ps_config.sh'      // path to your PS installer script
+    // Health-check inputs
+    SERVER_FILE   = 'server_pci_map.txt'
+    SSH_KEY       = '/var/lib/jenkins/.ssh/jenkins_key'
+
+    // PS install script path
+    PS_SCRIPT     = 'scripts/ps_config.sh'
+
+    // TEMP defaults (you can later convert these to parameters)
+    NEW_BUILD_PATH = '/home/labadmin/6.3.0/EA3/'
+    NEW_VERSION    = '6.3.0'
   }
 
-  // Knobs you can change at build time
   parameters {
     string(name: 'HEALTH_RETRY_WAIT_SECS', defaultValue: '300', description: 'Wait between retries (secs)')
     string(name: 'HEALTH_RETRIES',          defaultValue: '1',   description: 'Retry count for health check')
@@ -26,7 +31,6 @@ pipeline {
         timeout(time: 20, unit: 'MINUTES') {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
-# safe defaults so first run doesn’t fail on unbound vars
 : "${HEALTH_RETRY_WAIT_SECS:=300}"
 : "${HEALTH_RETRIES:=1}"
 : "${SERVER_FILE:=server_pci_map.txt}"
@@ -49,26 +53,32 @@ bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.log
     }
 
     stage('PS config & install') {
-      // If the health check failed, the pipeline would have stopped already.
       steps {
         script {
-          // Convert parameter string to integer for timeout
           def psTimeout = params.PS_STAGE_TIMEOUT_MIN as Integer
           timeout(time: psTimeout, unit: 'MINUTES') {
             sh '''#!/usr/bin/env bash
 set -euo pipefail
 : "${PS_SCRIPT:=scripts/ps_config.sh}"
 
+# TEMP: ensure these exist even if Jenkins env is missing
+: "${NEW_BUILD_PATH:=/home/labadmin/6.3.0/EA3/}"
+: "${NEW_VERSION:=6.3.0}"
+
 test -f "${PS_SCRIPT}" || { echo "PS script not found at ${PS_SCRIPT}"; exit 2; }
 sed -i 's/\\r$//' "${PS_SCRIPT}" || true
 chmod +x "${PS_SCRIPT}"
 
-echo "[pipeline] Running ${PS_SCRIPT}…"
+echo "[pipeline] Running ${PS_SCRIPT} with:"
+echo "  NEW_BUILD_PATH=${NEW_BUILD_PATH}"
+echo "  NEW_VERSION=${NEW_VERSION}"
+
 set -o pipefail
-# Pass along common envs in case the script needs them
 env \
   SERVER_FILE="${SERVER_FILE}" \
   SSH_KEY="${SSH_KEY}" \
+  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+  NEW_VERSION="${NEW_VERSION}" \
 bash -euo pipefail "${PS_SCRIPT}" |& tee ps_config.log
 '''
           }
