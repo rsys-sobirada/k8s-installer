@@ -177,7 +177,7 @@ if has_image_pull_backoff; then
         show_backoff_pods
         exit 5
       fi
-    fi
+    end
   fi
 fi
 echo "[remote] ✅ No ImagePullBackOff detected for PS (final)."
@@ -217,19 +217,22 @@ if ! mongo_pods_ok; then
 fi
 echo "[remote] ✅ MongoDB pods healthy (namespace mongodb: all pods Running & Ready)."
 
-# ---- Make one Mongo PRIMARY via addmongoreplica.sh (two attempts, 8s apart) ----
+# ---- Make one Mongo PRIMARY via addmongoreplica.sh (retry ONLY if needed) ----
 if [[ -x ./addmongoreplica.sh ]]; then
-  echo "[remote] Running addmongoreplica.sh (first pass)…"
+  echo "[remote] Running addmongoreplica.sh (attempt 1)…"
   ./addmongoreplica.sh | tee /tmp/addreplica1.log || true
-  echo "[remote] Waiting 8s before second attempt…"
-  sleep 8
-  echo "[remote] Running addmongoreplica.sh (second pass)…"
-  ./addmongoreplica.sh | tee /tmp/addreplica2.log || true
 
-  if grep -Eq "PRIMARY" /tmp/addreplica1.log /tmp/addreplica2.log; then
-    echo "[remote] ✅ PRIMARY detected in addmongoreplica output."
+  if grep -q "PRIMARY" /tmp/addreplica1.log; then
+    echo "[remote] ✅ PRIMARY detected after attempt 1 — skipping second attempt."
   else
-    echo "[remote] ⚠️  PRIMARY not detected in addmongoreplica output; continuing but please verify."
+    echo "[remote] PRIMARY not detected after attempt 1 — waiting 8s and retrying…"
+    sleep 8
+    ./addmongoreplica.sh | tee /tmp/addreplica2.log || true
+    if grep -q "PRIMARY" /tmp/addreplica2.log; then
+      echo "[remote] ✅ PRIMARY detected after attempt 2."
+    else
+      echo "[remote] ⚠️  PRIMARY not detected after two attempts; continuing but please verify."
+    fi
   fi
 else
   echo "[remote] WARNING: addmongoreplica.sh not found or not executable; skipping PRIMARY setup."
