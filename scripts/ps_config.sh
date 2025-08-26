@@ -62,10 +62,8 @@ fi
 
 # Helpers
 has_image_pull_backoff() {
-  # Return 0 if any pod is in ImagePullBackOff
   kubectl get pods -A --no-headers 2>/dev/null | grep -q "ImagePullBackOff"
 }
-
 show_backoff_pods() {
   echo "[remote] Pods in ImagePullBackOff:"
   kubectl get pods -A --no-headers | awk '$4 ~ /ImagePullBackOff/ {printf "%-20s %-50s %-7s %-20s\n",$1,$2,$3,$4}'
@@ -85,23 +83,19 @@ echo "[remote] YAML=${YAML}"
 cp -a "${YAML}" "${YAML}.bak"
 
 # update scalars (preserve indentation)
-# elasticHost: <server IP>
 sed -i -E "s|^(\s*elasticHost:\s*).*$|\1${TARGET_IP}|"            "${YAML}"
-# capacitySetup: "LOW|MEDIUM|HIGH"
 sed -i -E "s|^(\s*capacitySetup:\s*).*$|\1\"${CAP}\"|"           "${YAML}"
-# ingressExtFQDN: <server IP>.nip.io
 sed -i -E "s|^(\s*ingressExtFQDN:\s*).*$|\1${TARGET_IP}.nip.io|" "${YAML}"
 
-# update global.registry: docker.io -> rsys-dockerproxy.radisys.com (only inside `global:` block)
+# update global.registry: docker.io -> rsys-dockerproxy.radisys.com (inside `global:` block)
 awk -v reg="rsys-dockerproxy.radisys.com" '
   BEGIN{ in_g=0 }
   {
     if ($0 ~ /^[[:space:]]*global:[[:space:]]*$/) { in_g=1; print; next }
-    if (in_g && $0 ~ /^[^[:space:]]/) { in_g=0 }   # left the global block
+    if (in_g && $0 ~ /^[^[:space:]]/) { in_g=0 }
     if (in_g && $0 ~ /^[[:space:]]*registry:[[:space:]]*/) {
       match($0, /^[[:space:]]*/); indent=substr($0,1,RLENGTH);
-      print indent "registry: " reg;
-      next
+      print indent "registry: " reg; next
     }
     print
   }
@@ -114,8 +108,7 @@ awk -v ip="${TARGET_IP}" '
     if ($0 ~ /^[[:space:]]*metallb:[[:space:]]*$/) { in_m=1; in_l=0 }
     else if (in_m && $0 ~ /^[[:space:]]*L2Pool:[[:space:]]*$/) { in_l=1 }
     else if (in_m && in_l && $0 ~ /^[[:space:]]*-[[:space:]]*"/ && replaced==0) {
-      sub(/"[0-9.]+\/32"/, "\"" ip "/32\"")
-      replaced=1
+      sub(/"[0-9.]+\/32"/, "\"" ip "/32\""); replaced=1
     } else if (in_m && $0 ~ /^[[:space:]]*[A-Za-z0-9_]+:/ && $0 !~ /^[[:space:]]*L2Pool:/) {
       in_m=0; in_l=0
     }
@@ -166,8 +159,25 @@ if has_image_pull_backoff; then
     fi
   fi
 fi
-
 echo "[remote] ✅ No ImagePullBackOff detected (final)."
+
+# ---- Copy & run load.sh (using NEW_BUILD_PATH + version-only) ----
+LOAD_SRC="${BASE}/TRILLIUM_5GCN_CNF_REL_${VER}/common/tools/install/load.sh"
+LOAD_DST="${BASE}/load.sh"
+
+if [[ ! -f "${LOAD_SRC}" ]]; then
+  echo "[remote] ERROR: load.sh not found at ${LOAD_SRC}" >&2
+  exit 6
+fi
+
+echo "[remote] Copying load.sh: ${LOAD_SRC} -> ${LOAD_DST}"
+cp -f "${LOAD_SRC}" "${LOAD_DST}"
+chmod +x "${LOAD_DST}"
+
+echo "[remote] Running ${LOAD_DST} ${VER}"
+( cd "${BASE}" && "${LOAD_DST}" "${VER}" )
+
+echo "[remote] load.sh completed."
 EOSSH
 
   echo "[ps_config][$host] done"
