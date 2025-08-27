@@ -5,15 +5,15 @@ pipeline {
     timeout(time: 45, unit: 'MINUTES')
   }
   parameters {
-    // Optional: if left empty, we auto-find the script
-    string(name: 'NF_SCRIPT', defaultValue: '', description: 'Path to nf_config.sh in repo (leave empty to auto-detect)')
+    // Optional: leave empty to auto-detect
+    string(name: 'NF_SCRIPT', defaultValue: '', description: 'Path to nf_config.sh (leave empty to auto-detect)')
 
     // Required inputs
     string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/6.3.0/EA3', description: 'Base path like /home/labadmin/<VER>/<TAG>')
     string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3', description: 'Version (tag optional), e.g. 6.3.0_EA3')
     choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'], description: 'Capacity profile')
 
-    // Host/IP + data maps (single file by default)
+    // Maps (single file by default)
     string(name: 'SERVER_FILE',         defaultValue: 'server_pci_map.txt', description: 'Hosts list (colon format); field #2 is IP')
     string(name: 'SERVER_PCI_MAP',      defaultValue: 'server_pci_map.txt', description: 'PCI/mode map (same file by default)')
     string(name: 'SERVER_IP_RANGE_MAP', defaultValue: 'server_pci_map.txt', description: 'Per-server N4 base (.0[/mask]); same file by default')
@@ -27,38 +27,28 @@ pipeline {
   }
 
   stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
+    stage('Checkout') { steps { checkout scm } }
 
     stage('Prep') {
       steps {
         sh '''
           #!/bin/sh
           set -eu
-          # Fallback to default location or auto-discover
-          path_candidate="${NF_SCRIPT:-}"
-          [ -n "$path_candidate" ] || path_candidate="scripts/nf_config.sh"
-
-          if [ -f "$path_candidate" ]; then
-            nf_path="$path_candidate"
-          else
-            echo "[pipeline] ${path_candidate} not found — searching repo for nf_config.sh ..."
-            nf_path="$(find . -maxdepth 4 -type f -name nf_config.sh | head -n1 || true)"
-            if [ -z "$nf_path" ]; then
-              echo "ERROR: nf_config.sh not found in repo (looked for ${path_candidate})."
-              echo "[pipeline] Repo file list (top 2 levels):"
-              find . -maxdepth 2 -type f | sed 's|^\\./||'
+          # Fallback to default or auto-discover
+          cand="${NF_SCRIPT:-}"; [ -n "$cand" ] || cand="scripts/nf_config.sh"
+          if [ -f "$cand" ]; then nf="$cand"; else
+            echo "[pipeline] ${cand} not found — searching for nf_config.sh ..."
+            nf="$(find . -maxdepth 4 -type f -name nf_config.sh | head -n1 || true)"
+            if [ -z "$nf" ]; then
+              echo "ERROR: nf_config.sh not found (looked for ${cand})."
+              find . -maxdepth 2 -type f | sed "s|^\\./||"
               exit 2
             fi
           fi
+          sed -i 's/\\r$//' "$nf" || true
+          chmod +x "$nf"
+          echo "$nf" > .nf_script_path
 
-          # Normalize CRLF, mark executable, persist path
-          sed -i 's/\\r$//' "$nf_path" || true
-          chmod +x "$nf_path"
-          echo "$nf_path" > .nf_script_path
-
-          # Non-fatal warnings for data files
           [ -f "${SERVER_FILE}" ]         || echo "[pipeline] WARNING: ${SERVER_FILE} not present in repo"
           [ -f "${SERVER_PCI_MAP}" ]      || echo "[pipeline] WARNING: ${SERVER_PCI_MAP} not present in repo"
           [ -f "${SERVER_IP_RANGE_MAP}" ] || echo "[pipeline] WARNING: ${SERVER_IP_RANGE_MAP} not present in repo"
@@ -68,35 +58,33 @@ pipeline {
 
     stage('NF services config') {
       steps {
+        // IMPORTANT: run under bash explicitly
         sh '''
-          #!/usr/bin/env bash
-          set -euo pipefail
+          bash -lc '
+            set -euo pipefail
+            if [ ! -f "${SSH_KEY_PATH}" ]; then
+              echo "ERROR: SSH key not found at ${SSH_KEY_PATH}"; exit 3; fi
 
-          # Ensure SSH key exists
-          if [ ! -f "${SSH_KEY_PATH}" ]; then
-            echo "ERROR: SSH key not found at ${SSH_KEY_PATH}"
-            exit 3
-          fi
+            script="$(cat .nf_script_path)"
+            echo "[pipeline] Running ${script} …"
+            echo "[pipeline] Using SSH key: ${SSH_KEY_PATH}"
 
-          script="$(cat .nf_script_path)"
-          echo "[pipeline] Running ${script} …"
-          echo "[pipeline] Using SSH key: ${SSH_KEY_PATH}"
+            env \
+              SERVER_FILE="${SERVER_FILE}" \
+              SSH_KEY="${SSH_KEY_PATH}" \
+              NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+              NEW_VERSION="${NEW_VERSION}" \
+              DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+              SERVER_PCI_MAP="${SERVER_PCI_MAP}" \
+              SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP}" \
+              HOST_USER="${HOST_USER}" \
+              CN_DEPLOYMENT="${CN_DEPLOYMENT}" \
+              N3_PCI="${N3_PCI}" \
+              N6_PCI="${N6_PCI}" \
+            bash -euo pipefail "${script}" 2>&1 | tee nf_config.log
 
-          env \
-            SERVER_FILE="${SERVER_FILE}" \
-            SSH_KEY="${SSH_KEY_PATH}" \
-            NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-            NEW_VERSION="${NEW_VERSION}" \
-            DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-            SERVER_PCI_MAP="${SERVER_PCI_MAP}" \
-            SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP}" \
-            HOST_USER="${HOST_USER}" \
-            CN_DEPLOYMENT="${CN_DEPLOYMENT}" \
-            N3_PCI="${N3_PCI}" \
-            N6_PCI="${N6_PCI}" \
-          bash -euo pipefail "${script}" 2>&1 | tee nf_config.log
-
-          exit ${PIPESTATUS[0]}
+            exit ${PIPESTATUS[0]}
+          '
         '''
       }
     }
