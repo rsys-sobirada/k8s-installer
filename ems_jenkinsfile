@@ -2,134 +2,134 @@ pipeline {
   agent any
 
   options {
-    ansiColor('xterm')
     timestamps()
     disableConcurrentBuilds()
     timeout(time: 45, unit: 'MINUTES') // overall guard
   }
 
-  // Only safe, high-level params; nothing from server_pci_map.txt is shown
   parameters {
     string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin', description: 'Base path where releases are staged')
     string(name: 'NEW_VERSION', defaultValue: '6.3.0_EA3', description: 'Version tag like 6.3.0_EA3')
     string(name: 'INSTALL_SERVER_FILE', defaultValue: 'server_pci_map.txt', description: 'Path to server map (not exposed contents)')
-    string(name: 'NODE_NAME', defaultValue: '', description: 'Optional: pick a server name from column 1 (blank=first line)')
-  }
-
-  environment {
-    // Nothing sensitive printed; SERVER_IP is resolved inside the shell step
-    KUBECONFIG = "${env.WORKSPACE}/.kube/config" // use your cluster kubeconfig if needed
+    string(name: 'NODE_NAME', defaultValue: '', description: 'Optional: pick server name from column 1 (blank=first line)')
+    string(name: 'SSH_KEY', defaultValue: '/var/lib/jenkins/.ssh/jenkins_key', description: 'Private key used for remote login (same as nf_config.sh)')
+    string(name: 'SSH_USER', defaultValue: 'root', description: 'SSH user (same as nf_config.sh)')
   }
 
   stages {
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
-    // If you already run NF config elsewhere, keep that stage there.
-    // This is just a placeholder showing relative order.
-    stage('NF config (placeholder)') {
+    // keep your existing NF-config stage(s) here as-is
+    stage('EMS install & health check (remote via SSH)') {
+      options { timeout(time: 15, unit: 'MINUTES') }
       steps {
-        echo 'NF config was updated earlier in your flow...'
-      }
-    }
-
-    stage('EMS install & health check') {
-      options { timeout(time: 10, unit: 'MINUTES') }
-      steps {
-        sh label: 'Install EMS + wait ready + probe GUI', script: '''
+        sh label: 'Install EMS on remote server and verify', script: '''
           set -euo pipefail
 
-          req(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
-          die(){ echo "❌ $*"; exit 1; }
-
+          # ---------- Inputs ----------
           : "${NEW_BUILD_PATH:?missing NEW_BUILD_PATH}"
           : "${NEW_VERSION:?missing NEW_VERSION}"
           INSTALL_SERVER_FILE="${INSTALL_SERVER_FILE:-server_pci_map.txt}"
           NODE_NAME="${NODE_NAME:-}"
+          SSH_KEY="${SSH_KEY:?missing SSH_KEY}"
+          SSH_USER="${SSH_USER:-root}"
 
-          req kubectl
-          req curl
-          req awk
-          req grep
-          req sed
+          # ---------- Helpers (same style as nf_config.sh) ----------
+          die(){ echo "❌ $*"; exit 1; }
+          req(){ command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
-          echo ">>> Resolving SERVER_IP from ${INSTALL_SERVER_FILE}"
-          get_server_ip() {
-            local file="$1" name_filter="$2"
+          req awk; req grep; req sed; req ssh; req scp; req curl
+
+          SSH_OPTS="-i ${SSH_KEY} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+
+          get_server_ip(){
+            local file="$1" name="$2"
             [ -s "$file" ] || die "Server map not found or empty: $file"
             local line
-            if [ -n "$name_filter" ]; then
-              line="$(awk -F: -v n="$name_filter" \'BEGIN{IGNORECASE=1} $0!~/^[[:space:]]*#/ && NF>=2 && $1==n {print; exit}\' "$file")"
-              [ -n "$line" ] || die "No entry for NODE_NAME=\\"$name_filter\\" in $file"
+            if [ -n "$name" ]; then
+              line="$(awk -F: -v n="$name" 'BEGIN{IGNORECASE=1} $0!~/^[[:space:]]*#/ && NF>=2 && $1==n {print; exit}' "$file")"
+              [ -n "$line" ] || die "No entry for NODE_NAME=\\"$name\\" in $file"
             else
-              line="$(awk -F: \'$0!~/^[[:space:]]*#/ && NF>=2 {print; exit}\' "$file")"
+              line="$(awk -F: '$0!~/^[[:space:]]*#/ && NF>=2 {print; exit}' "$file")"
             fi
-            local ip
-            ip="$(awk -F: \'{print $2}\' <<<"$line")"
+            local ip; ip="$(awk -F: '{print $2}' <<<"$line")"
             [[ "$ip" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || die "Invalid IP parsed from: $line"
             printf "%s" "$ip"
           }
 
+          # remote shell helper (same spirit as nf_config.sh)
+          rsh(){ ssh $SSH_OPTS "${SSH_USER}@${SERVER_IP}" -- "$@"; }
+          rcp(){ scp $SSH_OPTS "$1" "${SSH_USER}@${SERVER_IP}:$2"; }
+
+          # ---------- Resolve target & preflight ----------
           SERVER_IP="$(get_server_ip "$INSTALL_SERVER_FILE" "$NODE_NAME")"
-          export SERVER_IP
-          EMS_URL="https://${SERVER_IP}.nip.io/ems/register"
-          echo ">>> SERVER_IP resolved (hidden from parameters UI)."
-          echo ">>> EMS URL for probe: $EMS_URL"
+          echo ">>> Target server (hidden in params UI): ${SERVER_IP}"
 
-          # Build EMS scripts directory from NEW_VERSION & NEW_BUILD_PATH
-          base="${NEW_VERSION%%_*}"         # e.g., 6.3.0
-          tag="${NEW_VERSION#*_}"           # e.g., EA3
-          [ "$base" != "$NEW_VERSION" ] || die "NEW_VERSION must look like 6.3.0_EA3 (got: $NEW_VERSION)"
-          EMS_SCRIPTS_DIR="${NEW_BUILD_PATH}/${tag}/TRILLIUM_5GCN_CNF_REL_${base}/nf-services/scripts"
-          [ -d "$EMS_SCRIPTS_DIR" ] || die "EMS scripts dir not found: $EMS_SCRIPTS_DIR"
-          echo ">>> Using EMS scripts dir: $EMS_SCRIPTS_DIR"
+          # Key login check (same pattern used in nf_config.sh flows)
+          if ! rsh true; then
+            die "SSH key login failed for ${SSH_USER}@${SERVER_IP} using ${SSH_KEY}"
+          fi
+          echo "✅ SSH key login OK to ${SSH_USER}@${SERVER_IP}"
 
-          echo ">>> Running ./install_ems.sh"
-          ( cd "$EMS_SCRIPTS_DIR" && chmod +x install_ems.sh && ./install_ems.sh )
+          # ---------- Build EMS path exactly like your local layout ----------
+          BASE_VER="${NEW_VERSION%%_*}"     # e.g., 6.3.0
+          TAG="${NEW_VERSION#*_}"           # e.g., EA3
+          [ "$BASE_VER" != "$NEW_VERSION" ] || die "NEW_VERSION must look like 6.3.0_EA3 (got: $NEW_VERSION)"
 
+          EMS_SCRIPTS_DIR="${NEW_BUILD_PATH}/${TAG}/TRILLIUM_5GCN_CNF_REL_${BASE_VER}/nf-services/scripts"
+          echo ">>> EMS scripts dir (remote): ${EMS_SCRIPTS_DIR}"
+
+          # ---------- Run EMS install remotely (same login flow) ----------
+          rsh "bash -euo pipefail -c '
+            [ -d \"$EMS_SCRIPTS_DIR\" ] || { echo \"EMS scripts dir not found: $EMS_SCRIPTS_DIR\"; exit 1; }
+            cd \"$EMS_SCRIPTS_DIR\"
+            chmod +x install_ems.sh
+            ./install_ems.sh
+          '"
+
+          # ---------- Remote health check via kubectl on the server ----------
           echo ">>> Waiting up to 180s for EMS pods to be Ready (n/n) and Running…"
-          ems_all_ready() {
-            local lines ready status r t ok=1
-            mapfile -t lines < <(kubectl get pods -A 2>/dev/null | grep -i ems || true)
-            ((${#lines[@]})) || return 1
-            for l in "${lines[@]}"; do
-              ready="$(awk \'{print $3}\' <<<"$l")"
-              status="$(awk \'{print $4}\' <<<"$l")"
-              case "$ready" in
-                */*) r="${ready%/*}"; t="${ready#*/}";;
-                *)   r=0; t=1;;
-              esac
-              if [ "$r" != "$t" ] || [ "$status" != "Running" ]; then
-                ok=0; break
+          rsh "bash -euo pipefail -c '
+            deadline=\$(( \$(date +%s) + 180 ))
+            ems_all_ready() {
+              mapfile -t lines < <(kubectl get pods -A 2>/dev/null | grep -i ems || true)
+              ((${#lines[@]})) || return 1
+              for l in \"${lines[@]}\"; do
+                ready=\$(awk \"{print \\$3}\" <<<\"\$l\")
+                status=\$(awk \"{print \\$4}\" <<<\"\$l\")
+                case \"\$ready\" in
+                  */*) r=\"\${ready%/*}\"; t=\"\${ready#*/}\";;
+                  *)   r=0; t=1;;
+                esac
+                if [ \"\$r\" != \"\$t\" ] || [ \"\$status\" != \"Running\" ]; then
+                  return 1
+                fi
+              done
+              return 0
+            }
+            while :; do
+              if ems_all_ready; then
+                echo \"✅ EMS pods Ready:\"
+                kubectl get pods -A | grep -i ems || true
+                break
+              else
+                echo \"…waiting:\"
+                kubectl get pods -A | grep -i ems || echo \"(no ems pods yet)\"
               fi
+              [ \"\$(date +%s)\" -lt \"\$deadline\" ] || { echo \"Timeout: EMS pods not Ready within 3 minutes\"; exit 1; }
+              sleep 5
             done
-            [ "$ok" -eq 1 ]
-          }
+            echo \"--- short watch ---\"
+            for i in 1 2 3; do
+              kubectl get pod -A | grep -i ems || true
+              sleep 3
+            done
+          '"
 
-          deadline=$(( $(date +%s) + 180 ))
-          while :; do
-            if ems_all_ready; then
-              echo "✅ EMS pods Ready:"
-              kubectl get pods -A | grep -i ems || true
-              break
-            else
-              echo "…waiting:"
-              kubectl get pods -A | grep -i ems || echo "(no ems pods yet)"
-            fi
-            [ "$(date +%s)" -lt "$deadline" ] || die "Timeout: EMS pods not Ready within 3 minutes"
-            sleep 5
-          done
-
-          echo ">>> Short watch (3 snapshots) of 'kubectl get pod -A | grep ems'"
-          for i in 1 2 3; do
-            echo "--- snapshot $i ---"
-            kubectl get pod -A | grep -i ems || true
-            sleep 3
-          done
-
+          # ---------- GUI probe (from controller, OK) ----------
+          EMS_URL="https://${SERVER_IP}.nip.io/ems/register"
           echo ">>> Probing EMS GUI: $EMS_URL"
           code="$(curl -sk -o /dev/null -w '%{http_code}' "$EMS_URL" || true)"
           if [ "$code" = "200" ] || [ "$code" = "302" ]; then
@@ -138,11 +138,8 @@ pipeline {
             die "EMS GUI not reachable (HTTP $code) at $EMS_URL"
           fi
 
-          echo "🎉 EMS install & checks completed."
-          echo "👉 GUI registration (manual once):"
-          echo "   User ID: root"
-          echo "   Name   : root"
-          echo "   Password: root123"
+          echo "🎉 EMS remote install & checks completed."
+          echo "👉 Register via GUI (once): user=root, name=root, password=root123"
         '''
       }
     }
@@ -150,14 +147,20 @@ pipeline {
 
   post {
     always {
+      // Best-effort pull of pod state for the record
       sh '''
-        echo "---- EMS pods (final) ----"
-        kubectl get pods -A | (grep -i ems || true)
+        set -e
+        if command -v awk >/dev/null && [ -f "${INSTALL_SERVER_FILE}" ]; then
+          SERVER_IP=$(awk -F: '$0!~/^[[:space:]]*#/ && NF>=2 {print $2; exit}' "${INSTALL_SERVER_FILE}")
+          if [ -n "$SERVER_IP" ] && command -v ssh >/dev/null; then
+            ssh -i "${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@${SERVER_IP}" -- \
+              "kubectl get pods -A | (grep -i ems || true)" || true
+          fi
+        fi
       '''.stripIndent()
-      archiveArtifacts artifacts: '**/ems*.log', allowEmptyArchive: true
     }
     failure {
-      echo 'Pipeline failed — see console for the first non-zero step that aborted the run.'
+      echo 'Pipeline failed — check the first non-zero step for details.'
     }
   }
 }
