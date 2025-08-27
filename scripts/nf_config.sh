@@ -108,48 +108,65 @@ patch_key_scalar() { # file key value
 }
 
 # ---- path-anchored IPAM patchers (update range & exclude in the exact blocks) ----
+# UPF (anchored to: upfsp -> n4 -> "ipam")
 patch_upf_upfsp_n4_ipam() { # file CIDR excludeIPv4
   awk -v rng="$2" -v exc="$3" '
-    function hdr(line,   i,ind,name){
+    function head(line,   i,ind,name){
       i=match(line,/[^[:space:]]/); ind=(i?i-1:0);
       if (match(line,/^[[:space:]]*[A-Za-z0-9_-]+:/)) {
         name=$0; sub(/^[[:space:]]*/,"",name); sub(/:.*/,"",name); return ind "|" name;
       }
       return "-1|";
     }
-    BEGIN{in_upfsp=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; rd=0; ed=0; ind_upfsp=-1; ind_n4=-1}
+    BEGIN{in_upfsp=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; wrote_exc=0}
     {
       line=$0
-      split(hdr(line),H,"|"); h_ind=H[1]+0; h_name=H[2];
+      split(head(line),H,"|"); h_ind=H[1]+0; h_name=H[2];
 
-      # enter/exit upfsp:
-      if (!in_upfsp && h_name=="upfsp") { in_upfsp=1; ind_upfsp=h_ind }
-      else if (in_upfsp && h_ind>=0 && h_ind<=ind_upfsp && h_name!="upfsp") { in_upfsp=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
+      # upfsp scope
+      if (!in_upfsp && h_name=="upfsp"){in_upfsp=1; ind_upfsp=h_ind}
+      else if (in_upfsp && h_ind>=0 && h_ind<=ind_upfsp && h_name!="upfsp"){in_upfsp=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; wrote_exc=0}
 
-      # inside upfsp → track n4:
-      if (in_upfsp) {
-        if (!in_n4 && h_name=="n4") { in_n4=1; ind_n4=h_ind }
-        else if (in_n4 && h_ind>=0 && h_ind<=ind_n4 && h_name!="n4") { in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
+      # n4 scope
+      if (in_upfsp){
+        if (!in_n4 && h_name=="n4"){in_n4=1; ind_n4=h_ind}
+        else if (in_n4 && h_ind>=0 && h_ind<=ind_n4 && h_name!="n4"){in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; wrote_exc=0}
       }
 
-      # inside upfsp.n4 → ipam braces
-      if (in_upfsp && in_n4) {
+      # ipam + range + exclude overwrite
+      if (in_upfsp && in_n4){
         if (!in_ipam && line ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) in_ipam=1
-        if (in_ipam) {
-          if (line ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
-          if (in_ranges && !rd && line ~ /"range"[[:space:]]*:[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+)"/) {
+        if (in_ipam){
+          # range
+          if (!in_ranges && line ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
+          if (in_ranges && line ~ /"range"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/){
             i=match(line,/[^[:space:]]/); ind=(i?substr(line,1,i-1):""); trail=""; if (line ~ /",[[:space:]]*$/) trail=","
-            print ind "\"range\": \"" rng "\"" trail; rd=1; next
+            print ind "\"range\": \"" rng "\"" trail; next
           }
           if (in_ranges && line ~ /\]/) in_ranges=0
 
-          if (!in_ex && line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/) in_ex=1
-          if (in_ex && !ed && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
-            sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/, "\"" exc "\"", line); print line; ed=1; next
+          # exclude (force first item = exc)
+          if (!in_ex && line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/){
+            in_ex=1
+            # remember indent for item lines
+            i=match(line,/[^[:space:]]/); exind=(i?substr(line,1,i-1):"") "  "
+            print line
+            next
           }
-          if (in_ex && line ~ /\]/) in_ex=0
-
-          if (line ~ /\}/ && !in_ranges && !in_ex) in_ipam=0
+          if (in_ex && !wrote_exc && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/){
+            trail=""; if (line ~ /",[[:space:]]*$/) trail=","
+            print exind "\"" exc "\"" trail
+            wrote_exc=1
+            next
+          }
+          # if list empty or first non-IPv4 until closing bracket, inject before ]
+          if (in_ex && !wrote_exc && line ~ /^[[:space:]]*\]/){
+            print exind "\"" exc "\""
+            print line
+            in_ex=0; wrote_exc=1; next
+          }
+          if (in_ex && line ~ /\]/){ in_ex=0 }  # close exclude
+          if (in_ipam && !in_ranges && !in_ex && line ~ /\}/){ in_ipam=0 }  # close ipam
         }
       }
 
@@ -159,59 +176,66 @@ patch_upf_upfsp_n4_ipam() { # file CIDR excludeIPv4
 
 patch_smf_n4_ipam() { # file CIDR excludeIPv4
   awk -v rng="$2" -v exc="$3" '
-    function hdr(line,   i,ind,name){
+    function head(line,   i,ind,name){
       i=match(line,/[^[:space:]]/); ind=(i?i-1:0);
       if (match(line,/^[[:space:]]*[A-Za-z0-9_-]+:/)) {
         name=$0; sub(/^[[:space:]]*/,"",name); sub(/:.*/,"",name); return ind "|" name;
       }
       return "-1|";
     }
-    BEGIN{in_smfTop=0; in_smf=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; rd=0; ed=0; ind_smfTop=-1; ind_smf=-1; ind_n4=-1}
+    BEGIN{in_top=0; in_mid=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; wrote_exc=0}
     {
       line=$0
-      split(hdr(line),H,"|"); h_ind=H[1]+0; h_name=H[2];
+      split(head(line),H,"|"); h_ind=H[1]+0; h_name=H[2];
 
-      # top: smf-n4iwf:
-      if (!in_smfTop && h_name=="smf-n4iwf") { in_smfTop=1; ind_smfTop=h_ind }
-      else if (in_smfTop && h_ind>=0 && h_ind<=ind_smfTop && h_name!="smf-n4iwf") { in_smfTop=0; in_smf=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
+      if (!in_top && h_name=="smf-n4iwf"){in_top=1; ind_top=h_ind}
+      else if (in_top && h_ind>=0 && h_ind<=ind_top && h_name!="smf-n4iwf"){in_top=0; in_mid=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; wrote_exc=0}
 
-      # child: smf_n4iwf:
-      if (in_smfTop) {
-        if (!in_smf && h_name=="smf_n4iwf") { in_smf=1; ind_smf=h_ind }
-        else if (in_smf && h_ind>=0 && h_ind<=ind_smf && h_name!="smf_n4iwf") { in_smf=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
+      if (in_top){
+        if (!in_mid && h_name=="smf_n4iwf"){in_mid=1; ind_mid=h_ind}
+        else if (in_mid && h_ind>=0 && h_ind<=ind_mid && h_name!="smf_n4iwf"){in_mid=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; wrote_exc=0}
       }
 
-      # smf_n4iwf → n4:
-      if (in_smf) {
-        if (!in_n4 && h_name=="n4") { in_n4=1; ind_n4=h_ind }
-        else if (in_n4 && h_ind>=0 && h_ind<=ind_n4 && h_name!="n4") { in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
+      if (in_mid){
+        if (!in_n4 && h_name=="n4"){in_n4=1; ind_n4=h_ind}
+        else if (in_n4 && h_ind>=0 && h_ind<=ind_n4 && h_name!="n4"){in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; wrote_exc=0}
       }
 
-      # smf_n4iwf.n4 → ipam
-      if (in_smf && in_n4) {
+      if (in_mid && in_n4){
         if (!in_ipam && line ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) in_ipam=1
-        if (in_ipam) {
-          if (line ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
-          if (in_ranges && !rd && line ~ /"range"[[:space:]]*:[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+)"/) {
+        if (in_ipam){
+          if (!in_ranges && line ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
+          if (in_ranges && line ~ /"range"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/){
             i=match(line,/[^[:space:]]/); ind=(i?substr(line,1,i-1):""); trail=""; if (line ~ /",[[:space:]]*$/) trail=","
-            print ind "\"range\": \"" rng "\"" trail; rd=1; next
+            print ind "\"range\": \"" rng "\"" trail; next
           }
           if (in_ranges && line ~ /\]/) in_ranges=0
 
-          if (!in_ex && line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/) in_ex=1
-          if (in_ex && !ed && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
-            sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/, "\"" exc "\"", line); print line; ed=1; next
+          if (!in_ex && line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/){
+            in_ex=1
+            i=match(line,/[^[:space:]]/); exind=(i?substr(line,1,i-1):"") "  "
+            print line
+            next
           }
-          if (in_ex && line ~ /\]/) in_ex=0
-
-          if (line ~ /\}/ && !in_ranges && !in_ex) in_ipam=0
+          if (in_ex && !wrote_exc && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/){
+            trail=""; if (line ~ /",[[:space:]]*$/) trail=","
+            print exind "\"" exc "\"" trail
+            wrote_exc=1
+            next
+          }
+          if (in_ex && !wrote_exc && line ~ /^[[:space:]]*\]/){
+            print exind "\"" exc "\""
+            print line
+            in_ex=0; wrote_exc=1; next
+          }
+          if (in_ex && line ~ /\]/){ in_ex=0 }
+          if (in_ipam && !in_ranges && !in_ex && line ~ /\}/){ in_ipam=0 }
         }
       }
 
       print line
     }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
-
 # ---- normalize CRLF ----
 sed -i 's/\r$//' "$UPF" "$SMF" "$AMF" "$GV"
 
