@@ -148,23 +148,21 @@ exit 2
 RS
 
 # Read "ip|path" from server_pci_map.txt (supports name:ip:path or ip:path)
+# Read "ip|path" from server_pci_map.txt (supports name:ip:path or ip:path)
 read_server_entries(){
-  awk 'NF && $1 !~ /^#/ {
-    gsub(/
-/,"");
-    sub(/[[:space:]]+$/, "");
-    n = split($0, a, ":");
-    if (n >= 2) {
-      ip = a[2];
-      path = (n >= 3 ? a[3] : "");
-      printf "%s|%s
-", ip, path;
+  awk -F':' 'NF && $1 !~ /^#/ {
+    gsub(/\r/, "", $0);               # strip Windows CRs
+    sub(/[[:space:]]+$/, "", $0);     # strip trailing whitespace
+    if (NF >= 2) {
+      ip   = $2
+      path = (NF >= 3 ? $3 : "")
+      printf "%s|%s\n", ip, path
     } else {
-      printf "%s|
-", a[1];
+      printf "%s|\n", $1
     }
   }' "$SERVER_FILE"
 }
+
 
 remote_file_exists(){
   local ip="$1" p="$2"
