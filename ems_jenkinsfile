@@ -4,16 +4,17 @@ pipeline {
   options {
     timestamps()
     disableConcurrentBuilds()
-    timeout(time: 45, unit: 'MINUTES')  // overall guard
+    timeout(time: 45, unit: 'MINUTES') // overall guard
   }
 
   parameters {
-    string(name: 'NEW_BUILD_PATH',       defaultValue: '/home/labadmin',                     description: 'Base path where releases are staged')
-    string(name: 'NEW_VERSION',          defaultValue: '6.3.0_EA3',                          description: 'Version tag like 6.3.0_EA3')
-    string(name: 'INSTALL_SERVER_FILE',  defaultValue: 'server_pci_map.txt',                 description: 'Server map file (contents not exposed)')
-    string(name: 'NODE_NAME',            defaultValue: '',                                   description: 'Optional: server name from column 1 (blank=first)')
-    string(name: 'SSH_KEY',              defaultValue: '/var/lib/jenkins/.ssh/jenkins_key',  description: 'Private key for remote login (same as nf_config.sh)')
-    string(name: 'SSH_USER',             defaultValue: 'root',                               description: 'SSH user (same as nf_config.sh)')
+    // IMPORTANT: NEW_BUILD_PATH should point to the tag folder root used by nf_config.sh, e.g. /home/labadmin/EA3
+    string(name: 'NEW_BUILD_PATH',      defaultValue: '/home/labadmin/EA3',              description: 'Base path containing TRILLIUM_5GCN_CNF_REL_<VER> (e.g., /home/labadmin/EA3)')
+    string(name: 'NEW_VERSION',         defaultValue: '6.3.0_EA3',                       description: 'Version tag (e.g., 6.3.0_EA3)')
+    string(name: 'SERVER_FILE',         defaultValue: 'server_pci_map.txt',              description: 'Server map file used to pick target host')
+    string(name: 'HOST_NAME',           defaultValue: '',                                description: 'Optional: name filter from column 1 in server_pci_map.txt (blank = first entry)')
+    string(name: 'HOST_USER',           defaultValue: 'root',                            description: 'Remote SSH user (same as nf_config.sh)')
+    string(name: 'SSH_KEY',             defaultValue: '/var/lib/jenkins/.ssh/jenkins_key', description: 'Private key path used for SSH (same as nf_config.sh)')
   }
 
   stages {
@@ -24,11 +25,22 @@ pipeline {
     stage('EMS install & health check (remote via SSH)') {
       options { timeout(time: 15, unit: 'MINUTES') }
       steps {
-        // Ensure the script exists and is executable, then run it with bash
+        // Run your repo script that follows nf_config.sh SSH style
         sh '''
           set -e
           test -f scripts/ems_install_and_check.sh || { echo "scripts/ems_install_and_check.sh not found" >&2; exit 1; }
           chmod +x scripts/ems_install_and_check.sh
+
+          # Pass-through proxies if defined in the Jenkins env (the script will pick them up)
+          export http_proxy="${http_proxy:-}"; export https_proxy="${https_proxy:-}"; export no_proxy="${no_proxy:-}"
+          export HTTP_PROXY="${HTTP_PROXY:-}"; export HTTPS_PROXY="${HTTPS_PROXY:-}"; export NO_PROXY="${NO_PROXY:-}"
+
+          SERVER_FILE="${SERVER_FILE}" \
+          SSH_KEY="${SSH_KEY}" \
+          NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+          NEW_VERSION="${NEW_VERSION}" \
+          HOST_USER="${HOST_USER}" \
+          HOST_NAME="${HOST_NAME}" \
           /bin/bash scripts/ems_install_and_check.sh
         '''
       }
@@ -37,15 +49,15 @@ pipeline {
 
   post {
     always {
-      // Best-effort remote snapshot of EMS pods for logs
+      // Final remote snapshot for logs (best effort)
       sh '''
         set -e
-        if command -v awk >/dev/null 2>&1 && [ -n "${INSTALL_SERVER_FILE:-}" ] && [ -f "${INSTALL_SERVER_FILE}" ]; then
-          SERVER_IP="$(awk -F: '$0!~/^[[:space:]]*#/ && NF>=2 {print $2; exit}' "${INSTALL_SERVER_FILE}")"
+        if [ -f "${SERVER_FILE:-server_pci_map.txt}" ]; then
+          SERVER_IP="$(awk -F: '$0!~/^[[:space:]]*#/ && NF>=2 {print $2; exit}' "${SERVER_FILE:-server_pci_map.txt}")"
           if [ -n "$SERVER_IP" ] && command -v ssh >/dev/null 2>&1; then
             ssh -i "${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}" \
                 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                "${SSH_USER:-root}@${SERVER_IP}" -- 'kubectl get pods -A | (grep -i ems || true)' || true
+                "${HOST_USER:-root}@${SERVER_IP}" -- 'kubectl get pods -A | (grep -i ems || true)' || true
           fi
         fi
       '''.stripIndent()
