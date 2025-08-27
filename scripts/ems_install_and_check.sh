@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 # scripts/ems_install_and_check.sh
 # EMS install + EMS-only health check + GUI probe (remote via SSH)
-# Uses nf_config-style SSH; avoids remote profile loading to prevent PS1/XDG errors.
-
+# Avoids loading remote profiles to prevent PS1/XDG unbound errors.
 set -euo pipefail
 
-# ---------- Inputs ----------
+# ----- Inputs -----
 : "${SERVER_FILE:?missing SERVER_FILE}"         # e.g., server_pci_map.txt
 : "${SSH_KEY:?missing SSH_KEY}"                 # e.g., /var/lib/jenkins/.ssh/jenkins_key
-: "${NEW_BUILD_PATH:?missing NEW_BUILD_PATH}"   # e.g., /home/labadmin/EA3
+: "${NEW_BUILD_PATH:?missing NEW_BUILD_PATH}"   # e.g., /home/labadmin/EA3  (NOTE: include the tag folder)
 : "${NEW_VERSION:?missing NEW_VERSION}"         # e.g., 6.3.0_EA3
 HOST_USER="${HOST_USER:-root}"
 HOST_NAME="${HOST_NAME:-}"
 
-# EMS-only readiness controls
+# EMS-only readiness knobs
 EMS_NAMESPACE="${EMS_NAMESPACE:-}"              # blank = all namespaces
 EMS_SELECTOR="${EMS_SELECTOR:-app=ems}"        # label selector; blank -> fallback to name prefix
 EMS_NAME_PREFIX="${EMS_NAME_PREFIX:-ems}"      # used if selector yields nothing
 
-# ---------- Resolve target ----------
+# ----- Resolve target from server file -----
 pick_line() {
   if [[ -n "${HOST_NAME}" ]]; then
     awk -F: -v n="${HOST_NAME}" '$0!~/^[[:space:]]*#/ && NF>=2 && $1==n {print; exit}' "${SERVER_FILE}"
@@ -26,7 +25,6 @@ pick_line() {
     awk -F: '$0!~/^[[:space:]]*#/ && NF>=2 {print; exit}' "${SERVER_FILE}"
   fi
 }
-
 RAW="$(pick_line || true)"
 [[ -n "${RAW}" ]] || { echo "[ems] ERROR: no matching entry in ${SERVER_FILE}"; exit 2; }
 TARGET_NAME="$(printf '%s\n' "${RAW}" | awk -F: '{print $1}')"
@@ -38,7 +36,7 @@ VER="${NEW_VERSION%%_*}"
 EMS_DIR="${NEW_BUILD_PATH%/}/TRILLIUM_5GCN_CNF_REL_${VER}/nf-services/scripts"
 echo "[ems] EMS_DIR=${EMS_DIR}"
 
-# ---------- Remote runner (NO profile sourcing) ----------
+# ----- Remote runner (NO profile sourcing) -----
 REMOTE_ENV=$(cat <<'EOF'
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
 [ -z "${KUBECONFIG:-}" ] && [ -f /root/.kube/config ] && export KUBECONFIG=/root/.kube/config || true
@@ -51,7 +49,7 @@ ssh_run() {
     bash --noprofile --norc -euo pipefail -c "$1"
 }
 
-# ---------- Install EMS remotely ----------
+# ----- Install EMS remotely -----
 ssh_run "
 ${REMOTE_ENV}
 [ -d '${EMS_DIR}' ] || { echo '[remote] EMS dir not found: ${EMS_DIR}' 1>&2; exit 3; }
@@ -59,7 +57,7 @@ command -v kubectl >/dev/null 2>&1 || { echo '[remote] kubectl not found' 1>&2; 
 cd '${EMS_DIR}'; chmod +x install_ems.sh; ./install_ems.sh
 "
 
-# ---------- EMS-only readiness ----------
+# ----- EMS-only readiness -----
 echo "[ems] waiting up to 180s for EMS pods Ready (n/n) & Running…"
 
 K_NS_OPT="-A"; [ -n "${EMS_NAMESPACE}" ] && K_NS_OPT="-n ${EMS_NAMESPACE}"
@@ -78,7 +76,7 @@ list_ems() {
   fi
 }
 
-# READY/STATUS index differs for -A (namespace present)
+# READY/STATUS fields differ when -A includes NAMESPACE
 ready_idx=2; status_idx=3
 if echo \"\$K_NS_OPT\" | grep -q '^-A'; then ready_idx=3; status_idx=4; fi
 
@@ -116,7 +114,7 @@ else
 fi
 "
 
-# ---------- GUI probe ----------
+# ----- GUI probe -----
 EMS_URL="https://${TARGET_IP}.nip.io/ems/register"
 echo "[ems] probing GUI: ${EMS_URL}"
 code="$(curl -sk -o /dev/null -w '%{http_code}' "${EMS_URL}" || true)"
