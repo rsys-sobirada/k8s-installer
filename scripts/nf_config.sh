@@ -107,40 +107,105 @@ patch_key_scalar() { # file key value
   ' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
-# --- robust: update the *same* ipam block: first IPv4 "range" and first IPv4 in "exclude"
-patch_ipam_range_and_exclude() { # file CIDR excludeIPv4
+# ---- path-anchored IPAM patchers (update range & exclude in the exact blocks) ----
+patch_upf_upfsp_n4_ipam() { # file CIDR excludeIPv4
   awk -v rng="$2" -v exc="$3" '
-    BEGIN{ipam=0; in_ranges=0; in_ex=0; rd=0; ed=0}
+    function hdr(line,   i,ind,name){
+      i=match(line,/[^[:space:]]/); ind=(i?i-1:0);
+      if (match(line,/^[[:space:]]*[A-Za-z0-9_-]+:/)) {
+        name=$0; sub(/^[[:space:]]*/,"",name); sub(/:.*/,"",name); return ind "|" name;
+      }
+      return "-1|";
+    }
+    BEGIN{in_upfsp=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; rd=0; ed=0; ind_upfsp=-1; ind_n4=-1}
     {
       line=$0
-      # enter/exit ipam block
-      if (line ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) ipam=1
+      split(hdr(line),H,"|"); h_ind=H[1]+0; h_name=H[2];
 
-      if (ipam) {
-        if (line ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
-        if (line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/)   in_ex=1
+      # enter/exit upfsp:
+      if (!in_upfsp && h_name=="upfsp") { in_upfsp=1; ind_upfsp=h_ind }
+      else if (in_upfsp && h_ind>=0 && h_ind<=ind_upfsp && h_name!="upfsp") { in_upfsp=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
 
-        # replace "range": "<IPv4/mask>"
-        if (in_ranges && !rd && line ~ /"range":[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+)"/) {
-          i=match(line,/[^[:space:]]/); ind=(i?substr(line,1,i-1):"");
-          trail=""; if (line ~ /",[[:space:]]*$/) trail=","
-          print ind "\"range\": \"" rng "\"" trail
-          rd=1; next
+      # inside upfsp → track n4:
+      if (in_upfsp) {
+        if (!in_n4 && h_name=="n4") { in_n4=1; ind_n4=h_ind }
+        else if (in_n4 && h_ind>=0 && h_ind<=ind_n4 && h_name!="n4") { in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
+      }
+
+      # inside upfsp.n4 → ipam braces
+      if (in_upfsp && in_n4) {
+        if (!in_ipam && line ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) in_ipam=1
+        if (in_ipam) {
+          if (line ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
+          if (in_ranges && !rd && line ~ /"range"[[:space:]]*:[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+)"/) {
+            i=match(line,/[^[:space:]]/); ind=(i?substr(line,1,i-1):""); trail=""; if (line ~ /",[[:space:]]*$/) trail=","
+            print ind "\"range\": \"" rng "\"" trail; rd=1; next
+          }
+          if (in_ranges && line ~ /\]/) in_ranges=0
+
+          if (!in_ex && line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/) in_ex=1
+          if (in_ex && !ed && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
+            sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/, "\"" exc "\"", line); print line; ed=1; next
+          }
+          if (in_ex && line ~ /\]/) in_ex=0
+
+          if (line ~ /\}/ && !in_ranges && !in_ex) in_ipam=0
         }
+      }
 
-        # replace first IPv4 in exclude
-        if (in_ex && !ed && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
-          sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/, "\"" exc "\"", line)
-          print line
-          ed=1; next
+      print line
+    }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
+patch_smf_n4_ipam() { # file CIDR excludeIPv4
+  awk -v rng="$2" -v exc="$3" '
+    function hdr(line,   i,ind,name){
+      i=match(line,/[^[:space:]]/); ind=(i?i-1:0);
+      if (match(line,/^[[:space:]]*[A-Za-z0-9_-]+:/)) {
+        name=$0; sub(/^[[:space:]]*/,"",name); sub(/:.*/,"",name); return ind "|" name;
+      }
+      return "-1|";
+    }
+    BEGIN{in_smfTop=0; in_smf=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0; rd=0; ed=0; ind_smfTop=-1; ind_smf=-1; ind_n4=-1}
+    {
+      line=$0
+      split(hdr(line),H,"|"); h_ind=H[1]+0; h_name=H[2];
+
+      # top: smf-n4iwf:
+      if (!in_smfTop && h_name=="smf-n4iwf") { in_smfTop=1; ind_smfTop=h_ind }
+      else if (in_smfTop && h_ind>=0 && h_ind<=ind_smfTop && h_name!="smf-n4iwf") { in_smfTop=0; in_smf=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
+
+      # child: smf_n4iwf:
+      if (in_smfTop) {
+        if (!in_smf && h_name=="smf_n4iwf") { in_smf=1; ind_smf=h_ind }
+        else if (in_smf && h_ind>=0 && h_ind<=ind_smf && h_name!="smf_n4iwf") { in_smf=0; in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
+      }
+
+      # smf_n4iwf → n4:
+      if (in_smf) {
+        if (!in_n4 && h_name=="n4") { in_n4=1; ind_n4=h_ind }
+        else if (in_n4 && h_ind>=0 && h_ind<=ind_n4 && h_name!="n4") { in_n4=0; in_ipam=0; in_ranges=0; in_ex=0 }
+      }
+
+      # smf_n4iwf.n4 → ipam
+      if (in_smf && in_n4) {
+        if (!in_ipam && line ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) in_ipam=1
+        if (in_ipam) {
+          if (line ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
+          if (in_ranges && !rd && line ~ /"range"[[:space:]]*:[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+)"/) {
+            i=match(line,/[^[:space:]]/); ind=(i?substr(line,1,i-1):""); trail=""; if (line ~ /",[[:space:]]*$/) trail=","
+            print ind "\"range\": \"" rng "\"" trail; rd=1; next
+          }
+          if (in_ranges && line ~ /\]/) in_ranges=0
+
+          if (!in_ex && line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/) in_ex=1
+          if (in_ex && !ed && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
+            sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/, "\"" exc "\"", line); print line; ed=1; next
+          }
+          if (in_ex && line ~ /\]/) in_ex=0
+
+          if (line ~ /\}/ && !in_ranges && !in_ex) in_ipam=0
         }
-
-        # close sub-blocks
-        if (in_ranges && line ~ /\]/) in_ranges=0
-        if (in_ex     && line ~ /\]/) in_ex=0
-
-        # leave ipam block when both done and we see a closing brace not inside sub-blocks
-        if (!in_ranges && !in_ex && line ~ /\}/) ipam=0
       }
 
       print line
@@ -218,30 +283,68 @@ if [[ -n "${N6_PCI}" ]]; then
   }' "$UPF"
 fi
 
-# ---- N4 ipam updates (same ipam block for range + exclude) ----
+# ---- N4 ipam updates (anchored to exact blocks) ----
 if [[ -n "${N4_IN:-}" && "${N4_IN}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)\/([0-9]+)$ ]]; then
   base3="${BASH_REMATCH[1]}"; last="${BASH_REMATCH[2]}"; mask="${BASH_REMATCH[3]}"
   N4_RANGE="${base3}.${last}/${mask}"
   EXCL_UPF="${base3}.$((last+1))/32"
   EXCL_SMF="${base3}.$((last+2))/32"
 
-  patch_ipam_range_and_exclude "$UPF" "${N4_RANGE}" "${EXCL_UPF}"
-  patch_ipam_range_and_exclude "$SMF" "${N4_RANGE}" "${EXCL_SMF}"
+  patch_upf_upfsp_n4_ipam "$UPF" "${N4_RANGE}" "${EXCL_UPF}"
+  patch_smf_n4_ipam       "$SMF" "${N4_RANGE}" "${EXCL_SMF}"
   echo "[remote] N4_RANGE=${N4_RANGE}  EXCL_UPF=${EXCL_UPF}  EXCL_SMF=${EXCL_SMF}"
 else
   echo "[remote] N4_IN invalid or missing — skipping N4 edits"
 fi
 
-# ---- sanity prints ----
+# ---- sanity prints (anchored views) ----
 echo "[remote] NF checks:"
 awk '/# *NGC IP for external Communication/{p=NR+1} NR==p{print "[remote] AMF NGC line: " $0}' "$AMF" || true
 grep -nE '^[[:space:]]*externalIP:' "$AMF" | head -1 | sed 's/^/[remote] /' || true
 awk '/^ *intfConfig:/{f=1} f&&/^ *type:/{print "[remote] upf.type: "$0; f=0}' "$UPF" || true
 awk '/^ *nguInterface:/{f=1} f&&/^ *pciAddress:/{print "[remote] upf.ngu pci: "$0; f=0}' "$UPF" || true
 awk '/^ *n6Interface_0:/{f=1} f&&/^ *pciAddress:/{print "[remote] upf.n6  pci: "$0; f=0}' "$UPF" || true
-# Show first exclude IPv4 found after each exclude block header
-awk '/"exclude"[[:space:]]*:[[:space:]]*\[/{ex=1;next} ex&&/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/{print "[remote] upf.exclude: "$0; ex=0}' "$UPF" || true
-awk '/"exclude"[[:space:]]*:[[:space:]]*\[/{ex=1;next} ex&&/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/{print "[remote] smf.exclude: "$0; ex=0}' "$SMF" || true
+
+# Show exclude inside UPF → upfsp → n4
+awk '
+  function hdr(line,   i,ind,name){i=match(line,/[^[:space:]]/);ind=(i?i-1:0);
+    if (match(line,/^[[:space:]]*[A-Za-z0-9_-]+:/)) {name=$0; sub(/^[[:space:]]*/,"",name); sub(/:.*/,"",name); return ind "|" name} return "-1|"}
+  BEGIN{in_upfsp=0; in_n4=0; in_ex=0; ind_upfsp=-1; ind_n4=-1}
+  { line=$0; split(hdr(line),H,"|"); h_ind=H[1]+0; h_name=H[2];
+    if (!in_upfsp && h_name=="upfsp"){in_upfsp=1;ind_upfsp=h_ind}
+    else if (in_upfsp && h_ind>=0 && h_ind<=ind_upfsp && h_name!="upfsp"){in_upfsp=0;in_n4=0;in_ex=0}
+    if (in_upfsp){
+      if (!in_n4 && h_name=="n4"){in_n4=1;ind_n4=h_ind}
+      else if (in_n4 && h_ind>=0 && h_ind<=ind_n4 && h_name!="n4"){in_n4=0;in_ex=0}
+    }
+    if (in_upfsp && in_n4){
+      if (line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/){in_ex=1; next}
+      if (in_ex && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/){print "[remote] upf.exclude(anchor): " line; in_ex=0}
+    }
+  }' "$UPF" || true
+
+# Show exclude inside SMF → smf-n4iwf → smf_n4iwf → n4
+awk '
+  function hdr(line,   i,ind,name){i=match(line,/[^[:space:]]/);ind=(i?i-1:0);
+    if (match(line,/^[[:space:]]*[A-Za-z0-9_-]+:/)) {name=$0; sub(/^[[:space:]]*/,"",name); sub(/:.*/,"",name); return ind "|" name} return "-1|"}
+  BEGIN{in_smfTop=0; in_smf=0; in_n4=0; in_ex=0; ind_smfTop=-1; ind_smf=-1; ind_n4=-1}
+  { line=$0; split(hdr(line),H,"|"); h_ind=H[1]+0; h_name=H[2];
+    if (!in_smfTop && h_name=="smf-n4iwf"){in_smfTop=1;ind_smfTop=h_ind}
+    else if (in_smfTop && h_ind>=0 && h_ind<=ind_smfTop && h_name!="smf-n4iwf"){in_smfTop=0;in_smf=0;in_n4=0;in_ex=0}
+    if (in_smfTop){
+      if (!in_smf && h_name=="smf_n4iwf"){in_smf=1;ind_smf=h_ind}
+      else if (in_smf && h_ind>=0 && h_ind<=ind_smf && h_name!="smf_n4iwf"){in_smf=0;in_n4=0;in_ex=0}
+    }
+    if (in_smf){
+      if (!in_n4 && h_name=="n4"){in_n4=1;ind_n4=h_ind}
+      else if (in_n4 && h_ind>=0 && h_ind<=ind_n4 && h_name!="n4"){in_n4=0;in_ex=0}
+    }
+    if (in_smf && in_n4){
+      if (line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/){in_ex=1; next}
+      if (in_ex && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/){print "[remote] smf.exclude(anchor): " line; in_ex=0}
+    }
+  }' "$SMF" || true
+
 grep -nE '"range"|exclude' "$UPF" "$SMF" | sed "s|${NF_ROOT}/||" || true
 
 echo "[remote] ✅ NF config complete on ${HOST_IP}"
