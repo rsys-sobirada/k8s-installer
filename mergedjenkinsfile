@@ -1,669 +1,587 @@
-// ================== Parameters (Active Choices, ordered as requested) ==================
-properties([
-  parameters([
-    // 1) Deployment type
-    choice(
-      name: 'DEPLOYMENT_TYPE',
-      choices: 'Low\nMedium\nHigh',
-      description: 'Deployment type'
-    ),
+#!/usr/bin/env bash
+# scripts/cluster_reset.sh
+if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
+# Takes OLD_BUILD_PATH per-server from server_pci_map.txt (ignores UI OLD_BUILD_PATH).
+# Flow:
+# 1) Detect Kubernetes on host
+# 2) Ensure requirements.txt under old build's kubespray; if missing, start install_k8s.sh and monitor
+# 3) When requirements.txt appears, stop installer, swap in Jenkins reset.yml + inventory,
+#    run ./uninstall_k8s.sh with retries; restore swaps.
 
-    // 2) Install mode (controls OLD_BUILD_PATH visibility)
-    choice(
-      name: 'INSTALL_MODE',
-      choices: 'Upgrade_with_cluster_reset\nUpgrade_without_cluster_reset\nFresh_installation',
-      description: 'Select installation mode'
-    ),
+set -euo pipefail
 
-    // 3) OLD_BUILD_PATH shown only for Upgrade_* modes (kept for UI)
-    [
-      $class: 'DynamicReferenceParameter',
-      name: 'OLD_BUILD_PATH_UI',
-      description: 'Base dir of OLD_VERSION (shown only for Upgrade modes)',
-      referencedParameters: 'INSTALL_MODE',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def mode = (INSTALL_MODE ?: "").toString()
-if (mode == 'Fresh_installation') return ""
-return """<input class='setting-input' name='value' type='text' value='/home/labadmin'/>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
+# ===== Inputs =====
+CR="${CLUSTER_RESET:-Yes}"                         # gate (Yes/True/1 to run)
+SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
+SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}"   # lines: name:ip:path  |  ip:path
+KSPRAY_DIR="${KSPRAY_DIR:-kubespray-2.27.0}"
+K8S_VER="${K8S_VER:-1.31.4}"
+OLD_VERSION="${OLD_VERSION:-}"                     # e.g. 6.3.0_EA2 or 6.3.0
 
-    // 4) New build path
-    string(name: 'NEW_BUILD_PATH',
-           defaultValue: '/home/labadmin',
-           description: 'Base dir to place NEW_VERSION (and extract)'),
+RESET_YML_WS="${RESET_YML_WS:-$WORKSPACE/reset.yml}"
+REQ_WAIT_SECS="${REQ_WAIT_SECS:-360}"
+RETRY_COUNT="${RETRY_COUNT:-3}"
+RETRY_DELAY_SECS="${RETRY_DELAY_SECS:-10}"
+INSTALL_NAME="${INSTALL_NAME:-install_k8s.sh}"
+UNINSTALL_NAME="${UNINSTALL_NAME:-uninstall_k8s.sh}"
+REL_SUFFIX="${REL_SUFFIX:-}"                       # optional suffix in TRILLIUM dir name
 
-    // 5) New version
-    choice(name: 'NEW_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2\n6.3.0_EA3',
-           description: 'Target bundle (may have suffix, e.g. 6.3.0_EA2)'),
+# Optional inputs for alias IP ensure (same semantics as install)
+: "${INSTALL_IP_ADDR:=}"                           # e.g. 10.10.10.20/24 ; if empty, skipped
+: "${INSTALL_IP_IFACE:=}"                          # optional explicit iface
 
-    // 6) Old version
-    choice(name: 'OLD_VERSION',
-           choices: '6.2.0_EA6\n6.3.0\n6.3.0_EA1\n6.3.0_EA2\n6.3.0_EA3',
-           description: 'Existing bundle (used if upgrading)'),
+# ---- NEW (IP Monitor) ----
+IP_MONITOR_INTERVAL="${IP_MONITOR_INTERVAL:-30}"   # seconds between checks
 
-    // 7) Fetch toggle
-    booleanParam(name: 'FETCH_BUILD',
-           defaultValue: true,
-           description: 'Fetch NEW_VERSION from build host to CN servers'),
+# ===== Gate & validation =====
+shopt -s nocasematch
+if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
+  echo ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
+  exit 0
+fi
+shopt -u nocasematch
 
-    // 8) Host (visible only if FETCH_BUILD truthy)
-    [
-      $class: 'DynamicReferenceParameter',
-      name: 'BUILD_SRC_HOST',
-      description: 'Build repo host',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
-def enabled = ['true','on','1','yes','y'].contains(fb)
-if (!enabled) return ""
-return """<select class='setting-input' name='value'>
-           <option value="172.26.2.96">172.26.2.96</option>
-           <option value="172.26.2.95">172.26.2.95</option>
-         </select>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
+[[ -f "$SSH_KEY" ]]      || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
+chmod 600 "$SSH_KEY" || true
+[[ -f "$SERVER_FILE" ]]  || { echo "❌ $SERVER_FILE not found"; exit 1; }
+[[ -f "$RESET_YML_WS" ]] || { echo "❌ Jenkins reset.yml not found: $RESET_YML_WS"; exit 1; }
+[[ -n "$OLD_VERSION" ]]  || { echo "❌ OLD_VERSION is required (e.g. 6.3.0_EA2)"; exit 1; }
 
-    // 9) User (visible only if FETCH_BUILD truthy)
-    [
-      $class: 'DynamicReferenceParameter',
-      name: 'BUILD_SRC_USER',
-      description: 'Build repo user',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
-def enabled = ['true','on','1','yes','y'].contains(fb)
-if (!enabled) return ""
-return """<select class='setting-input' name='value'>
-           <option value="sobirada">sobirada</option>
-           <option value="labadmin">labadmin</option>
-         </select>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
+# ===== Helpers =====
+log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
+ver_num(){ echo "${1%%_*}"; }   # 6.3.0_EA1 -> 6.3.0
+ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }
 
-    // 10) Base path (visible only if FETCH_BUILD truthy)
-    [
-      $class: 'DynamicReferenceParameter',
-      name: 'BUILD_SRC_BASE',
-      description: 'Path on build host containing the tar.gz files',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
-def enabled = ['true','on','1','yes','y'].contains(fb)
-if (!enabled) return ""
-return """<input class='setting-input' name='value' type='text' value='/CNBuild/6.3.0_EA2'/>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
+SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
 
-    // 11) Password (Active Choices; conditional; visually masked)
-    [
-      $class: 'DynamicReferenceParameter',
-      name: 'BUILD_SRC_PASS',
-      description: 'Build host password (for SCP/SSH from build repo)',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [
-        $class: 'GroovyScript',
-        script: [
-          script: '''
-def fb = (FETCH_BUILD ?: "").toString().trim().toLowerCase()
-def enabled = ['true','on','1','yes','y'].contains(fb)
-if (!enabled) return ""
-return """<input type='password' class='setting-input' name='value' value=''/>"""
-''',
-          sandbox: true,
-          classpath: []
-        ],
-        fallbackScript: [ script: 'return ""', sandbox: true, classpath: [] ]
-      ]
-    ],
+# Version-safe path normalizer (prevents double-versioning; probes EA/non-EA)
+normalize_k8s_path() {
+  local base="${1%/}" old_ver="$2"
 
-    // 12) Alias IP/CIDR
-    string(name: 'INSTALL_IP_ADDR',
-           defaultValue: '10.10.10.20/24',
-           description: 'Alias IP/CIDR to plumb on CN servers'),
+  # 1) Already a full k8s root → return as-is
+  if [[ "$base" =~ /common/tools/install/k8s-v[^/]+$ ]]; then
+    echo "$base"; return
+  fi
 
-    // Optional: bootstrap password to push Jenkins key once if key login not ready
-    password(name: 'CN_BOOTSTRAP_PASS', description: 'One-time CN root password (to push Jenkins key if needed).')
-  ])
-])
+  # 2) Already at TRILLIUM install dir → just add k8s-v
+  if [[ "$base" =~ /TRILLIUM_5GCN_CNF_REL_[0-9]+\.[0-9]+\.[0-9]+[^/]*/common/tools/install$ ]]; then
+    echo "$base/k8s-v${K8S_VER}"; return
+  fi
 
-// =================================== Pipeline ===================================
-pipeline {
-  agent any
-  options { timestamps(); disableConcurrentBuilds() }
+  # 3) If base ends with ".../<num>[/EAx]" use version/tag from path and PROBE remote
+  if [[ "$base" =~ /([0-9]+\.[0-9]+\.[0-9]+)(/(EA[0-9]+))?$ ]]; then
+    local num_in_path tag_in_path rel_with rel_without
+    num_in_path="$(printf '%s\n' "$base" | sed -n 's#.*/\([0-9]\+\.[0-9]\+\.[0-9]\+\)\(/\(EA[0-9]\+\)\)\?$#\1#p')"
+    tag_in_path="$(printf '%s\n' "$base" | sed -n 's#.*/[0-9]\+\.[0-9]\+\.[0-9]\+\(/\(EA[0-9]\+\)\)\?$#\2#p' | sed 's#^/##')"
 
-  environment {
-    SERVER_FILE = 'server_pci_map.txt'                       // \u2714 keep inputs ONLY in this file (hidden from GUI)
-    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'        // root key used to reach CN
-    K8S_VER     = '1.31.4'
-    EXTRACT_BUILD_TARBALLS = 'false'
-    HEALTH_RETRY_WAIT_SECS = '300'
-    HEALTH_RETRIES          = '1'
-    PS_STAGE_TIMEOUT_MIN    = '60'
-    CS_STAGE_TIMEOUT_MIN    = '60'
-    INSTALL_IP_ADDR  = "${params.INSTALL_IP_ADDR}"          // ensure param override is available
+    rel_with="TRILLIUM_5GCN_CNF_REL_${num_in_path}${tag_in_path:+_${tag_in_path}}"
+    rel_without="TRILLIUM_5GCN_CNF_REL_${num_in_path}"
+
+    local cand_with="$base/${rel_with}/common/tools/install/k8s-v${K8S_VER}"
+    local cand_wo="$base/${rel_without}/common/tools/install/k8s-v${K8S_VER}"
+
+    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_with"; then
+      echo "$cand_with"; return
+    elif ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_wo"; then
+      echo "$cand_wo"; return
+    else
+      echo "$cand_wo"; return
+    fi
+  fi
+
+  # 4) If base ends right at ".../common/tools/install" without k8s-v
+  if [[ "$base" =~ /common/tools/install$ ]]; then
+    echo "$base/k8s-v${K8S_VER}"; return
+  fi
+
+  # 5) Fallback: use OLD_VERSION to build under base, then probe both TRILLIUM variants
+  local num tag rel_with rel_without parent cand_with cand_wo
+  num="${old_ver%%_*}"
+  tag=""; [[ "$old_ver" == *_* ]] && tag="${old_ver##*_}"
+  rel_with="TRILLIUM_5GCN_CNF_REL_${num}${tag:+_${tag}}"
+  rel_without="TRILLIUM_5GCN_CNF_REL_${num}"
+
+  parent="$base/${num}${tag:+/${tag}}"
+  cand_with="$parent/${rel_with}/common/tools/install/k8s-v${K8S_VER}"
+  cand_wo="$parent/${rel_without}/common/tools/install/k8s-v${K8S_VER}"
+
+  if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_with"; then
+    echo "$cand_with"
+  elif ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_wo"; then
+    echo "$cand_wo"
+  else
+    echo "$cand_wo"
+  fi
+}
+
+# Robust alias-IP ensure snippet (present → no-op; missing → add)
+read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
+set -euo pipefail
+IP_CIDR="$1"; FORCE_IFACE="${2-}"
+IP_ONLY="${IP_CIDR%%/*}"
+is_present(){ ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY"; }
+echo "[IP] Ensuring ${IP_CIDR}"
+if is_present; then
+  echo "[IP] Already present: ${IP_ONLY}"
+  exit 0
+fi
+declare -a CAND=()
+[[ -n "$FORCE_IFACE" ]] && CAND+=("$FORCE_IFACE")
+DEF_IF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
+[[ -n "${DEF_IF:-}" ]] && CAND+=("$DEF_IF")
+while IFS= read -r ifc; do CAND+=("$ifc"); done < <(
+  ip -o link | awk -F': ' '{print $2}' \
+    | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
+    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
+    | sort -u
+)
+for IF in "${CAND[@]}"; do
+  [[ -z "$IF" ]] && continue
+  echo "[IP] Trying ${IP_CIDR} on iface ${IF}..."
+  ip link set dev "$IF" up || true
+  if ip addr replace "$IP_CIDR" dev "$IF" 2>"/tmp/ip_err_${IF}.log"; then
+    ip -4 addr show dev "$IF" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY" && { echo "[IP] OK on ${IF}"; exit 0; }
+  fi
+done
+echo "[IP] ERROR: Could not plumb ${IP_CIDR} (tried: ${CAND[*]})"
+exit 2
+RS
+
+# Read "ip|path" from server_pci_map.txt (supports name:ip:path or ip:path)
+read_server_entries(){
+  awk 'NF && $1 !~ /^#/ {
+    gsub(/\r/,"");           # strip Windows CRs
+    sub(/[[:space:]]+$/,""); # strip trailing whitespace
+    n=split($0,a,":")
+    if(n==3){ printf "%s|%s\n", a[2], a[3] }      # name:ip:path
+    else if(n==2){ printf "%s|%s\n", a[1], a[2] } # ip:path
+    else { printf "%s|\n", a[1] }                 # ip only (no path)
+  }' "$SERVER_FILE"
+}
+
+remote_file_exists(){
+  local ip="$1" p="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$p" <<'EOF'
+set -euo pipefail; p="$1"; [[ -e "$p" ]]
+EOF
+}
+
+remote_cluster_present(){
+  local ip="$1"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail <<'EOF'
+set +e
+if command -v kubectl >/dev/null 2>&1; then
+  kubectl get nodes --no-headers 2>/dev/null | grep -q . && exit 0
+  kubectl get pods  -A --no-headers 2>/dev/null | grep -q . && exit 0
+fi
+exit 1
+EOF
+}
+
+start_installer_bg(){
+  local ip="$1" sp="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$INSTALL_NAME" <<'EOF'
+set -euo pipefail
+SP="$1"; NAME="$2"
+cd "$SP"
+if [[ -x "./$NAME" || -f "./$NAME" ]]; then
+  ( setsid bash -c "yes yes | bash ./$NAME" > install.log 2>&1 & echo $! > install.pid )
+  PGID="$(ps -o pgid= -p "$(cat install.pid)" | tr -d ' ')"
+  echo "$PGID" > install.pgid
+  echo "[START] $NAME pid=$(cat install.pid) pgid=$PGID"
+else
+  echo "❌ $NAME not found in $(pwd)"; exit 127
+fi
+EOF
+}
+
+stop_installer_pg(){
+  local ip="$1" sp="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" <<'EOF'
+set +e
+SP="$1"; cd "$SP" 2>/dev/null || exit 0
+echo "[STOP] Pre-kill:"; pgrep -a -f 'install_k8s.sh|ansible-playbook|kubespray' || true
+[[ -f install.pgid ]] && PGID="$(tr -d ' ' < install.pgid 2>/dev/null)" && [[ -n "$PGID" ]] && { kill -TERM -"$PGID" 2>/dev/null; sleep 2; kill -KILL -"$PGID" 2>/dev/null; }
+[[ -f install.pid  ]] && PID="$(tr -d ' ' < install.pid  2>/dev/null)" && [[ -n "$PID"  ]] && { kill -TERM "$PID"    2>/dev/null; sleep 2; kill -KILL "$PID"    2>/dev/null; }
+pkill -f 'install_k8s.sh' 2>/dev/null || true
+pkill -f 'ansible-playbook.*kubespray' 2>/dev/null || true
+rm -f install.pid install.pgid 2>/dev/null || true
+echo "[STOP] Post-kill:"; pgrep -a -f 'install_k8s.sh|ansible-playbook|kubespray' || true
+exit 0
+EOF
+}
+
+push_reset_override(){
+  local ip="$1" sp="$2" swap_id="$3"
+  local remote_tmp="/tmp/ci_reset_${swap_id}.yml"
+  scp $SSH_OPTS -i "$SSH_KEY" "$RESET_YML_WS" "root@$ip:${remote_tmp}"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$KSPRAY_DIR" "$remote_tmp" "$swap_id" <<'EOF'
+set -euo pipefail
+SP="$1"; KS="$2"; TMP="$3"; ID="$4"
+BASE="$SP/$KS"
+TGT=""
+if [[ -f "$BASE/playbooks/reset.yml" || ! -f "$BASE/reset.yml" ]]; then
+  mkdir -p "$BASE/playbooks"; TGT="$BASE/playbooks/reset.yml"
+else
+  TGT="$BASE/reset.yml"
+fi
+BK="/tmp/reset_backup_${ID}.yml"; [[ -f "$TGT" ]] && cp -f "$TGT" "$BK" || : > "$BK"
+mv -f "$TMP" "$TGT"
+CTX="/tmp/reset_swap_ctx_${ID}"; printf "TGT=%s\nBK=%s\n" "$TGT" "$BK" > "$CTX"
+echo "[SWAP] reset.yml -> $TGT (backup $BK)"
+EOF
+}
+
+restore_reset_override(){
+  local ip="$1" swap_id="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$swap_id" <<'EOF'
+set +e
+ID="$1"; CTX="/tmp/reset_swap_ctx_${ID}"; [[ -f "$CTX" ]] || { echo "[RESTORE] reset: no ctx"; exit 0; }
+. "$CTX"
+mkdir -p "$(dirname "$TGT")"
+if [[ -s "$BK" ]]; then mv -f "$BK" "$TGT"; echo "[RESTORE] reset: restored $TGT"; else rm -f "$TGT"; echo "[RESTORE] reset: removed temp"; fi
+rm -f "$CTX" 2>/dev/null || true
+EOF
+}
+
+push_inventory_override(){
+  local ip="$1" sp="$2" swap_id="$3"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$KSPRAY_DIR" "$swap_id" <<'EOF'
+set -euo pipefail
+SP="$1"; KS="$2"; ID="$3"
+INV_SAMPLE="$SP/$KS/inventory/sample/hosts.yaml"
+INV_REAL="$SP/k8s-yamls/hosts.yaml"
+[[ -f "$INV_REAL" ]] || { echo "[ERROR] Missing real inventory $INV_REAL"; exit 2; }
+mkdir -p "$(dirname "$INV_SAMPLE")"
+BK="/tmp/inventory_backup_${ID}.yml"; [[ -f "$INV_SAMPLE" ]] && cp -f "$INV_SAMPLE" "$BK" || : > "$BK"
+cp -f "$INV_REAL" "$INV_SAMPLE"
+CTX="/tmp/inventory_swap_ctx_${ID}"; printf "INV_SAMPLE=%s\nBK=%s\n" "$INV_SAMPLE" "$BK" > "$CTX"
+echo "[SWAP] inventory: $INV_SAMPLE ← $INV_REAL (backup $BK)"
+EOF
+}
+
+restore_inventory_override(){
+  local ip="$1" swap_id="$2"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$swap_id" <<'EOF'
+set +e
+ID="$1"; CTX="/tmp/inventory_swap_ctx_${ID}"; [[ -f "$CTX" ]] || { echo "[RESTORE] inventory: no ctx"; exit 0; }
+. "$CTX"
+mkdir -p "$(dirname "$INV_SAMPLE")"
+if [[ -s "$BK" ]]; then mv -f "$BK" "$INV_SAMPLE"; echo "[RESTORE] inventory: restored $INV_SAMPLE"; else rm -f "$INV_SAMPLE"; echo "[RESTORE] inventory: removed temp"; fi
+rm -f "$CTX" 2>/dev/null || true
+EOF
+}
+
+run_uninstall_with_retries(){
+  local ip="$1" sp="$2"
+  local attempt=1
+  while (( attempt <= RETRY_COUNT )); do
+    echo "🧹 Running $UNINSTALL_NAME on $ip (attempt $attempt/$RETRY_COUNT)..."
+    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$UNINSTALL_NAME" "${INSTALL_IP_ADDR:-}" "${INSTALL_IP_IFACE:-}" "${IP_MONITOR_INTERVAL:-30}" <<'EOF'
+set -euo pipefail
+SP="$1"; NAME="$2"; CIDR="\${3:-}"; IFACE_PIN="\${4:-}"; INTERVAL="\${5:-30}"
+cd "$SP"
+sed -i 's/\r$//' "$NAME" 2>/dev/null || true
+
+# ---- Inline alias IP watchdog (keeps INSTALL_IP_ADDR present during uninstall) ----
+if [[ -n "\${CIDR:-}" ]]; then
+  IP="\${CIDR%%/*}"
+  LOG="/var/log/alias_ipmon.log"
+
+  ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG"; }
+  is_present(){ ip -4 addr show | awk '/inet /{print \$2}' | cut -d/ -f1 | grep -qx "$IP"; }
+  pick_if(){
+    if [[ -n "$IFACE_PIN" ]]; then echo "$IFACE_PIN"; return; fi
+    local d; d=\$(ip route 2>/dev/null | awk '/^default/{print \$5; exit}')
+    [[ -n "\$d" ]] && { echo "\$d"; return; }
+    ip -o link | awk -F': ' '{print \$2}' | sed 's/@.*//' \
+      | grep -E '^(en|eth|ens|eno|em|bond|br)' \
+      | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' | head -n1
+  }
+  ensure_once(){
+    local IF; IF="\$(pick_if)"; [[ -n "\$IF" ]] || { ipmon_log "no iface"; return 1; }
+    ip link set dev "\$IF" up || true
+    if ip addr replace "$CIDR" dev "\$IF" 2>/tmp/ipmon_err.log; then
+      sleep 1; is_present && { ipmon_log "ensured $CIDR on \$IF"; return 0; }
+    fi
+    ipmon_log "failed to add $CIDR on \$IF: \$(tr -d \\n </tmp/ipmon_err.log 2>/dev/null || true)"; return 1
   }
 
-  stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
+  mkdir -p "/var/log" 2>/dev/null || true; : >>"\$LOG" || true
+  ipmon_log "inline watch start for $CIDR (iface=\${IFACE_PIN:-auto}, interval=\${INTERVAL}s)"
+  ! is_present && ensure_once || true
 
-    stage('Show inputs') {
-      steps {
-        echo "INSTALL_MODE='${params.INSTALL_MODE}'  FETCH_BUILD='${params.FETCH_BUILD}'  NEW_VERSION='${params.NEW_VERSION}'  OLD_VERSION='${params.OLD_VERSION}'  INSTALL_IP_ADDR='${params.INSTALL_IP_ADDR}'"
-      }
-    }
-
-    // \u2705 Preflight: ensure SSH + ensure alias IP (add only if missing; IP-only check)
-    stage('Preflight SSH to CNs') {
-      steps {
-        timeout(time: 10, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
-set -euo pipefail
-: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
-
-PUB_KEY_FILE="${SSH_KEY}.pub"
-if [ ! -s "${PUB_KEY_FILE}" ]; then
-  echo "[preflight] Generating Jenkins SSH key at ${SSH_KEY} (no passphrase)…"
-  install -m 700 -d "$(dirname "${SSH_KEY}")"
-  ssh-keygen -q -t rsa -N "" -f "${SSH_KEY}"
-fi
-
-HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
-[ -n "${HOSTS}" ] || { echo "[preflight] ERROR: No hosts parsed from ${SERVER_FILE}"; exit 2; }
-echo "[preflight] Hosts: ${HOSTS}"
-
-push_key_if_needed() {
-  local host="$1"
-  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true 2>/dev/null; then
-    echo "[preflight] ${host}: ✅ key login OK"
-    return 0
+  # reactive watcher
+  if command -v ip >/dev/null 2>&1; then
+    ( ip monitor address 2>/dev/null | while read -r _; do
+        ! is_present && { ipmon_log "addr change; restoring $CIDR"; ensure_once || true; }
+      done ) &
+    MON_PID=\$!
+    trap '[[ -n "\${MON_PID:-}" ]] && kill "\$MON_PID" 2>/dev/null || true' EXIT
   fi
-  if [ -n "${CN_BOOTSTRAP_PASS:-}" ]; then
-    if ! command -v sshpass >/dev/null 2>&1; then
-      echo "[preflight] ERROR: sshpass required but not installed on the Jenkins agent."
-      exit 2
-    fi
-    echo "[preflight] ${host}: ⛏️ pushing Jenkins key via password…"
-    sshpass -p "${CN_BOOTSTRAP_PASS}" \
-      ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-      "root@${host}" 'install -m700 -d /root/.ssh; touch /root/.ssh/authorized_keys; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys'
-    sshpass -p "${CN_BOOTSTRAP_PASS}" \
-      scp -o StrictHostKeyChecking=no "${PUB_KEY_FILE}" "root@${host}:/root/.jenkins_key.pub.tmp"
-    sshpass -p "${CN_BOOTSTRAP_PASS}" \
-      ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-      "root@${host}" 'grep -Fxf /root/.jenkins_key.pub.tmp /root/.ssh/authorized_keys >/dev/null || cat /root/.ssh/.jenkins_key.pub.tmp >> /root/.ssh/authorized_keys; rm -f /root/.jenkins_key.pub.tmp'
-    ssh-keygen -R "${host}" >/dev/null 2>&1 || true
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" 'echo "[preflight] ✅ key login OK on $(hostname)"'
-  else
-    echo "[preflight] ${host}: ❌ key login failed and CN_BOOTSTRAP_PASS not provided"
-    return 1
-  fi
-}
 
-# --- SSH key preflight ---
-fail=0
-for h in ${HOSTS}; do
-  echo "[preflight] Testing ${h}…"
-  push_key_if_needed "${h}" || fail=1
-done
-
-if [ "${fail}" -ne 0 ]; then
-  echo "[preflight] ❌ One or more hosts failed SSH preflight."
-  exit 1
+  # periodic safety loop
+  ( while true; do
+      ! is_present && { ipmon_log "periodic restore; adding $CIDR"; ensure_once || true; }
+      sleep "\$INTERVAL"
+    done ) &
 fi
+# ---- end inline watchdog ----
 
-# --- Alias IP ensure (stream logs; capture SSH rc) ---
-echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
-fail=0
-for h in ${HOSTS}; do
-  echo "[alias-ip][${h}] ▶ start"
-  set -o pipefail
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" \
-      "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' bash -s -- '${INSTALL_IP_ADDR}'" \
-      2>&1 < scripts/alias_ip.sh | sed "s/^/[alias-ip][${h}] /"
-  rc=${PIPESTATUS[0]:-$?}
-  echo "[alias-ip][${h}] ◀ exit code=${rc}"
-  [ "${rc}" -eq 0 ] || fail=1
-done
-
-[ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
-
-echo "[preflight] ✅ All CNs accept Jenkins key & alias IP ensured. Proceeding."
-'''
-        }
-      }
-    }
-
-    stage('Validate inputs') {
-      steps {
-        script {
-          if ((params.INSTALL_MODE ?: '').toString().trim() != 'Fresh_installation' &&
-              !((params.OLD_BUILD_PATH_UI ?: '').toString().trim())) {
-            error "OLD_BUILD_PATH is required for ${params.INSTALL_MODE}"
-          }
-        }
-      }
-    }
-
-    // -------- Pre-bootstrap: Fresh_installation only --------
-    stage('Pre-bootstrap keys (Fresh only)') {
-      when { expression { (params.INSTALL_MODE ?: '').toString().trim() == 'Fresh_installation' } }
-      steps {
-        timeout(time: 10, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
-set -euo pipefail
-
-: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
-ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
-
-HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
-echo "[bootstrap][runner] Hosts: ${HOSTS}"
-echo "[bootstrap][runner] Alias IP: ${ALIAS_IP}  (from ${INSTALL_IP_ADDR})"
-
-for h in ${HOSTS}; do
-  # ensure alias exists first so the ssh-copy-id step can reach it
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
-    set -euo pipefail
-    ip -4 addr show | awk "/inet /{print \$2}" | grep -qx '"${INSTALL_IP_ADDR}"' || {
-      DEFIF=$(ip route | awk "/^default/{print \$5; exit}")
-      ip link set dev "${DEFIF}" up || true
-      ip addr add '"${INSTALL_IP_ADDR}"' dev "${DEFIF}"
-    }
-    ip -4 addr show | grep -q '"${INSTALL_IP_ADDR}"' && echo "[IP] Present: ${INSTALL_IP_ADDR}" || { echo "[IP] Failed to plumb ${INSTALL_IP_ADDR}"; exit 2; }
-  '
-done
-'''
-        }
-      }
-    }
-
-    // -------- Reset &/or Fetch (parallel) --------
-    stage('Reset &/or Fetch (parallel)') {
-      parallel {
-        stage('Cluster reset (auto from INSTALL_MODE)') {
-          when { expression { (params.INSTALL_MODE ?: '').toString().trim() == 'Upgrade_with_cluster_reset' } }
-          steps {
-            timeout(time: 15, unit: 'MINUTES', activity: true) {
-              sh '''#!/usr/bin/env bash
-sh '''
-#!/usr/bin/env bash
-set -euo pipefail
-echo ">>> Cluster reset starting (INSTALL_MODE=${INSTALL_MODE})"
-sed -i 's/\r$//' scripts/cluster_reset.sh || true
-chmod +x scripts/cluster_reset.sh
-bash -euo pipefail scripts/cluster_reset.sh
-'''
-env \
-  CLUSTER_RESET=true \
-  OLD_VERSION="${OLD_VERSION}" \
-  OLD_BUILD_PATH="${OLD_BUILD_PATH_UI}" \
-  K8S_VER="${K8S_VER}" \
-  KSPRAY_DIR="kubespray-2.27.0" \
-  RESET_YML_WS="$WORKSPACE/reset.yml" \
-  SSH_KEY="${SSH_KEY}" \
-  SERVER_FILE="${SERVER_FILE}" \
-  REQ_WAIT_SECS="360" \
-  RETRY_COUNT="3" \
-  RETRY_DELAY_SECS="10" \
-bash -euo pipefail scripts/cluster_reset.sh
-
-touch "$WORKSPACE/.cluster_reset_done"
-echo "[reset] Wrote marker $WORKSPACE/.cluster_reset_done"
-'''
-            }
-          }
-        }
-
-        stage('Fetch build to CN (optional)') {
-          when { expression { return params.FETCH_BUILD } }
-          steps {
-            timeout(time: 20, unit: 'MINUTES', activity: true) {
-              sh '''#!/usr/bin/env bash
-set -eu
-sed -i 's/\r$//' scripts/fetch_build.sh || true
-chmod +x scripts/fetch_build.sh
-
-if [ -n "${BUILD_SRC_PASS:-}" ]; then
-  if ! command -v sshpass >/dev/null 2>&1; then
-    echo "ERROR: sshpass is required on this agent for password-based SCP/SSH to BUILD_SRC_HOST." >&2
-    exit 2
-  fi
-fi
-
-echo "Targets from ${SERVER_FILE}:"
-awk 'NF && $1 !~ /^#/' "${SERVER_FILE}" || true
-
-NEW_VERSION="${NEW_VERSION}" \
-NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-SERVER_FILE="${SERVER_FILE}" \
-BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
-BUILD_SRC_USER="${BUILD_SRC_USER}" \
-BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
-BUILD_SRC_PASS="${BUILD_SRC_PASS:-}" \
-CN_SSH_KEY="${SSH_KEY}" \
-EXTRACT_BUILD_TARBALLS="${EXTRACT_BUILD_TARBALLS}" \
-bash -euo pipefail scripts/fetch_build.sh
-'''
-            }
-          }
-        }
-      }
-    }
-
-    // -------- Cluster install gated on reset marker when required --------
-    stage('Cluster install') {
-      steps {
-        timeout(time: 20, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
-set -euo pipefail
-
-if [ "${INSTALL_MODE:-}" = "Upgrade_with_cluster_reset" ] && [ ! -f "$WORKSPACE/.cluster_reset_done" ]; then
-  echo "[gate] INSTALL_MODE=Upgrade_with_cluster_reset but reset marker not found: $WORKSPACE/.cluster_reset_done"
-  echo "[gate] This usually means the reset stage didn't run or failed."
-  exit 2
-fi
-
-echo ">>> Cluster install starting (mode: ${INSTALL_MODE})"
-sed -i 's/\r$//' scripts/cluster_install.sh || true
-chmod +x scripts/cluster_install.sh
-
-run_install() {
-  env \
-    NEW_VERSION="${NEW_VERSION}" \
-    NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-    K8S_VER="${K8S_VER}" \
-    KSPRAY_DIR="kubespray-2.27.0" \
-    INSTALL_SERVER_FILE="${SERVER_FILE}" \
-    INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
-    SSH_KEY="${SSH_KEY}" \
-    INSTALL_MODE="${INSTALL_MODE}" \
-    INSTALL_RETRY_COUNT="1" \
-    INSTALL_RETRY_DELAY_SECS="10" \
-    BUILD_WAIT_SECS="300" \
-  bash -euo pipefail scripts/cluster_install.sh | tee /tmp/cluster_install.out
-}
-
-# 1st attempt
-set +e
-run_install
-RC=$?
-set -e
-
-if grep -q "Permission denied (publickey,password)" /tmp/cluster_install.out; then
-  echo "[auto-recovery] SSH permission denied detected → bootstrap keys and retry."
-  ALIAS_IP="${INSTALL_IP_ADDR%%/*}"
-  HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
-  for h in ${HOSTS}; do
-    ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" bash -lc '
-      set -euo pipefail
-      cat > /root/bootstrap_keys.sh <<'"'"'EOF'"'"'
-#!/usr/bin/env bash
-set -euo pipefail
-IP="$1"
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa
-ssh-copy-id root@"${IP}"
-cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
-ssh-keygen -f "/root/.ssh/known_hosts" -R "${IP}"
-systemctl restart sshd
+bash -x "./$NAME"
 EOF
-      chmod +x /root/bootstrap_keys.sh
-      /root/bootstrap_keys.sh '"${ALIAS_IP}"'
-    '
+    then
+      echo "✅ Uninstall succeeded on $ip"; return 0
+    fi
+    echo "⚠️ Uninstall attempt $attempt failed on $ip"
+    ((attempt++))
+    (( attempt <= RETRY_COUNT )) && { echo "🔁 Retrying in ${RETRY_DELAY_SECS}s..."; sleep "$RETRY_DELAY_SECS"; }
+  done
+  echo "❌ Uninstall failed after $RETRY_COUNT attempts on $ip"; return 1
+}
+
+# ===== NEW: IP monitor helpers (start/stop, hardened & logged) =====
+declare -a IP_MON_IDS=()  # "<ip>|<tag>"
+
+start_ip_monitor(){
+  local ip="$1" ip_cidr="$2" iface="$3"
+  [[ -z "$ip_cidr" ]] && { echo "[IPMON][$ip] skipped (INSTALL_IP_ADDR empty)"; return 0; }
+
+  # Stable one-per-host+CIDR tag
+  local cidr_sanitized="${ip_cidr//\//_}"               # e.g. 10.10.10.20_24
+  local tag="ipmon_${ip//./-}_${cidr_sanitized}"
+  IP_MON_IDS+=("$ip|$tag")
+
+  local remote="/tmp/${tag}"
+  local sh="${remote}.sh"
+  local pidf="${remote}.pid"
+  local pgf="${remote}.pgid"
+  local log="/var/log/alias_ipmon.log"
+
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -eo pipefail -s -- \
+      "${ip_cidr:-}" "${iface:-}" "${IP_MONITOR_INTERVAL:-30}" \
+      "${sh:-}" "${pidf:-}" "${pgf:-}" "${log:-/var/log/alias_ipmon.log}" <<'EOF'
+CIDR="${1:-}"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"
+SH="${4:-/tmp/ipmon.sh}"; PIDF="${5:-/tmp/ipmon.pid}"; PGF="${6:-/tmp/ipmon.pgid}"
+LOG_PATH="${7:-/var/log/alias_ipmon.log}"
+IP="${CIDR%%/*}"
+
+# ensure log file usable
+if ! { mkdir -p "$(dirname "$LOG_PATH")" 2>/dev/null && : >>"$LOG_PATH"; }; then
+  LOG_PATH="/tmp/alias_ipmon.log"
+  mkdir -p /tmp >/dev/null 2>&1 || true
+  : >>"$LOG_PATH" || true
+fi
+
+ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG_PATH"; }
+
+# If already running, keep it
+if [[ -s "$PIDF" ]] && ps -p "$(cat "$PIDF" 2>/dev/null)" >/dev/null 2>&1; then
+  ipmon_log "already running (PID=$(cat "$PIDF")) logging to $LOG_PATH"
+  exit 0
+fi
+
+cat >"$SH" <<'MON'
+#!/usr/bin/env bash
+set -euo pipefail
+CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; LOG_PATH="$4"
+IP="${CIDR%%/*}"
+
+ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG_PATH"; }
+
+is_present(){ ip -4 addr show | awk "/inet /{print \$2}" | cut -d/ -f1 | grep -qx "$IP"; }
+
+pick_if(){
+  [[ -n "$IFACE" ]] && { echo "$IFACE"; return; }
+  DEFIF=$(ip route 2>/dev/null | awk "/^default/{print \$5; exit}" || true)
+  if [[ -n "$DEFIF" ]]; then echo "$DEFIF"; return; fi
+  ip -o link | awk -F': ' '{print $2}' \
+    | sed 's/@.*//' \
+    | grep -E '^(en|eth|ens|eno|em|bond|br)' \
+    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
+    | head -n1
+}
+
+ensure_once(){
+  local IF
+  IF="$(pick_if)"
+  if [[ -z "$IF" ]]; then ipmon_log "no suitable iface"; return 1; fi
+  ip link set dev "$IF" up || true
+  if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ipmon_err.log; then
+    sleep 1
+    if is_present; then
+      ipmon_log "added $CIDR on $IF"
+      return 0
+    fi
+  fi
+  local ERR="$(tr -d '\n' </tmp/ipmon_err.log 2>/dev/null || true)"
+  ipmon_log "failed to add $CIDR on $IF: ${ERR:-unknown}"
+  return 1
+}
+
+ipmon_log "watchdog start for $CIDR (IFACE=${IFACE:-auto})"
+
+# Ensure once at start
+if ! is_present; then
+  ensure_once || true
+fi
+
+# React to address changes immediately
+if command -v ip >/dev/null 2>&1; then
+  (
+    ip monitor address 2>/dev/null | while read -r _; do
+      if ! is_present; then
+        ipmon_log "detected address change; re-adding $CIDR"
+        ensure_once || true
+      fi
+    done
+  ) &
+fi
+
+# Periodic safety check
+while true; do
+  if ! is_present; then
+    ipmon_log "missing; re-adding $CIDR"
+    ensure_once || true
+  fi
+  sleep "$SLEEP_SEC"
+done
+MON
+chmod +x "$SH"
+
+# Launch detached; persist beyond SSH session; record PID+PGID
+nohup setsid bash -lc "bash '$SH' '$CIDR' '${IFACE:-}' '$SLEEP_SEC' '$LOG_PATH'" >/dev/null 2>&1 &
+echo $! >"$PIDF"
+PGID="$(ps -o pgid= -p "$(cat "$PIDF")" | tr -d ' ')"
+echo "$PGID" >"$PGF"
+ipmon_log "started PID=$(cat "$PIDF") PGID=$PGID → $LOG_PATH"
+EOF
+}
+
+
+stop_ip_monitor(){
+  local ip="$1" tag="$2"
+  local remote="/tmp/${tag}"; local pidf="${remote}.pid"; local pgf="${remote}.pgid"; local sh="${remote}.sh"
+  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$pidf" "$pgf" "$sh" <<'EOF'
+set +e
+PIDF="${1:?}"; PGF="${2:?}"; SH="${3:?}"
+if [[ -f "$PGF" ]]; then
+  PGID="$(tr -d ' ' < "$PGF" 2>/dev/null)"
+  [[ -n "$PGID" ]] && { kill -TERM -"$PGID" 2>/dev/null; sleep 1; kill -KILL -"$PGID" 2>/dev/null; }
+fi
+[[ -f "$PIDF" ]] && { kill -TERM "$(cat "$PIDF")" 2>/dev/null; sleep 1; kill -KILL "$(cat "$PIDF")" 2>/dev/null; }
+rm -f "$PGF" "$PIDF" "$SH" 2>/dev/null || true
+echo "[IPMON] stopped"
+EOF
+}
+
+# ===== Ensure swaps are restored & monitors stopped on exit =====
+declare -a SWAP_IDS=()   # "<ip>|<id>"
+on_exit_restore_all(){
+  local item ip id
+  for item in "${SWAP_IDS[@]}"; do
+    ip="${item%%|*}"; id="${item#*|}"
+    restore_reset_override "$ip" "$id" || true
+    restore_inventory_override "$ip" "$id" || true
+  done
+}
+on_exit_stop_ipmon(){
+  local item ip tag
+  for item in "${IP_MON_IDS[@]}"; do
+    ip="${item%%|*}"; tag="${item#*|}"
+    stop_ip_monitor "$ip" "$tag" || true
+  done
+}
+trap 'on_exit_restore_all; on_exit_stop_ipmon' EXIT
+
+# ===== Main =====
+log "Jenkins reset.yml: $RESET_YML_WS"
+
+any_failed=0
+while IFS= read -r entry; do
+  [[ -n "${entry// }" ]] || continue
+  ip="${entry%%|*}"
+  pth="${entry#*|}"
+
+  echo ""
+  echo "🔧 Server: $ip"
+
+  # Ensure alias IP (only if configured)
+  if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET" || true
+    # ---- NEW: start a watchdog that re-adds the IP if removed ----
+    start_ip_monitor "$ip" "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE"
+  else
+    echo "[IP] Skipping ensure; INSTALL_IP_ADDR is empty"
+  fi
+
+  if [[ -z "$pth" || "$pth" == "$ip" ]]; then
+    echo "❌ No OLD_BUILD_PATH specified for $ip in $SERVER_FILE (UI param ignored by design). Skipping."
+    any_failed=1
+    continue
+  fi
+
+  server_path="$(normalize_k8s_path "$pth" "$OLD_VERSION")"
+  echo "📁 Using (normalized): $server_path"
+
+  # 1) Pre-check: Kubernetes present?
+  if remote_cluster_present "$ip"; then
+    echo "✅ Kubernetes detected on $ip — proceeding."
+  else
+    echo "ℹ️  No Kubernetes detected on $ip — skipping this server."
+    continue
+  fi
+
+  req="$server_path/$KSPRAY_DIR/requirements.txt"
+
+  # 2) Ensure requirements.txt; if missing, start installer briefly to generate it
+  if remote_file_exists "$ip" "$req"; then
+    echo "✅ requirements.txt present"
+  else
+    echo "⏳ requirements.txt not found → starting $INSTALL_NAME in background to generate it"
+    start_installer_bg "$ip" "$server_path"
+
+    detected=0; loops=$(( REQ_WAIT_SECS / 2 ))
+    for _ in $(seq 1 "$loops"); do
+      if remote_file_exists "$ip" "$req"; then
+        echo "📄 $req detected → stopping installer"
+        stop_installer_pg "$ip" "$server_path"
+        detected=1; break
+      fi
+      sleep 2
+    done
+
+    if [[ "$detected" -eq 0 ]]; then
+      echo "❌ Timed out waiting for $req on $ip"
+      stop_installer_pg "$ip" "$server_path"
+      any_failed=1
+      continue
+    fi
+  fi
+
+  # 3) Swap Jenkins reset.yml + inventory; run uninstall; restore
+  swap_id="$(date +%s)_$$_$RANDOM"; SWAP_IDS+=("$ip|$swap_id")
+  push_reset_override      "$ip" "$server_path" "$swap_id"
+  push_inventory_override  "$ip" "$server_path" "$swap_id"
+
+  if ! run_uninstall_with_retries "$ip" "$server_path"; then
+    any_failed=1
+  fi
+
+  restore_reset_override     "$ip" "$swap_id"
+  restore_inventory_override "$ip" "$swap_id"
+
+  # ---- NEW: stop the per-host IP monitor now that this host's reset flow is done ----
+  for _it in "${IP_MON_IDS[@]}"; do
+    [[ "${_it%%|*}" == "$ip" ]] || continue
+    stop_ip_monitor "$ip" "${_it#*|}" || true
   done
 
-  set +e
-  run_install
-  RC=$?
-  set -e
+done < <(read_server_entries)
+
+echo ""
+if [[ $any_failed -ne 0 ]]; then
+  echo "❌ One or more servers failed."
+  exit 1
 fi
-
-exit $RC
-'''
-        }
-      }
-    }
-
-    // ---------- Pods health check (REPLACED with Jenkinsfile.health logic) ----------
-    stage('K8s health check') {
-      steps {
-        timeout(time: 20, unit: 'MINUTES') {
-          sh '''#!/usr/bin/env bash
-set -euo pipefail
-: "${HEALTH_RETRY_WAIT_SECS:=300}"
-: "${HEALTH_RETRIES:=1}"
-: "${SERVER_FILE:=server_pci_map.txt}"
-: "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
-
-# Expect scripts/k8s_health_check.sh to exist; it should perform READY and STATUS checks and retry
-[ -f scripts/k8s_health_check.sh ] || { echo "scripts/k8s_health_check.sh not found"; exit 2; }
-sed -i 's/\r$//' scripts/k8s_health_check.sh || true
-chmod +x scripts/k8s_health_check.sh
-
-set -o pipefail
-env \
-  SERVER_FILE="${SERVER_FILE}" \
-  SSH_KEY="${SSH_KEY}" \
-  HEALTH_RETRY_WAIT_SECS="${HEALTH_RETRY_WAIT_SECS}" \
-  HEALTH_RETRIES="${HEALTH_RETRIES}" \
-  bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.log
-'''
-        }
-      }
-    }
-
-    // ---------- PS config & install ----------
-    stage('PS config & install') {
-      steps {
-        script {
-          def psTimeout = env.PS_STAGE_TIMEOUT_MIN as Integer
-          timeout(time: psTimeout, unit: 'MINUTES') {
-            withEnv([
-              "NEW_BUILD_PATH=${params.NEW_BUILD_PATH}",
-              "NEW_VERSION=${params.NEW_VERSION}",
-              "DEPLOYMENT_TYPE=${params.DEPLOYMENT_TYPE}",
-              "HOST_USER=root"
-            ]) {
-              sh '''#!/usr/bin/env bash
-set -euo pipefail
-: "${PS_SCRIPT:=scripts/ps_config.sh}"
-: "${NEW_BUILD_PATH:=/home/labadmin/6.3.0/EA3}"
-: "${NEW_VERSION:=6.3.0_EA3}"
-: "${DEPLOYMENT_TYPE:=Low}"
-: "${HOST_USER:=root}"
-
-echo "[pipeline] NEW_BUILD_PATH=${NEW_BUILD_PATH}"
-echo "[pipeline] NEW_VERSION=${NEW_VERSION}"
-echo "[pipeline] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}"
-echo "[pipeline] HOST_USER=${HOST_USER}"
-
-[ -f "${PS_SCRIPT}" ] || { echo "PS script not found at ${PS_SCRIPT}"; exit 2; }
-sed -i 's/\r$//' "${PS_SCRIPT}" || true
-chmod +x "${PS_SCRIPT}"
-
-set -o pipefail
-env \
-  SERVER_FILE="${SERVER_FILE}" \
-  SSH_KEY="${SSH_KEY}" \
-  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-  NEW_VERSION="${NEW_VERSION}" \
-  DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-  HOST_USER="${HOST_USER}" \
-  bash -euo pipefail "${PS_SCRIPT}" |& tee ps_config.log
-'''
-            }
-          }
-        }
-      }
-    }
-
-    // ---------- CS config & install ----------
-    stage('CS config & install') {
-      steps {
-        script {
-          def csTimeout = env.CS_STAGE_TIMEOUT_MIN as Integer
-          timeout(time: csTimeout, unit: 'MINUTES') {
-            withEnv([
-              "NEW_BUILD_PATH=${params.NEW_BUILD_PATH}",
-              "NEW_VERSION=${params.NEW_VERSION}",
-              "DEPLOYMENT_TYPE=${params.DEPLOYMENT_TYPE}",
-              "HOST_USER=root"
-            ]) {
-              sh '''#!/usr/bin/env bash
-set -euo pipefail
-: "${SERVER_FILE:=server_pci_map.txt}"
-: "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
-: "${CS_SCRIPT:=scripts/cs_config.sh}"
-
-: "${NEW_BUILD_PATH:=/home/labadmin/6.3.0/EA3}"
-: "${NEW_VERSION:=6.3.0_EA3}"
-: "${DEPLOYMENT_TYPE:=Medium}"
-: "${HOST_USER:=root}"
-
-echo "[pipeline] (CS) NEW_BUILD_PATH=${NEW_BUILD_PATH}"
-echo "[pipeline] (CS) NEW_VERSION=${NEW_VERSION}"
-echo "[pipeline] (CS) DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE}"
-echo "[pipeline] (CS) HOST_USER=${HOST_USER}"
-
-[ -f "${CS_SCRIPT}" ] || { echo "CS script not found at ${CS_SCRIPT}"; exit 2; }
-sed -i 's/\r$//' "${CS_SCRIPT}" || true
-chmod +x "${CS_SCRIPT}"
-
-set -o pipefail
-env \
-  SERVER_FILE="${SERVER_FILE}" \
-  SSH_KEY="${SSH_KEY}" \
-  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-  NEW_VERSION="${NEW_VERSION}" \
-  DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-  HOST_USER="${HOST_USER}" \
-  bash -euo pipefail "${CS_SCRIPT}" |& tee cs_config.log
-'''
-            }
-          }
-        }
-      }
-    }
-
-    // ---------- PS health check (quick sanity) ----------
-    stage('PS health check') {
-      steps {
-        timeout(time: 10, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
-set -euo pipefail
-HOST="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0) { n=split($0,a,":"); print $1; exit } else { print $1; exit } }' "${SERVER_FILE}")"
-if [[ -z "${HOST}" ]]; then
-  echo "[ps-health] ERROR: could not parse host from ${SERVER_FILE}" >&2
-  exit 2
-fi
-echo "[ps-health] Using host ${HOST} for kubectl checks"
-
-ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${HOST}" bash -lc '
-  set -euo pipefail
-  kubectl get nodes >/dev/null 2>&1 || { echo "[ps-health] kubectl not yet available; treating as not-ready"; exit 1; }
-  check() {
-    local notok=0
-    while read -r ns name ready status rest; do
-      x="${ready%%/*}"; y="${ready##*/}"
-      if [[ "$status" != "Running" || "$x" != "$y" ]]; then
-        echo "[ps-health] $ns/$name not healthy (READY=$ready STATUS=$status)"
-        notok=1
-      fi
-    done < <(kubectl get pods -A --no-headers)
-    return $notok
-  }
-  if check; then
-    echo "[ps-health] ✅ All pods Running & Ready."
-  else
-    echo "[ps-health] ❌ Pods not healthy after PS."
-    kubectl get pods -A || true
-    exit 1
-  fi
-'
-'''
-        }
-      }
-    }
-
-    // ---------- NF services config ----------
-    stage('NF services config') {
-      steps {
-        timeout(time: 45, unit: 'MINUTES', activity: true) {
-          sh '''#!/usr/bin/env bash
-set -euo pipefail
-
-[ -f scripts/nf_config.sh ] || { echo "ERROR: scripts/nf_config.sh not found"; exit 2; }
-sed -i 's/\r$//' scripts/nf_config.sh || true
-chmod +x scripts/nf_config.sh
-
-echo "[pipeline] Running scripts/nf_config.sh …"
-set -o pipefail
-env \
-  SERVER_FILE="${SERVER_FILE}" \
-  SSH_KEY="${SSH_KEY}" \
-  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-  NEW_VERSION="${NEW_VERSION}" \
-  DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-  SERVER_PCI_MAP="${SERVER_FILE}" \
-  SERVER_IP_RANGE_MAP="${SERVER_FILE}" \
-  HOST_USER="root" \
-  bash -euo pipefail scripts/nf_config.sh 2>&1 | tee nf_config.log
-
-exit ${PIPESTATUS[0]}
-'''
-        }
-      }
-    }
-  }
-
-  post {
-    always {
-      archiveArtifacts artifacts: 'health_check.log, ps_config.log, cs_config.log, nf_config.log', allowEmptyArchive: true
-    }
-  }
-}
+echo "🎉 Completed all servers successfully."
