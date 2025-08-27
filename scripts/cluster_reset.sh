@@ -153,7 +153,7 @@ read_server_entries(){
     gsub(/\r/,"");           # strip Windows CRs
     sub(/[[:space:]]+$/,""); # strip trailing whitespace
     n=split($0,a,":")
-    if(n==3){ printf "%s|%s\n", a[2], a[3] }      # name:ip:path
+    if(n>=3){ printf "%s|%s\n", a[2], a[3] }      # name:ip:path
     else if(n==2){ printf "%s|%s\n", a[1], a[2] } # ip:path
     else { printf "%s|\n", a[1] }                 # ip only (no path)
   }' "$SERVER_FILE"
