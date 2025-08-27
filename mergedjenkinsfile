@@ -330,10 +330,14 @@ done
           steps {
             timeout(time: 15, unit: 'MINUTES', activity: true) {
               sh '''#!/usr/bin/env bash
-set -eu
-echo ">>> Cluster reset starting (INSTALL_MODE=Upgrade_with_cluster_reset)"
+sh '''
+#!/usr/bin/env bash
+set -euo pipefail
+echo ">>> Cluster reset starting (INSTALL_MODE=${INSTALL_MODE})"
 sed -i 's/\r$//' scripts/cluster_reset.sh || true
 chmod +x scripts/cluster_reset.sh
+bash -euo pipefail scripts/cluster_reset.sh
+'''
 env \
   CLUSTER_RESET=true \
   OLD_VERSION="${OLD_VERSION}" \
