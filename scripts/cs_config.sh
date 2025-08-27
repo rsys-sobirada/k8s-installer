@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Pick first host as kubectl runner
+RUNNER="$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){ split($0,a,":"); print a[2]; exit } else { print $1; exit } }' "${SERVER_FILE}")"
+: "${RUNNER:?no host found in ${SERVER_FILE}}"
+
 set -euo pipefail
 
 # --- required env (exported by Jenkins stage) ---
