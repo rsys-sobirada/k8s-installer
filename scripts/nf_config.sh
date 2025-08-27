@@ -23,26 +23,19 @@ echo "[nf_config] NEW_VERSION=${NEW_VERSION} (VER=${VER})"
 echo "[nf_config] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE} (CAP=${CAP})"
 echo "[nf_config] SERVER_FILE=${SERVER_FILE}"
 
-# ---------- process each line in server_pci_map.txt (no spaces) ----------
-# Format:
-# name:ip:old_build_path:VM|SRIOV:N3_PCI_or_iface:N6_PCI_or_iface:N4_BASE_CIDR:AMF_N2_IP
 mapfile -t MAPLINES < <(awk 'NF && $1 !~ /^#/' "${SERVER_FILE}")
 
 for RAW in "${MAPLINES[@]}"; do
-  LINE="${RAW//[[:space:]]/}"   # strip any stray spaces
-
-  # Split left to right for first 4 fields
-  IFS=':' read -r NAME HOST OLD_BUILD MODE REST <<< "${LINE}"
+  LINE="${RAW//[[:space:]]/}"
+  IFS=':' read -r NAME HOST OLD_BUILD MODE REST <<< "${LINE}" || true
   if [[ -z "${HOST:-}" || -z "${REST:-}" ]]; then
     echo "[nf_config] skip malformed line: ${RAW}"; continue
   fi
-
-  # Pull AMF and N4 safely from the RIGHT (they do not contain ':')
   AMF_N2_IP="${REST##*:}"; REST="${REST%:*}"
   N4_BASE="${REST##*:}";   REST="${REST%:*}"
 
   # Remaining is N3:N6 (can be full PCI with colons or iface names)
-  if [[ "$REST" =~ ^([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]):([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F])$ ]]; then
+  if [[ "$REST" =~ ^([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f]):([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])$ ]]; then
     N3_RAW="${BASH_REMATCH[1]}"; N6_RAW="${BASH_REMATCH[2]}"
   else
     IFS=':' read -r N3_RAW N6_RAW <<< "${REST}"
@@ -53,7 +46,6 @@ for RAW in "${MAPLINES[@]}"; do
 
   NF_ROOT="${NEW_BUILD_PATH%/}/TRILLIUM_5GCN_CNF_REL_${VER}/nf-services/scripts"
 
-  # Ship a robust remote script via heredoc (no local expansion)
   ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${HOST_USER}@${HOST}" bash -se -- "${NF_ROOT}" "${MODE}" "${N3_RAW:-}" "${N6_RAW:-}" "${N4_BASE:-}" "${AMF_N2_IP:-}" "${CAP}" "${HOST}" "${VER}" <<'EOSH'
 set -euo pipefail
 NF_ROOT="$1"; MODE_IN="$2"; N3_IN="$3"; N6_IN="$4"; N4_IN="$5"; AMF_IP="$6"; CAPACITY="$7"; HOST_IP="$8"; VER="$9"
@@ -68,7 +60,10 @@ for f in "$UPF" "$SMF" "$AMF" "$GV"; do
   [[ -f "$f" ]] || { echo "[remote] ERROR: missing $f"; exit 3; }
 done
 
-is_pci() { [[ "$1" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; }
+# Strip CRLF just in case
+sed -i 's/\r$//' "$UPF" "$SMF" "$AMF" "$GV"
+
+is_pci() { [[ "$1" =~ ^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f]$ ]]; }
 resolve_pci() {
   local t="$1"
   if is_pci "$t"; then echo "$t"; return 0; fi
@@ -82,104 +77,96 @@ resolve_pci() {
   echo ""
 }
 
-patch_ipam_range_ipv4() {  # $1 file, $2 A.B.C.D/M
-  local f="$1" rng="$2"
-  awk -v rng="$rng" '
+patch_line_to_key_val() { # file key value   (portable; no backrefs)
+  awk -v key="$2" -v val="$3" '
+    !done && $0 ~ "^[[:space:]]*" key "[[:space:]]*:" {
+      i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
+      print ind key ": " val; done=1; next
+    }
+    { print }
+  ' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
+patch_first_range_ipv4() {  # file A.B.C.D/M  (ipam.ipRanges[0].range)
+  awk -v rng="$2" '
     BEGIN{in_ipam=0; in_ranges=0; done=0}
     {
-      line=$0
-      if (line ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) in_ipam=1
-      if (in_ipam && line ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
-      if (in_ranges && !done && line ~ /"range":[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
-        sub(/"range":[[:space:]]*"[^"]+"/, "\"range\": \"" rng "\"", line); done=1
+      if ($0 ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) in_ipam=1
+      if (in_ipam && $0 ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
+      if (in_ranges && !done && $0 ~ /"range":[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
+        i=match($0,/^([[:space:]]*)"range":[[:space:]]*"/,a)
+        i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
+        print ind "\"range\": \"" rng "\"", substr($0, index($0, "\"") + length(rng) + 2); done=1; next
       }
-      print line
-      if (in_ranges && line ~ /\]/) in_ranges=0
-      if (in_ipam   && line ~ /\}/ && !in_ranges) in_ipam=0
-    }' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+      print
+      if (in_ranges && $0 ~ /\]/) in_ranges=0
+      if (in_ipam   && $0 ~ /\}/ && !in_ranges) in_ipam=0
+    }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
-patch_ipam_exclude_ipv4() { # $1 file, $2 A.B.C.D/32
-  local f="$1" exc="$2"
-  awk -v exc="$exc" '
+patch_first_exclude_ipv4() { # file A.B.C.D/32 (ipam.exclude first IPv4)
+  awk -v exc="$2" '
     BEGIN{in_ipam=0; in_exc=0; done=0}
     {
-      line=$0
-      if (line ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) in_ipam=1
-      if (in_ipam && line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/) in_exc=1
-      if (in_exc && !done && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/) {
-        sub(/"[0-9]+\.[0-9]+\.[0-9]+\/32"/, "\"" exc "\"", line); done=1
-      }
-      print line
-      if (in_exc && line ~ /\]/) in_exc=0
-      if (in_ipam && line ~ /\}/ && !in_exc) in_ipam=0
-    }' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-}
-
-# ---- global-values.yaml
-# capacitySetup
-awk -v cap="$CAPACITY" '
-  BEGIN{done=0}
-  {
-    if (!done && $0 ~ /^[[:space:]]*capacitySetup:[[:space:]]*"/) {
-      sub(/^([[:space:]]*capacitySetup:[[:space:]]*).*/, "\\1\"" cap "\"")
-      done=1
-    }
-    print
-  }' "$GV" > "$GV.tmp" && mv "$GV.tmp" "$GV"
-
-# ingressExtFQDN -> <host>.nip.io
-awk -v fqdn="${HOST_IP}.nip.io" '
-  BEGIN{done=0}
-  {
-    if (!done && $0 ~ /^[[:space:]]*ingressExtFQDN:[[:space:]]*/) {
-      sub(/^([[:space:]]*ingressExtFQDN:[[:space:]]*).*/, "\\1 " fqdn)
-      done=1
-    }
-    print
-  }' "$GV" > "$GV.tmp" && mv "$GV.tmp" "$GV"
-
-# CPU manager flag for LOW
-if [[ "${CAPACITY}" == "LOW" ]]; then
-  awk '
-    BEGIN{done=0}
-    {
-      if (!done && $0 ~ /^[[:space:]]*k8sCpuMgrStaticPolicyEnable:[[:space:]]*/) {
-        sub(/^([[:space:]]*k8sCpuMgrStaticPolicyEnable:[[:space:]]*).*/, "\\1false")
+      if ($0 ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) in_ipam=1
+      if (in_ipam && $0 ~ /"exclude"[[:space:]]*:[[:space:]]*\[/) in_exc=1
+      if (in_exc && !done && $0 ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/) {
+        i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
+        # replace the first IPv4/32 on this line
+        sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/, "\"" exc "\"")
         done=1
       }
       print
-    }' "$GV" > "$GV.tmp" && mv "$GV.tmp" "$GV"
+      if (in_exc && $0 ~ /\]/) in_exc=0
+      if (in_ipam && $0 ~ /\}/ && !in_exc) in_ipam=0
+    }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
+# ---- global-values.yaml (portable; no backrefs)
+patch_line_to_key_val "$GV" "capacitySetup" "\"${CAPACITY}\""
+patch_line_to_key_val "$GV" "ingressExtFQDN" "${HOST_IP}.nip.io"
+
+if [[ "${CAPACITY}" == "LOW" ]]; then
+  patch_line_to_key_val "$GV" "k8sCpuMgrStaticPolicyEnable" "false"
 fi
 echo "[remote] global-values.yaml updated."
 
-# ---- version bump v1 -> VER for image tags
-find "${NF_ROOT}" -maxdepth 1 -type f -name "*.yaml" -print0 | xargs -0 sed -i -E "s/\bv1\b/${VER}/g"
-echo "[remote] replaced v1 -> ${VER} in files under nf-services/scripts."
+# ---- version bump v1 -> VER (only image tags v1 -> <VER>)
+find "${NF_ROOT}" -maxdepth 1 -type f -name "*.yaml" -print0 | xargs -0 sed -i -E "s/(image:[[:space:]]*\"[^\"]*:)v1(\")/\\1${VER}\\2/g"
+echo "[remote] replaced image tag v1 -> ${VER} in nf-services/scripts."
 
-# ---- AMF externalIP
+# ---- AMF: replace the IP that sits directly under the NGC comment
 if [[ -n "${AMF_IP:-}" && "${AMF_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   awk -v ip="$AMF_IP" '
-    BEGIN{done=0}
     {
-      if (!done && $0 ~ /^[[:space:]]*externalIP:[[:space:]]*/) {
-        sub(/^([[:space:]]*externalIP:[[:space:]]*).*/, "\\1 " ip)
-        done=1
+      line=$0
+      if (mark) {
+        if (line ~ /^[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+([[:space:]]*#.*)?$/) {
+          i=match(line,/[^[:space:]]/); ind=(i?substr(line,1,i-1):"");
+          print ind ip; mark=0; next
+        }
       }
-      print
+      if (line ~ /# *NGC IP for external Communication/) { print line; mark=1; next }
+      print line
     }' "$AMF" > "$AMF.tmp" && mv "$AMF.tmp" "$AMF"
+
+  # Fallback: if file actually has externalIP:, update that too
+  patch_line_to_key_val "$AMF" "externalIP" "${AMF_IP}" || true
 else
   echo "[remote] amf-1-values.yaml: AMF_N2_IP not provided/invalid — skipped"
 fi
 
-# ---- UPF intfConfig.type
+# ---- UPF intfConfig.type per mode
 MODE_UP=$(printf "%s" "${MODE_IN:-}" | tr '[:lower:]' '[:upper:]')
 if [[ "${MODE_UP}" == "VM" ]]; then
   awk '
     BEGIN{in_blk=0; done=0}
     {
       if ($0 ~ /^ *intfConfig:/) in_blk=1
-      if (in_blk && !done && $0 ~ /^ *type:/) { sub(/^ *type:.*/, "      type: \"devPassthrough\""); done=1 }
+      if (in_blk && !done && $0 ~ /^ *type:/) {
+        i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
+        print ind "type: \"devPassthrough\""; done=1; next
+      }
       if (in_blk && $0 ~ /^ *upfsesscoresteps:/) in_blk=0
       print
     }' "$UPF" > "$UPF.tmp" && mv "$UPF.tmp" "$UPF"
@@ -188,48 +175,54 @@ else
     BEGIN{in_blk=0; done=0}
     {
       if ($0 ~ /^ *intfConfig:/) in_blk=1
-      if (in_blk && !done && $0 ~ /^ *type:/) { sub(/^ *type:.*/, "      type: \"sriov\""); done=1 }
+      if (in_blk && !done && $0 ~ /^ *type:/) {
+        i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
+        print ind "type: \"sriov\""; done=1; next
+      }
       if (in_blk && $0 ~ /^ *upfsesscoresteps:/) in_blk=0
       print
     }' "$UPF" > "$UPF.tmp" && mv "$UPF.tmp" "$UPF"
 fi
 
-# ---- Resolve / inject PCI addresses
+# ---- Resolve / inject PCI addresses (portable awk)
 N3_PCI="$(resolve_pci "${N3_IN:-}")"
 N6_PCI="$(resolve_pci "${N6_IN:-}")"
 
 if [[ -n "${N3_PCI}" ]]; then
   awk -v pci="${N3_PCI}" '
-    BEGIN{in=0; done=0}
-    {
-      if ($0 ~ /^ *nguInterface:/) in=1
-      if (in && !done && $0 ~ /^ *pciAddress:/) { sub(/^ *pciAddress:.*/, "        pciAddress: " pci); done=1 }
-      if (in && $0 ~ /^ *n6Interface_0:/) in=0
-      print
-    }' "$UPF" > "$UPF.tmp" && mv "$UPF.tmp" "$UPF"
-fi
-if [[ -n "${N6_PCI}" ]]; then
-  awk -v pci="${N6_PCI}" '
-    BEGIN{in=0; done=0}
-    {
-      if ($0 ~ /^ *n6Interface_0:/) in=1
-      if (in && !done && $0 ~ /^ *pciAddress:/) { sub(/^ *pciAddress:.*/, "        pciAddress: " pci); done=1 }
-      if (in && ($0 ~ /^ *n6Interface_1:/ || $0 ~ /^ *n9Interface:/ || $0 ~ /^ *upfsesscoresteps:/)) in=0
-      print
-    }' "$UPF" > "$UPF.tmp" && mv "$UPF.tmp" "$UPF"
+    /^ *nguInterface:/ { in=1; print; next }
+    in && /^ *pciAddress:/ && !done {
+      i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
+      print ind "pciAddress: " pci; done=1; next
+    }
+    in && /^ *n6Interface_0:/ { in=0 }
+    { print }
+  ' "$UPF" > "$UPF.tmp" && mv "$UPF.tmp" "$UPF"
 fi
 
-# ---- N4 IPAM range + excludes (.1 for UPF, .2 for SMF)
+if [[ -n "${N6_PCI}" ]]; then
+  awk -v pci="${N6_PCI}" '
+    /^ *n6Interface_0:/ { in=1; print; next }
+    in && /^ *pciAddress:/ && !done {
+      i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
+      print ind "pciAddress: " pci; done=1; next
+    }
+    in && (/^ *n6Interface_1:/ || /^ *n9Interface:/ || /^ *upfsesscoresteps:/) { in=0 }
+    { print }
+  ' "$UPF" > "$UPF.tmp" && mv "$UPF.tmp" "$UPF"
+fi
+
+# ---- N4 range + excludes (.1 for UPF, .2 for SMF)
 if [[ -n "${N4_IN:-}" && "${N4_IN}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)\/([0-9]+)$ ]]; then
   base3="${BASH_REMATCH[1]}"; last="${BASH_REMATCH[2]}"; mask="${BASH_REMATCH[3]}"
   N4_RANGE="${base3}.${last}/${mask}"
   EXCL_UPF="${base3}.$((last+1))/32"
   EXCL_SMF="${base3}.$((last+2))/32"
 
-  patch_ipam_range_ipv4   "$UPF" "${N4_RANGE}"
-  patch_ipam_range_ipv4   "$SMF" "${N4_RANGE}"
-  patch_ipam_exclude_ipv4 "$UPF" "${EXCL_UPF}"
-  patch_ipam_exclude_ipv4 "$SMF" "${EXCL_SMF}"
+  patch_first_range_ipv4   "$UPF" "${N4_RANGE}"
+  patch_first_range_ipv4   "$SMF" "${N4_RANGE}"
+  patch_first_exclude_ipv4 "$UPF" "${EXCL_UPF}"
+  patch_first_exclude_ipv4 "$SMF" "${EXCL_SMF}"
   echo "[remote] N4_RANGE=${N4_RANGE}  EXCL_UPF=${EXCL_UPF}  EXCL_SMF=${EXCL_SMF}"
 else
   echo "[remote] N4_BASE not provided/invalid — skipping N4 IPAM edits"
@@ -237,7 +230,7 @@ fi
 
 # ---- quick checks
 echo "[remote] NF checks:"
-grep -n 'externalIP:' "${AMF}" || true
+awk '/# *NGC IP for external Communication/{n=NR+1} NR==n{print "[remote] AMF NGC line: " $0}' "$AMF" || true
 awk '/^ *intfConfig:/{f=1} f&&/^ *type:/{print "[remote] upf.type: "$0; f=0}' "${UPF}"
 awk '/^ *nguInterface:/{f=1} f&&/^ *pciAddress:/{print "[remote] upf.ngu pci: "$0; f=0}' "${UPF}"
 awk '/^ *n6Interface_0:/{f=1} f&&/^ *pciAddress:/{print "[remote] upf.n6  pci: "$0; f=0}' "${UPF}"
