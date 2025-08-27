@@ -13,24 +13,25 @@ pipeline {
     string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3',          description: 'Version tag (e.g., 6.3.0_EA3)')
     string(name: 'SERVER_FILE',    defaultValue: 'server_pci_map.txt', description: 'Map of name:ip')
     string(name: 'HOST_NAME',      defaultValue: '',                   description: 'Optional: pick name from column 1')
-    string(name: 'HOST_USER',      defaultValue: 'root',               description: 'SSH user (same as nf_config.sh)')
+    string(name: 'HOST_USER',      defaultValue: 'root',               description: 'SSH user')
     string(name: 'SSH_KEY',        defaultValue: '/var/lib/jenkins/.ssh/jenkins_key', description: 'Private key path')
 
-    // EMS-specific readiness controls
-    string(name: 'EMS_NAMESPACE',  defaultValue: '',                   description: 'Optional namespace (blank = all namespaces)')
-    string(name: 'EMS_SELECTOR',   defaultValue: 'app=ems',            description: 'Label selector for EMS pods (blank = fallback to name prefix)')
-    string(name: 'EMS_NAME_PREFIX',defaultValue: 'ems',                description: 'Fallback pod-name prefix if selector returns nothing')
+    // EMS-only readiness controls
+    string(name: 'EMS_NAMESPACE',   defaultValue: '',                  description: 'Optional namespace (blank = all namespaces)')
+    string(name: 'EMS_SELECTOR',    defaultValue: 'app=ems',           description: 'Label selector for EMS pods')
+    string(name: 'EMS_NAME_PREFIX', defaultValue: 'ems',               description: 'Fallback name prefix if selector yields none')
   }
 
   stages {
     stage('Checkout') { steps { checkout scm } }
 
-    stage('Guard: ensure correct script is used') {
+    stage('Guard: enforce Option A') {
       steps {
         sh '''
           set -e
-          if grep -R --line-number ".ems_stage.sh" . || true; then
-            echo "ERROR: Remove any use of scripts/.ems_stage.sh; using scripts/ems_install_and_check.sh" >&2
+          echo "== Enforcing Option A (NO .ems_stage.sh) =="
+          if grep -R --line-number "\\.ems_stage\\.sh" .; then
+            echo "ERROR: Found references to scripts/.ems_stage.sh. Remove them and use scripts/ems_install_and_check.sh." >&2
             exit 2
           fi
           test -f scripts/ems_install_and_check.sh || { echo "scripts/ems_install_and_check.sh not found" >&2; exit 3; }
@@ -38,58 +39,36 @@ pipeline {
       }
     }
 
-stage('EMS install & EMS-only health check (remote via SSH)') {
-  options { timeout(time: 20, unit: 'MINUTES') }
-  steps {
-    sh '''
-      set -e
+    stage('EMS install & EMS-only health check (remote via SSH)') {
+      options { timeout(time: 20, unit: 'MINUTES') }
+      steps {
+        sh '''
+          set -e
+          chmod +x scripts/ems_install_and_check.sh
 
-      echo "== Guard =="
-      # 1) Fail if any leftover .ems_stage.sh is referenced anywhere
-      if grep -R --line-number "\\.ems_stage\\.sh" . || true; then
-        echo "ERROR: Remove any use of scripts/.ems_stage.sh; using scripts/ems_install_and_check.sh" >&2
-        exit 2
-      fi
+          # Optional proxies
+          export http_proxy="${http_proxy:-}"; export https_proxy="${https_proxy:-}"; export no_proxy="${no_proxy:-}"
+          export HTTP_PROXY="${HTTP_PROXY:-}"; export HTTPS_PROXY="${HTTPS_PROXY:-}"; export NO_PROXY="${NO_PROXY:-}"
 
-      # 2) Ensure we are running the repo script
-      test -f scripts/ems_install_and_check.sh || { echo "scripts/ems_install_and_check.sh not found" >&2; exit 3; }
-
-      # 3) Force the repo script to avoid loading remote profiles (belt & suspenders)
-      #    - add --noprofile --norc to any remote bash execs
-      sed -i -E "s/bash[[:space:]]+(-[[:alnum:]]+)?[[:space:]]*-c[[:space:]]+'/bash --noprofile --norc -euo pipefail -c '/" scripts/ems_install_and_check.sh || true
-      #    - strip any lines that source /etc/profile, /etc/bash.bashrc, or ~/.bashrc
-      awk '!/\\/etc\\/profile/ && !/bash\\.bashrc/ && !/\\.bashrc/' scripts/ems_install_and_check.sh > scripts/ems_install_and_check.sh.noprof
-      mv scripts/ems_install_and_check.sh.noprof scripts/ems_install_and_check.sh
-
-      chmod +x scripts/ems_install_and_check.sh
-
-      # Optional proxies
-      export http_proxy="${http_proxy:-}"; export https_proxy="${https_proxy:-}"; export no_proxy="${no_proxy:-}"
-      export HTTP_PROXY="${HTTP_PROXY:-}"; export HTTPS_PROXY="${HTTPS_PROXY:-}"; export NO_PROXY="${NO_PROXY:-}"
-
-      # EMS namespace/selector defaults (only EMS pods)
-      : "${EMS_NAMESPACE:=}"           # blank = all namespaces
-      : "${EMS_SELECTOR:=app=ems}"     # adjust to your label (e.g., app.kubernetes.io/name=ems)
-      : "${EMS_NAME_PREFIX:=ems}"      # fallback if selector returns none
-
-      SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}" \
-      SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}" \
-      NEW_BUILD_PATH="${NEW_BUILD_PATH:-/home/labadmin/EA3}" \
-      NEW_VERSION="${NEW_VERSION:-6.3.0_EA3}" \
-      HOST_USER="${HOST_USER:-root}" \
-      HOST_NAME="${HOST_NAME:-}" \
-      EMS_NAMESPACE="${EMS_NAMESPACE}" \
-      EMS_SELECTOR="${EMS_SELECTOR}" \
-      EMS_NAME_PREFIX="${EMS_NAME_PREFIX}" \
-      /bin/bash -x scripts/ems_install_and_check.sh
-    '''
+          # Run the repo script that uses nf_config-style SSH and NO profile sourcing
+          SERVER_FILE="${SERVER_FILE}" \
+          SSH_KEY="${SSH_KEY}" \
+          NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+          NEW_VERSION="${NEW_VERSION}" \
+          HOST_USER="${HOST_USER}" \
+          HOST_NAME="${HOST_NAME}" \
+          EMS_NAMESPACE="${EMS_NAMESPACE}" \
+          EMS_SELECTOR="${EMS_SELECTOR}" \
+          EMS_NAME_PREFIX="${EMS_NAME_PREFIX}" \
+          /bin/bash -x scripts/ems_install_and_check.sh
+        '''
+      }
+    }
   }
-}
-
 
   post {
     always {
-      // Best-effort snapshot of EMS pods
+      // Best-effort EMS-only snapshot for logs
       sh '''
         set -e
         if [ -f "${SERVER_FILE:-server_pci_map.txt}" ]; then
@@ -101,11 +80,11 @@ stage('EMS install & EMS-only health check (remote via SSH)') {
             [ -n "${EMS_SELECTOR:-}" ] && SEL_OPT="-l ${EMS_SELECTOR}"
             ssh -i "${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}" \
                 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                "${HOST_USER:-root}@${SERVER_IP}" -- "kubectl get pods \${NS_OPT:- -A} \${SEL_OPT} | (grep -i ems || true)" || true
+                "${HOST_USER:-root}@${SERVER_IP}" -- "kubectl get pods ${NS_OPT:- -A} ${SEL_OPT} | (grep -i ems || true)" || true
           fi
         fi
       '''.stripIndent()
     }
-    failure { echo 'Pipeline failed — see the EMS stage logs for the first non-zero step.' }
+    failure { echo 'Pipeline failed — see the EMS stage for the first non-zero step.' }
   }
 }
