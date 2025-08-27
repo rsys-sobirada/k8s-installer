@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # scripts/cluster_reset.sh
+if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
 # Takes OLD_BUILD_PATH per-server from server_pci_map.txt (ignores UI OLD_BUILD_PATH).
 # Flow:
 # 1) Detect Kubernetes on host
