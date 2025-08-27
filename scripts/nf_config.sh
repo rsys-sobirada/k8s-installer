@@ -32,7 +32,7 @@ echo "[nf_config] SERVER_FILE=${SERVER_FILE}"
 # --- iterate lines, skipping blanks/comments ---
 while IFS= read -r RAW; do
   [[ -z "$RAW" || "$RAW" =~ ^[[:space:]]*# ]] && continue
-  LINE="${RAW//[[:space:]]/}"   # remove whitespace defensively
+  LINE="${RAW//[[:space:]]/}"   # defensively strip whitespace
 
   # Split by ":" -> array
   IFS=':' read -r -a parts <<< "$LINE"
@@ -43,24 +43,14 @@ while IFS= read -r RAW; do
 
   if (( n == 12 )); then
     # PCI format
-    NAME="${parts[0]}"
-    HOST="${parts[1]}"
-    OLD_BUILD="${parts[2]}"
-    MODE="${parts[3]}"
+    NAME="${parts[0]}"; HOST="${parts[1]}"; OLD_BUILD="${parts[2]}"; MODE="${parts[3]}"
     N3_VAL="${parts[4]}:${parts[5]}:${parts[6]}"
     N6_VAL="${parts[7]}:${parts[8]}:${parts[9]}"
-    N4_CIDR="${parts[10]}"
-    AMF_IP="${parts[11]}"
+    N4_CIDR="${parts[10]}"; AMF_IP="${parts[11]}"
   elif (( n == 8 )); then
     # iface-name format
-    NAME="${parts[0]}"
-    HOST="${parts[1]}"
-    OLD_BUILD="${parts[2]}"
-    MODE="${parts[3]}"
-    N3_VAL="${parts[4]}"
-    N6_VAL="${parts[5]}"
-    N4_CIDR="${parts[6]}"
-    AMF_IP="${parts[7]}"
+    NAME="${parts[0]}"; HOST="${parts[1]}"; OLD_BUILD="${parts[2]}"; MODE="${parts[3]}"
+    N3_VAL="${parts[4]}"; N6_VAL="${parts[5]}"; N4_CIDR="${parts[6]}"; AMF_IP="${parts[7]}"
   else
     echo "[nf_config] skip malformed line (expected 8 or 12 fields): ${RAW}"
     continue
@@ -117,41 +107,43 @@ patch_key_scalar() { # file key value
   ' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
-patch_first_range_ipv4() {  # file CIDR => replace first IPv4 "range": "A.B.C.D/M"
-  awk -v rng="$2" '
-    BEGIN{ipam=0; ranges=0; done=0}
+# --- robust: update the *same* ipam block: first IPv4 "range" and first IPv4 in "exclude"
+patch_ipam_range_and_exclude() { # file CIDR excludeIPv4
+  awk -v rng="$2" -v exc="$3" '
+    BEGIN{ipam=0; in_ranges=0; in_ex=0; rd=0; ed=0}
     {
-      if ($0 ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) ipam=1
-      if (ipam && $0 ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) ranges=1
-      if (ranges && !done && $0 ~ /"range":[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
-        i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
-        trail=""; if ($0 ~ /",[[:space:]]*$/) trail=","
-        print ind "\"range\": \"" rng "\"" trail; done=1; next
+      line=$0
+      # enter/exit ipam block
+      if (line ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) ipam=1
+
+      if (ipam) {
+        if (line ~ /"ipRanges"[[:space:]]*:[[:space:]]*\[/) in_ranges=1
+        if (line ~ /"exclude"[[:space:]]*:[[:space:]]*\[/)   in_ex=1
+
+        # replace "range": "<IPv4/mask>"
+        if (in_ranges && !rd && line ~ /"range":[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+)"/) {
+          i=match(line,/[^[:space:]]/); ind=(i?substr(line,1,i-1):"");
+          trail=""; if (line ~ /",[[:space:]]*$/) trail=","
+          print ind "\"range\": \"" rng "\"" trail
+          rd=1; next
+        }
+
+        # replace first IPv4 in exclude
+        if (in_ex && !ed && line ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
+          sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/, "\"" exc "\"", line)
+          print line
+          ed=1; next
+        }
+
+        # close sub-blocks
+        if (in_ranges && line ~ /\]/) in_ranges=0
+        if (in_ex     && line ~ /\]/) in_ex=0
+
+        # leave ipam block when both done and we see a closing brace not inside sub-blocks
+        if (!in_ranges && !in_ex && line ~ /\}/) ipam=0
       }
-      print
-      if (ranges && $0 ~ /\]/) ranges=0
-      if (ipam && !ranges && $0 ~ /\}/) ipam=0
-    }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
-}
 
-patch_first_exclude_ipv4() { # file A.B.C.D/32 => replace first IPv4 under "exclude" (preserve comma/indent)
-  awk -v exc="$2" '
-    BEGIN{ipam=0; ex=0; done=0}
-    {
-      if ($0 ~ /"ipam"[[:space:]]*:[[:space:]]*\{/) ipam=1
-      if (ipam && $0 ~ /"exclude"[[:space:]]*:[[:space:]]*\[/) ex=1
-
-      if (ex && !done && $0 ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) {
-        i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
-        trail=""; if ($0 ~ /",[[:space:]]*$/) trail=","
-        print ind "\"" exc "\"" trail
-        done=1; next
-      }
-
-      print
-
-      if (ex && $0 ~ /\]/) ex=0
-      if (ipam && !ex && $0 ~ /\}/) ipam=0
+      print line
     }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
@@ -226,17 +218,15 @@ if [[ -n "${N6_PCI}" ]]; then
   }' "$UPF"
 fi
 
-# ---- N4 ipam updates ----
+# ---- N4 ipam updates (same ipam block for range + exclude) ----
 if [[ -n "${N4_IN:-}" && "${N4_IN}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)\/([0-9]+)$ ]]; then
   base3="${BASH_REMATCH[1]}"; last="${BASH_REMATCH[2]}"; mask="${BASH_REMATCH[3]}"
   N4_RANGE="${base3}.${last}/${mask}"
   EXCL_UPF="${base3}.$((last+1))/32"
   EXCL_SMF="${base3}.$((last+2))/32"
 
-  patch_first_range_ipv4   "$UPF" "${N4_RANGE}"
-  patch_first_range_ipv4   "$SMF" "${N4_RANGE}"
-  patch_first_exclude_ipv4 "$UPF" "${EXCL_UPF}"
-  patch_first_exclude_ipv4 "$SMF" "${EXCL_SMF}"
+  patch_ipam_range_and_exclude "$UPF" "${N4_RANGE}" "${EXCL_UPF}"
+  patch_ipam_range_and_exclude "$SMF" "${N4_RANGE}" "${EXCL_SMF}"
   echo "[remote] N4_RANGE=${N4_RANGE}  EXCL_UPF=${EXCL_UPF}  EXCL_SMF=${EXCL_SMF}"
 else
   echo "[remote] N4_IN invalid or missing — skipping N4 edits"
@@ -250,8 +240,8 @@ awk '/^ *intfConfig:/{f=1} f&&/^ *type:/{print "[remote] upf.type: "$0; f=0}' "$
 awk '/^ *nguInterface:/{f=1} f&&/^ *pciAddress:/{print "[remote] upf.ngu pci: "$0; f=0}' "$UPF" || true
 awk '/^ *n6Interface_0:/{f=1} f&&/^ *pciAddress:/{print "[remote] upf.n6  pci: "$0; f=0}' "$UPF" || true
 # Show first exclude IPv4 found after each exclude block header
-awk '/"exclude"[[:space:]]*:[[:space:]]*\[/{ex=1;next} ex&&/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/{print "[remote] upf.exclude: "$0; ex=0}' "$UPF" || true
-awk '/"exclude"[[:space:]]*:[[:space:]]*\[/{ex=1;next} ex&&/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/{print "[remote] smf.exclude: "$0; ex=0}' "$SMF" || true
+awk '/"exclude"[[:space:]]*:[[:space:]]*\[/{ex=1;next} ex&&/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/{print "[remote] upf.exclude: "$0; ex=0}' "$UPF" || true
+awk '/"exclude"[[:space:]]*:[[:space:]]*\[/{ex=1;next} ex&&/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/{print "[remote] smf.exclude: "$0; ex=0}' "$SMF" || true
 grep -nE '"range"|exclude' "$UPF" "$SMF" | sed "s|${NF_ROOT}/||" || true
 
 echo "[remote] ✅ NF config complete on ${HOST_IP}"
