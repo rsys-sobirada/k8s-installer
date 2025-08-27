@@ -61,7 +61,15 @@ if [[ ! -d "${PS_ROOT}" ]]; then
 fi
 
 # ---- helpers ----
-command -v kubectl >/dev/null 2>&1 || { echo "[remote] ERROR: kubectl not found"; exit 3; }
+command -v # Parse hosts (format: name:ip:build_path:VM|SRIOV:N3:N6:N4_CIDR:AMF_N2_IP)
+mapfile -t HOSTS < <(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){ split($0,a,":"); print a[2] } else { print $1 } }' "${SERVER_FILE}")
+if ((${#HOSTS[@]}==0)); then
+  echo "[ps_config] ERROR: no hosts parsed from ${SERVER_FILE}" >&2
+  exit 2
+fi
+RUNNER="${HOSTS[0]}"
+
+kubectl >/dev/null 2>&1 || { echo "[remote] ERROR: kubectl not found"; exit 3; }
 
 has_image_pull_backoff() {
   kubectl get pods -A --no-headers 2>/dev/null | grep -q "ImagePullBackOff"
@@ -275,3 +283,19 @@ for h in "${HOSTS[@]}"; do
 done
 
 echo "[ps_config] All hosts processed."
+
+# Gate on overall pod health after PS apply
+ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${HOST_USER}@${RUNNER}" bash -lc '
+  set -euo pipefail
+  bad=0
+  while read -r ns name ready status rest; do
+    x="${ready%%/*}"; y="${ready##*/}"
+    if [[ "$status" != "Running" || "$x" != "$y" ]]; then bad=1; fi
+  done < <(kubectl get pods -A --no-headers)
+  if [[ $bad -ne 0 ]]; then
+    echo "[ps_config] ❌ Pods not healthy after PS"
+    kubectl get pods -A || true
+    exit 1
+  fi
+  echo "[ps_config] ✅ PS stage done"
+'
