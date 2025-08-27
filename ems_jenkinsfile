@@ -1,44 +1,51 @@
 pipeline {
   agent any
+
   options {
     timestamps()
     disableConcurrentBuilds()
     timeout(time: 45, unit: 'MINUTES')
   }
+
   parameters {
-    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/EA3', description: 'Folder that contains TRILLIUM_5GCN_CNF_REL_<VER>')
-    string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3',          description: 'Version tag like 6.3.0_EA3')
+    // NEW_BUILD_PATH should be the tag folder root (e.g., /home/labadmin/EA3)
+    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/EA3', description: 'Folder containing TRILLIUM_5GCN_CNF_REL_<VER>')
+    string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3',          description: 'Version tag (e.g., 6.3.0_EA3)')
     string(name: 'SERVER_FILE',    defaultValue: 'server_pci_map.txt', description: 'Map of name:ip')
-    string(name: 'HOST_NAME',      defaultValue: '',                   description: 'Optional server name (column 1)')
-    string(name: 'HOST_USER',      defaultValue: 'root',               description: 'SSH user (like nf_config.sh)')
+    string(name: 'HOST_NAME',      defaultValue: '',                   description: 'Optional: pick name from column 1')
+    string(name: 'HOST_USER',      defaultValue: 'root',               description: 'SSH user (same as nf_config.sh)')
     string(name: 'SSH_KEY',        defaultValue: '/var/lib/jenkins/.ssh/jenkins_key', description: 'Private key path')
+
+    // EMS-specific readiness controls
+    string(name: 'EMS_NAMESPACE',  defaultValue: '',                   description: 'Optional namespace (blank = all namespaces)')
+    string(name: 'EMS_SELECTOR',   defaultValue: 'app=ems',            description: 'Label selector for EMS pods (blank = fallback to name prefix)')
+    string(name: 'EMS_NAME_PREFIX',defaultValue: 'ems',                description: 'Fallback pod-name prefix if selector returns nothing')
   }
+
   stages {
     stage('Checkout') { steps { checkout scm } }
 
-    stage('Guard: ensure correct pipeline & script') {
+    stage('Guard: ensure correct script is used') {
       steps {
         sh '''
           set -e
-          echo "== Guard check =="
-          # Fail fast if any .ems_stage.sh reference remains
-          if grep -R --line-number ".ems_stage.sh" ems_jenkinsfile Jenkinsfile scripts || true; then
-            echo "ERROR: Found references to scripts/.ems_stage.sh. Remove them and use scripts/ems_install_and_check.sh." >&2
+          if grep -R --line-number ".ems_stage.sh" . || true; then
+            echo "ERROR: Remove any use of scripts/.ems_stage.sh; using scripts/ems_install_and_check.sh" >&2
             exit 2
           fi
           test -f scripts/ems_install_and_check.sh || { echo "scripts/ems_install_and_check.sh not found" >&2; exit 3; }
-          head -n 5 scripts/ems_install_and_check.sh
         '''
       }
     }
 
-    stage('EMS install & health check (remote via SSH)') {
-      options { timeout(time: 15, unit: 'MINUTES') }
+    stage('EMS install & EMS-only health check (remote via SSH)') {
+      options { timeout(time: 20, unit: 'MINUTES') }
       steps {
         sh '''
           set -e
           chmod +x scripts/ems_install_and_check.sh
-          # Pass-through proxies if present
+
+          # Optional proxies pass-through
           export http_proxy="${http_proxy:-}"; export https_proxy="${https_proxy:-}"; export no_proxy="${no_proxy:-}"
           export HTTP_PROXY="${HTTP_PROXY:-}"; export HTTPS_PROXY="${HTTPS_PROXY:-}"; export NO_PROXY="${NO_PROXY:-}"
 
@@ -48,25 +55,34 @@ pipeline {
           NEW_VERSION="${NEW_VERSION}" \
           HOST_USER="${HOST_USER}" \
           HOST_NAME="${HOST_NAME}" \
+          EMS_NAMESPACE="${EMS_NAMESPACE}" \
+          EMS_SELECTOR="${EMS_SELECTOR}" \
+          EMS_NAME_PREFIX="${EMS_NAME_PREFIX}" \
           /bin/bash scripts/ems_install_and_check.sh
         '''
       }
     }
   }
+
   post {
     always {
+      // Best-effort snapshot of EMS pods
       sh '''
         set -e
         if [ -f "${SERVER_FILE:-server_pci_map.txt}" ]; then
           SERVER_IP="$(awk -F: '$0!~/^[[:space:]]*#/ && NF>=2 {print $2; exit}' "${SERVER_FILE:-server_pci_map.txt}")"
           if [ -n "$SERVER_IP" ] && command -v ssh >/dev/null 2>&1; then
+            NS_OPT=""
+            [ -n "${EMS_NAMESPACE:-}" ] && NS_OPT="-n ${EMS_NAMESPACE}"
+            SEL_OPT=""
+            [ -n "${EMS_SELECTOR:-}" ] && SEL_OPT="-l ${EMS_SELECTOR}"
             ssh -i "${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}" \
                 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                "${HOST_USER:-root}@${SERVER_IP}" -- 'kubectl get pods -A | (grep -i ems || true)' || true
+                "${HOST_USER:-root}@${SERVER_IP}" -- "kubectl get pods \${NS_OPT:- -A} \${SEL_OPT} | (grep -i ems || true)" || true
           fi
         fi
       '''.stripIndent()
     }
-    failure { echo 'Pipeline failed — see the EMS stage logs above for the first non-zero step.' }
+    failure { echo 'Pipeline failed — see the EMS stage logs for the first non-zero step.' }
   }
 }
