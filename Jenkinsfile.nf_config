@@ -1,90 +1,167 @@
-// Jenkinsfile.nf_config — runs ONLY scripts/nf_config.sh using Jenkins credentials 'ssh_key'
+// Jenkinsfile.nf_config — NF services config only
+// Mirrors the structure and preflight from your main Jenkinsfile.
+
 pipeline {
   agent any
-  options {
-    timestamps()
-    timeout(time: 45, unit: 'MINUTES')
-  }
+  options { timestamps(); disableConcurrentBuilds(); timeout(time: 45, unit: 'MINUTES') }
+
+  // ---- Parameters (kept simple; mirrors main file intent) ----
   parameters {
-    // Optional: leave empty to auto-detect in repo
-    string(name: 'NF_SCRIPT', defaultValue: '', description: 'Path to nf_config.sh (leave empty to auto-detect)')
+    choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'], description: 'Deployment type / capacity')
+    string(name: 'NEW_BUILD_PATH',  defaultValue: '/home/labadmin/6.3.0/EA3', description: 'Base dir like /home/labadmin/<VER>/<TAG>')
+    string(name: 'NEW_VERSION',     defaultValue: '6.3.0_EA3',                description: 'Version (tag optional), e.g. 6.3.0_EA3')
+    string(name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24',           description: 'Alias IP/CIDR to plumb on CN servers')
 
-    // Required inputs
-    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/6.3.0/EA3', description: 'Base path like /home/labadmin/<VER>/<TAG>')
-    string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3', description: 'Version (tag optional), e.g. 6.3.0_EA3')
-    choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'], description: 'Capacity profile')
-
-    // Use one file for everything by default
+    // Maps (you can keep everything in one file if you want)
     string(name: 'SERVER_FILE',         defaultValue: 'server_pci_map.txt', description: 'Hosts list (colon format; field #2 is IP)')
     string(name: 'SERVER_PCI_MAP',      defaultValue: 'server_pci_map.txt', description: 'PCI/mode map (same file by default)')
     string(name: 'SERVER_IP_RANGE_MAP', defaultValue: 'server_pci_map.txt', description: 'Per-server N4 base (.0[/mask]); same file by default')
 
-    // SSH user for remote hosts (key comes from Jenkins credentials)
+    // SSH + optional overrides
     string(name: 'HOST_USER', defaultValue: 'root', description: 'SSH username on target hosts')
-
-    // Optional overrides
     string(name: 'CN_DEPLOYMENT', defaultValue: '', description: 'VM or SRIOV (leave empty to use map)')
     string(name: 'N3_PCI',        defaultValue: '', description: 'e.g. 0000:08:00.0 (leave empty to use map)')
     string(name: 'N6_PCI',        defaultValue: '', description: 'e.g. 0000:09:00.0 (leave empty to use map)')
+
+    // Optional one-time bootstrap password to push Jenkins key if key-based login not ready
+    password(name: 'CN_BOOTSTRAP_PASS', defaultValue: '', description: 'One-time CN root password (used to push Jenkins key if needed)')
+  }
+
+  environment {
+    // Keep these identical to your main pipeline
+    SERVER_FILE = "${params.SERVER_FILE}"
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key' // same path as main file
+    INSTALL_IP_ADDR = "${params.INSTALL_IP_ADDR}"
   }
 
   stages {
-    stage('Checkout') { steps { checkout scm } }
+    stage('Checkout') {
+      steps { checkout scm }
+    }
 
     stage('Prep') {
       steps {
-        sh '''
-          #!/bin/sh
-          set -eu
-          cand="${NF_SCRIPT:-}"; [ -n "$cand" ] || cand="scripts/nf_config.sh"
-          if [ -f "$cand" ]; then nf="$cand"; else
-            echo "[pipeline] ${cand} not found — searching for nf_config.sh ..."
-            nf="$(find . -maxdepth 4 -type f -name nf_config.sh | head -n1 || true)"
-            if [ -z "$nf" ]; then
-              echo "ERROR: nf_config.sh not found (looked for ${cand})."
-              find . -maxdepth 2 -type f | sed "s|^\\./||"
-              exit 2
-            fi
-          fi
-          sed -i 's/\\r$//' "$nf" || true
-          chmod +x "$nf"
-          echo "$nf" > .nf_script_path
+        sh '''#!/bin/sh
+set -eu
+# Resolve nf_config.sh path (default location)
+cand="scripts/nf_config.sh"
+if [ -f "$cand" ]; then nf="$cand"; else
+  echo "[prep] ${cand} not found — searching for nf_config.sh ..."
+  nf="$(find . -maxdepth 4 -type f -name nf_config.sh | head -n1 || true)"
+  [ -n "$nf" ] || { echo "ERROR: nf_config.sh not found"; exit 2; }
+fi
+sed -i 's/\\r$//' "$nf" || true
+chmod +x "$nf"
+echo "$nf" > .nf_script_path
 
-          [ -f "${SERVER_FILE}" ]         || echo "[pipeline] WARNING: ${SERVER_FILE} not present in repo"
-          [ -f "${SERVER_PCI_MAP}" ]      || echo "[pipeline] WARNING: ${SERVER_PCI_MAP} not present in repo"
-          [ -f "${SERVER_IP_RANGE_MAP}" ] || echo "[pipeline] WARNING: ${SERVER_IP_RANGE_MAP} not present in repo"
-        '''
+# Non-fatal hints if maps aren’t present in repo root
+[ -f "${SERVER_FILE}" ]         || echo "[prep] WARNING: ${SERVER_FILE} not present in repo"
+[ -f "${SERVER_PCI_MAP}" ]      || echo "[prep] WARNING: ${SERVER_PCI_MAP} not present in repo"
+[ -f "${SERVER_IP_RANGE_MAP}" ] || echo "[prep] WARNING: ${SERVER_IP_RANGE_MAP} not present in repo"
+'''
+      }
+    }
+
+    // === Preflight copied from your main Jenkinsfile: ensure SSH and alias IP on all CNs ===
+    stage('Preflight SSH to CNs') {
+      steps {
+        timeout(time: 10, unit: 'MINUTES', activity: true) {
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+: "${SERVER_FILE:?missing}"; : "${SSH_KEY:?missing}"; : "${INSTALL_IP_ADDR:?missing}"
+
+PUB_KEY_FILE="${SSH_KEY}.pub"
+if [ ! -s "${PUB_KEY_FILE}" ]; then
+  echo "[preflight] Generating Jenkins SSH key at ${SSH_KEY} (no passphrase)…"
+  install -m 700 -d "$(dirname "${SSH_KEY}")"
+  ssh-keygen -q -t rsa -N "" -f "${SSH_KEY}"
+fi
+
+HOSTS=$(awk 'NF && $1 !~ /^#/ { if (index($0,":")>0){n=split($0,a,":"); print a[2]} else {print $1} }' "${SERVER_FILE}" | paste -sd " " -)
+[ -n "${HOSTS}" ] || { echo "[preflight] ERROR: No hosts parsed from ${SERVER_FILE}"; exit 2; }
+echo "[preflight] Hosts: ${HOSTS}"
+
+push_key_if_needed() {
+  local host="$1"
+  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" true 2>/dev/null; then
+    echo "[preflight] ${host}: ✅ key login OK"; return 0
+  fi
+  if [ -n "${CN_BOOTSTRAP_PASS:-}" ]; then
+    if ! command -v sshpass >/dev/null 2>&1; then
+      echo "[preflight] ERROR: sshpass required but not installed on the Jenkins agent."; exit 2
+    fi
+    echo "[preflight] ${host}: pushing Jenkins key via password…"
+    sshpass -p "${CN_BOOTSTRAP_PASS}" \
+      ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+      "root@${host}" 'install -m700 -d /root/.ssh; touch /root/.ssh/authorized_keys; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys'
+    sshpass -p "${CN_BOOTSTRAP_PASS}" scp -o StrictHostKeyChecking=no "${PUB_KEY_FILE}" "root@${host}:/root/.jenkins_key.pub.tmp"
+    sshpass -p "${CN_BOOTSTRAP_PASS}" \
+      ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+      "root@${host}" 'grep -Fxf /root/.jenkins_key.pub.tmp /root/.ssh/authorized_keys >/dev/null || cat /root/.jenkins_key.pub.tmp >> /root/.ssh/authorized_keys; rm -f /root/.jenkins_key.pub.tmp'
+    ssh-keygen -R "${host}" >/dev/null 2>&1 || true
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${host}" 'echo "[preflight] ✅ key login OK on $(hostname)"'
+  else
+    echo "[preflight] ${host}: ❌ key login failed and CN_BOOTSTRAP_PASS not provided"; return 1
+  fi
+}
+
+# SSH key ensure
+fail=0
+for h in ${HOSTS}; do
+  echo "[preflight] Testing ${h}…"
+  push_key_if_needed "${h}" || fail=1
+done
+[ "${fail}" -eq 0 ] || { echo "[preflight] ❌ One or more hosts failed SSH preflight."; exit 1; }
+
+# Alias IP ensure (uses scripts/alias_ip.sh like your main pipeline)
+echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
+fail=0
+for h in ${HOSTS}; do
+  echo "[alias-ip][${h}] ▶ start"
+  set -o pipefail
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "root@${h}" \
+      "INSTALL_IP_ADDR='${INSTALL_IP_ADDR}' bash -s -- '${INSTALL_IP_ADDR}'" \
+      2>&1 < scripts/alias_ip.sh | sed "s/^/[alias-ip][${h}] /"
+  rc=${PIPESTATUS[0]:-$?}
+  echo "[alias-ip][${h}] ◀ exit code=${rc}"
+  [ "${rc}" -eq 0 ] || fail=1
+done
+[ "${fail:-0}" -eq 0 ] || { echo "[alias-ip] ❌ Failed to enforce alias IP on one or more CNs"; exit 1; }
+echo "[preflight] ✅ All CNs accept Jenkins key & alias IP ensured."
+'''
+        }
       }
     }
 
     stage('NF services config') {
       steps {
-        // Use the SAME Jenkins credential ID as PS: 'ssh_key'
-        withCredentials([sshUserPrivateKey(credentialsId: 'ssh_key', keyFileVariable: 'SSH_KEY', usernameVariable: 'IGN')]) {
-          sh '''
-            bash -lc '
-              set -euo pipefail
-              script="$(cat .nf_script_path)"
-              echo "[pipeline] Running ${script} …"
+        // IMPORTANT: run under bash so we can use pipefail/arrays, mirroring your main file approach
+        sh '''
+          bash -lc '
+            set -euo pipefail
 
-              env \
-                SERVER_FILE="${SERVER_FILE}" \
-                SSH_KEY="${SSH_KEY}" \
-                NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-                NEW_VERSION="${NEW_VERSION}" \
-                DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-                SERVER_PCI_MAP="${SERVER_PCI_MAP}" \
-                SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP}" \
-                HOST_USER="${HOST_USER}" \
-                CN_DEPLOYMENT="${CN_DEPLOYMENT}" \
-                N3_PCI="${N3_PCI}" \
-                N6_PCI="${N6_PCI}" \
-              bash -euo pipefail "${script}" 2>&1 | tee nf_config.log
+            test -f scripts/nf_config.sh || { echo "ERROR: scripts/nf_config.sh not found"; exit 2; }
+            sed -i "s/\\r$//" scripts/nf_config.sh || true
+            chmod +x scripts/nf_config.sh
 
-              exit ${PIPESTATUS[0]}
-            '
-          '''
-        }
+            echo "[pipeline] Running scripts/nf_config.sh …"
+            env \
+              SERVER_FILE="${SERVER_FILE}" \
+              SSH_KEY="${SSH_KEY}" \
+              NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+              NEW_VERSION="${NEW_VERSION}" \
+              DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+              SERVER_PCI_MAP="${SERVER_PCI_MAP}" \
+              SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP}" \
+              HOST_USER="${HOST_USER}" \
+              CN_DEPLOYMENT="${CN_DEPLOYMENT}" \
+              N3_PCI="${N3_PCI}" \
+              N6_PCI="${N6_PCI}" \
+            bash -euo pipefail scripts/nf_config.sh 2>&1 | tee nf_config.log
+
+            exit ${PIPESTATUS[0]}
+          '
+        '''
       }
     }
   }
