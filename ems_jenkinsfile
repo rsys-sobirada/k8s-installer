@@ -1,31 +1,7 @@
-pipeline {
-  agent any
-
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-    timeout(time: 45, unit: 'MINUTES')
-  }
-
-  parameters {
-    string(name: 'NEW_BUILD_PATH',       defaultValue: '/home/labadmin',              description: 'Base path where releases are staged')
-    string(name: 'NEW_VERSION',          defaultValue: '6.3.0_EA3',                   description: 'Version tag like 6.3.0_EA3')
-    string(name: 'INSTALL_SERVER_FILE',  defaultValue: 'server_pci_map.txt',          description: 'Path to server map (not exposed contents)')
-    string(name: 'NODE_NAME',            defaultValue: '',                            description: 'Optional: pick server name from column 1 (blank=first line)')
-    string(name: 'SSH_KEY',              defaultValue: '/var/lib/jenkins/.ssh/jenkins_key', description: 'Private key used for remote login (same as nf_config.sh)')
-    string(name: 'SSH_USER',             defaultValue: 'root',                        description: 'SSH user (same as nf_config.sh)')
-  }
-
-  stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
-
-    stage('EMS install & health check (remote via SSH)') {
-      options { timeout(time: 15, unit: 'MINUTES') }
-      steps {
-        // Force bash even if Jenkins runs /bin/sh by default
-        sh label: 'Install EMS on remote server and verify (bash)', script: '''
+stage('EMS install & health check (remote via SSH)') {
+  options { timeout(time: 15, unit: 'MINUTES') }
+  steps {
+    sh label: 'Install EMS on remote server and verify (bash)', script: '''
 bash -euo pipefail <<'BASH'
 # ---------- Inputs ----------
 : "${NEW_BUILD_PATH:?missing NEW_BUILD_PATH}"
@@ -35,8 +11,8 @@ NODE_NAME="${NODE_NAME:-}"
 SSH_KEY="${SSH_KEY:?missing SSH_KEY}"
 SSH_USER="${SSH_USER:-root}"
 
-# ---------- Helpers ----------
-die(){ echo "❌ $*" >&2; exit 1; }
+# ---------- Helpers (bash-safe) ----------
+die(){ echo "ERROR: $*" 1>&2; exit 1; }
 req(){ command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
 req awk; req grep; req sed; req ssh; req scp; req curl
@@ -46,14 +22,14 @@ SSH_OPTS="-i ${SSH_KEY} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnow
 get_server_ip(){
   local file="$1" name="$2"
   [ -s "$file" ] || die "Server map not found or empty: $file"
-  local line
+  local line ip
   if [ -n "$name" ]; then
     line="$(awk -F: -v n="$name" 'BEGIN{IGNORECASE=1} $0!~/^[[:space:]]*#/ && NF>=2 && $1==n {print; exit}' "$file")"
-    [ -n "$line" ] || die "No entry for NODE_NAME=\\""${name}\\" in $file"
+    [ -n "$line" ] || die "No entry for NODE_NAME=\"${name}\" in $file"
   else
     line="$(awk -F: '$0!~/^[[:space:]]*#/ && NF>=2 {print; exit}' "$file")"
   fi
-  local ip; ip="$(awk -F: '{print $2}' <<<"$line")"
+  ip="$(printf '%s\n' "$line" | awk -F: '{print $2}')"
   [[ "$ip" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || die "Invalid IP parsed from: $line"
   printf "%s" "$ip"
 }
@@ -68,33 +44,33 @@ echo ">>> Target server: ${SERVER_IP}"
 if ! rsh true; then
   die "SSH key login failed for ${SSH_USER}@${SERVER_IP} using ${SSH_KEY}"
 fi
-echo "✅ SSH key login OK to ${SSH_USER}@${SERVER_IP}"
+echo "OK: SSH key login"
 
 # ---------- Build EMS path ----------
 BASE_VER="${NEW_VERSION%%_*}"     # e.g., 6.3.0
 TAG="${NEW_VERSION#*_}"           # e.g., EA3
 [ "$BASE_VER" != "$NEW_VERSION" ] || die "NEW_VERSION must look like 6.3.0_EA3 (got: $NEW_VERSION)"
 EMS_SCRIPTS_DIR="${NEW_BUILD_PATH}/${TAG}/TRILLIUM_5GCN_CNF_REL_${BASE_VER}/nf-services/scripts"
-echo ">>> EMS scripts dir (remote): ${EMS_SCRIPTS_DIR}"
+echo "EMS scripts dir (remote): ${EMS_SCRIPTS_DIR}"
 
 # ---------- Run EMS install remotely ----------
 rsh "bash -euo pipefail -c '
-  [ -d \\"$EMS_SCRIPTS_DIR\\" ] || { echo \\"EMS scripts dir not found: $EMS_SCRIPTS_DIR\\"; exit 1; }
-  cd \\"$EMS_SCRIPTS_DIR\\"
+  [ -d \"$EMS_SCRIPTS_DIR\" ] || { echo \"EMS scripts dir not found: $EMS_SCRIPTS_DIR\" 1>&2; exit 1; }
+  cd \"$EMS_SCRIPTS_DIR\"
   chmod +x install_ems.sh
   ./install_ems.sh
 '"
 
 # ---------- Remote health check via kubectl ----------
-echo ">>> Waiting up to 180s for EMS pods to be Ready (n/n) and Running…"
+echo "Waiting up to 180s for EMS pods Ready (n/n) & Running…"
 rsh "bash -euo pipefail -c '
   deadline=\$(( \$(date +%s) + 180 ))
   ems_all_ready() {
     mapfile -t lines < <(kubectl get pods -A 2>/dev/null | grep -i ems || true)
     ((${#lines[@]})) || return 1
     for l in \"\${lines[@]}\"; do
-      ready=\$(awk \"{print \\$3}\" <<<\"\$l\")
-      status=\$(awk \"{print \\$4}\" <<<\"\$l\")
+      ready=\$(echo \"\$l\" | awk \"{print \\$3}\")
+      status=\$(echo \"\$l\" | awk \"{print \\$4}\")
       case \"\$ready\" in
         */*) r=\"\${ready%/*}\"; t=\"\${ready#*/}\";;
         *)   r=0; t=1;;
@@ -107,14 +83,14 @@ rsh "bash -euo pipefail -c '
   }
   while :; do
     if ems_all_ready; then
-      echo \"✅ EMS pods Ready:\"
+      echo \"EMS pods Ready:\"
       kubectl get pods -A | grep -i ems || true
       break
     else
       echo \"…waiting:\"
       kubectl get pods -A | grep -i ems || echo \"(no ems pods yet)\"
     fi
-    [ \"\$(date +%s)\" -lt \"\$deadline\" ] || { echo \"Timeout: EMS pods not Ready within 3 minutes\"; exit 1; }
+    [ \"\$(date +%s)\" -lt \"\$deadline\" ] || { echo \"Timeout: EMS pods not Ready within 3 minutes\" 1>&2; exit 1; }
     sleep 5
   done
   echo \"--- short watch ---\"
@@ -126,38 +102,16 @@ rsh "bash -euo pipefail -c '
 
 # ---------- GUI probe ----------
 EMS_URL="https://${SERVER_IP}.nip.io/ems/register"
-echo ">>> Probing EMS GUI: $EMS_URL"
+echo "Probing EMS GUI: $EMS_URL"
 code="$(curl -sk -o /dev/null -w '%{http_code}' "$EMS_URL" || true)"
 if [ "$code" = "200" ] || [ "$code" = "302" ]; then
-  echo "✅ EMS GUI reachable (HTTP $code) at $EMS_URL"
+  echo "OK: EMS GUI reachable (HTTP $code) at $EMS_URL"
 else
   die "EMS GUI not reachable (HTTP $code) at $EMS_URL"
 fi
 
-echo "🎉 EMS remote install & checks completed."
-echo "👉 Register via GUI (once): user=root, name=root, password=root123"
+echo "DONE: EMS remote install & checks ok (register once: root/root123)"
 BASH
 '''
-      }
-    }
-  }
-
-  post {
-    always {
-      // best-effort final snapshot; guard for unset params
-      sh '''
-        set -e
-        if command -v awk >/dev/null 2>&1 && [ -n "${INSTALL_SERVER_FILE:-}" ] && [ -f "${INSTALL_SERVER_FILE}" ]; then
-          SERVER_IP="$(awk -F: '$0!~/^[[:space:]]*#/ && NF>=2 {print $2; exit}' "${INSTALL_SERVER_FILE}")"
-          if [ -n "$SERVER_IP" ] && command -v ssh >/dev/null 2>&1; then
-            ssh -i "${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@${SERVER_IP}" -- \
-              "kubectl get pods -A | (grep -i ems || true)" || true
-          fi
-        fi
-      '''.stripIndent()
-    }
-    failure {
-      echo 'Pipeline failed — first non-zero step above shows why.'
-    }
   }
 }
