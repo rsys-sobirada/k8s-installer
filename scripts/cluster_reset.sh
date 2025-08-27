@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # scripts/cluster_reset.sh
-if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
 # Takes OLD_BUILD_PATH per-server from server_pci_map.txt (ignores UI OLD_BUILD_PATH).
 # Flow:
 # 1) Detect Kubernetes on host
@@ -36,7 +35,7 @@ IP_MONITOR_INTERVAL="${IP_MONITOR_INTERVAL:-30}"   # seconds between checks
 # ===== Gate & validation =====
 shopt -s nocasematch
 if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
-  echo "ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
+  echo ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
   exit 0
 fi
 shopt -u nocasematch
@@ -150,12 +149,19 @@ RS
 # Read "ip|path" from server_pci_map.txt (supports name:ip:path or ip:path)
 read_server_entries(){
   awk 'NF && $1 !~ /^#/ {
-    gsub(/\r/,"");           # strip Windows CRs
-    sub(/[[:space:]]+$/,""); # strip trailing whitespace
-    n=split($0,a,":")
-    if(n==3){ printf "%s|%s\n", a[2], a[3] }      # name:ip:path
-    else if(n==2){ printf "%s|%s\n", a[1], a[2] } # ip:path
-    else { printf "%s|\n", a[1] }                 # ip only (no path)
+    gsub(/
+/,"");
+    sub(/[[:space:]]+$/, "");
+    n = split($0, a, ":");
+    if (n >= 2) {
+      ip = a[2];
+      path = (n >= 3 ? a[3] : "");
+      printf "%s|%s
+", ip, path;
+    } else {
+      printf "%s|
+", a[1];
+    }
   }' "$SERVER_FILE"
 }
 
