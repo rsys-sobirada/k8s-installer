@@ -14,10 +14,13 @@ ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${HOST_USER:-root}@${ip}" bash 
   if [ ! -f '${UNINSTALL}' ]; then
     echo '[reset] ❌ Not found: ${UNINSTALL}'; exit 2
   fi
+  # strip CRLF just in case and ensure executable
   sed -i 's/\r$//' '${UNINSTALL}' || true
   chmod +x '${UNINSTALL}'
+  # force bash to avoid /bin/sh parsing errors
   bash '${UNINSTALL}'
 "
+
 
 
 #    run ./uninstall_k8s.sh with retries; restore swaps.
