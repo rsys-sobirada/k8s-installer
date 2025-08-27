@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # scripts/nf_config.sh — Configure NF YAMLs on CNs
-# Env (required): SERVER_FILE, SSH_KEY, NEW_BUILD_PATH, NEW_VERSION, DEPLOYMENT_TYPE
-# Env (optional): HOST_USER (default root)
-# Server map line format (no spaces): NAME:HOST:OLD_BUILD:MODE:N3:N6:N4:AMF
-#   - N3/N6 may be PCI (0000:08:00.0) or iface name (e.g., enp3s0f0)
-#   - N4 is IPv4 CIDR (e.g., 10.11.10.0/30)
-#   - AMF is IPv4 (e.g., 12.12.1.100)
+# Required env: SERVER_FILE, SSH_KEY, NEW_BUILD_PATH, NEW_VERSION, DEPLOYMENT_TYPE
+# Optional env: HOST_USER (default root)
+#
+# server_pci_map.txt format (no spaces in fields):
+# NAME:HOST:/path/to/build:MODE:N3:N6:N4:AMF
+# - If N3/N6 are PCI, each is split into 3 tokens by ":" (0000:08:00.0), so the whole line has 12 colon-separated tokens.
+# - If N3/N6 are interface names (enpXsY), the line has 8 tokens.
 
 set -euo pipefail
 
@@ -29,25 +30,45 @@ echo "[nf_config] NEW_VERSION=${NEW_VERSION} (VER=${VER})"
 echo "[nf_config] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE} (CAP=${CAP})"
 echo "[nf_config] SERVER_FILE=${SERVER_FILE}"
 
-# --- parse server file lines (ignore blanks/comments). No spaces allowed in fields. ---
-mapfile -t MAPLINES < <(awk 'NF && $1 !~ /^#/' "${SERVER_FILE}")
+# --- read non-empty, non-comment lines ---
+while IFS= read -r RAW; do
+  [[ -z "$RAW" || "$RAW" =~ ^[[:space:]]*# ]] && continue
+  LINE="${RAW//[[:space:]]/}"   # remove all spaces/tabs just to be safe
 
-for RAW in "${MAPLINES[@]}"; do
-  # strip spaces/tabs just in case
-  LINE="$(printf '%s' "${RAW}" | tr -d '[:space:]')"
+  # Split by ":" into array (safe even with paths having "/")
+  IFS=':' read -r -a parts <<< "$LINE"
+  n=${#parts[@]}
 
-  # parse from the RIGHT to avoid breaking on PCI colons
-  work="${LINE}"
+  NAME=""; HOST=""; OLD_BUILD=""; MODE=""
+  N3_VAL=""; N6_VAL=""; N4_CIDR=""; AMF_IP=""
 
-  AMF_IP="${work##*:}";   work="${work%:*}"          # last
-  N4_CIDR="${work##*:}";  work="${work%:*}"          # last-1
-  N6_VAL="${work##*:}";   work="${work%:*}"          # last-2
-  N3_VAL="${work##*:}";   work="${work%:*}"          # last-3
-  MODE="${work##*:}";     work="${work%:*}"          # last-4
-  HOST="${work##*:}";     work="${work%:*}"          # last-5 (name left in $work but unused)
+  if (( n == 12 )); then
+    # PCI format: 12 tokens total
+    NAME="${parts[0]}"
+    HOST="${parts[1]}"
+    OLD_BUILD="${parts[2]}"
+    MODE="${parts[3]}"
+    N3_VAL="${parts[4]}:${parts[5]}:${parts[6]}"
+    N6_VAL="${parts[7]}:${parts[8]}:${parts[9]}"
+    N4_CIDR="${parts[10]}"
+    AMF_IP="${parts[11]}"
+  elif (( n == 8 )); then
+    # Interface-name format: 8 tokens total
+    NAME="${parts[0]}"
+    HOST="${parts[1]}"
+    OLD_BUILD="${parts[2]}"
+    MODE="${parts[3]}"
+    N3_VAL="${parts[4]}"
+    N6_VAL="${parts[5]}"
+    N4_CIDR="${parts[6]}"
+    AMF_IP="${parts[7]}"
+  else
+    echo "[nf_config] skip malformed line (expected 8 or 12 fields): ${RAW}"
+    continue
+  fi
 
-  if [[ -z "${HOST}" || -z "${MODE}" || -z "${N3_VAL}" || -z "${N6_VAL}" || -z "${N4_CIDR}" || -z "${AMF_IP}" ]]; then
-    echo "[nf_config] skip malformed line: ${RAW}"
+  if [[ -z "$HOST" || -z "$MODE" || -z "$N3_VAL" || -z "$N6_VAL" || -z "$N4_CIDR" || -z "$AMF_IP" ]]; then
+    echo "[nf_config] skip: missing required fields in: ${RAW}"
     continue
   fi
 
@@ -74,24 +95,21 @@ done
 is_pci() { [[ "$1" =~ ^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f]$ ]]; }
 
 resolve_pci() {
-  # arg can be PCI (pass-through), iface name, or empty
   local t="$1"; local bus=""
   if is_pci "$t"; then echo "$t"; return 0; fi
   if [[ -z "${t}" ]]; then echo ""; return 0; fi
   if [[ -d "/sys/class/net/${t}" ]]; then
-    # try ethtool
     if command -v ethtool >/dev/null 2>&1; then
       bus=$(ethtool -i "$t" 2>/dev/null | awk '/bus-info:/ {print $2}') || true
       if is_pci "$bus"; then echo "$bus"; return 0; fi
     fi
-    # try sysfs link
     bus=$(basename "$(readlink -f "/sys/class/net/$t/device" 2>/dev/null)" 2>/dev/null) || true
     if is_pci "$bus"; then echo "$bus"; return 0; fi
   fi
   echo ""
 }
 
-patch_key_scalar() { # file key value    (replaces first "key: ..." line)
+patch_key_scalar() { # file key value    (replace first key: ...)
   awk -v key="$2" -v val="$3" '
     !done && $0 ~ "^[[:space:]]*" key "[[:space:]]*:" {
       i=match($0,/[^[:space:]]/); ind=(i?substr($0,1,i-1):"");
@@ -132,7 +150,7 @@ patch_first_exclude_ipv4() { # file A.B.C.D/32 => replace first IPv4 /32 inside 
     }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
-# ---- normalize line endings (avoid awk weirdness) ----
+# ---- normalize line endings ----
 sed -i 's/\r$//' "$UPF" "$SMF" "$AMF" "$GV"
 
 # ---- global-values.yaml tweaks ----
@@ -148,11 +166,10 @@ find "${NF_ROOT}" -maxdepth 1 -type f -name "*.yaml" -print0 | \
   xargs -0 sed -i -E 's/(image:[[:space:]]*"[^"]*:)v1(")/\1'"${VER}"'\2/g'
 echo "[remote] replaced image tag v1 -> ${VER} in nf-services/scripts."
 
-# ---- AMF NGC external IP under the comment, with fallback to externalIP: key ----
+# ---- AMF NGC IP under the comment, plus explicit externalIP: if present ----
 if [[ -n "${AMF_IP:-}" && "${AMF_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   awk -v ip="$AMF_IP" '
-    {
-      line=$0
+    { line=$0
       if (mark) {
         if (line ~ /^[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+([[:space:]]*#.*)?$/) {
           i=match(line,/[^[:space:]]/); ind=(i?substr(line,1,i-1):"");
@@ -162,12 +179,10 @@ if [[ -n "${AMF_IP:-}" && "${AMF_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; th
       if (line ~ /# *NGC IP for external Communication/) { print line; mark=1; next }
       print line
     }' "$AMF" > "$AMF.tmp" && mv "$AMF.tmp" "$AMF"
-
-  # also update an explicit key if present
   sed -i -E 's/^([[:space:]]*externalIP:).*/\1 '"${AMF_IP}"'/' "$AMF"
 fi
 
-# ---- UPF intfConfig type based on MODE (if block exists) ----
+# ---- UPF intfConfig.type per MODE ----
 MODE_UP="$(printf '%s' "${MODE_IN}" | tr '[:lower:]' '[:upper:]')"
 if grep -qE '^ *intfConfig:' "$UPF"; then
   if [[ "${MODE_UP}" == "VM" ]]; then
@@ -181,19 +196,19 @@ if grep -qE '^ *intfConfig:' "$UPF"; then
   fi
 fi
 
-# ---- resolve N3/N6 to PCI (if iface names were provided) ----
+# ---- Resolve N3/N6 to PCI if iface names given ----
 N3_PCI="$(resolve_pci "${N3_IN}")"
 N6_PCI="$(resolve_pci "${N6_IN}")"
 
-# ---- inject PCI inside correct interface blocks using sed ranges (BusyBox/GNU sed safe) ----
-# N3 (nguInterface) pciAddress within nguInterface: ... until n6Interface_0:
+# ---- Inject PCI using sed ranges (BusyBox/GNU sed safe) ----
+# N3 (nguInterface) pciAddress within nguInterface: ... up to n6Interface_0:
 if [[ -n "${N3_PCI}" ]]; then
   sed -i -e '/^ *nguInterface:/,/^ *n6Interface_0:/{
     s/^\([[:space:]]*pciAddress:\).*/\1 '"${N3_PCI}"'/
   }' "$UPF"
 fi
 
-# N6 (n6Interface_0) pciAddress within its block until the next header (three possible boundaries)
+# N6 (n6Interface_0) pciAddress within its block until the next header (whichever comes first)
 if [[ -n "${N6_PCI}" ]]; then
   sed -i -e '/^ *n6Interface_0:/,/^ *n6Interface_1:/{
     s/^\([[:space:]]*pciAddress:\).*/\1 '"${N6_PCI}"'/
@@ -206,7 +221,7 @@ if [[ -n "${N6_PCI}" ]]; then
   }' "$UPF"
 fi
 
-# ---- N4 ipam updates: first IPv4 "range" and first IPv4 in "exclude" ----
+# ---- N4 ipam updates ----
 if [[ -n "${N4_IN:-}" && "${N4_IN}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)\/([0-9]+)$ ]]; then
   base3="${BASH_REMATCH[1]}"; last="${BASH_REMATCH[2]}"; mask="${BASH_REMATCH[3]}"
   N4_RANGE="${base3}.${last}/${mask}"
@@ -222,23 +237,19 @@ else
   echo "[remote] N4_IN invalid or missing — skipping N4 edits"
 fi
 
-# ---- sanity prints for the pipeline log ----
+# ---- sanity prints ----
 echo "[remote] NF checks:"
-# AMF line under comment OR explicit key
 awk '/# *NGC IP for external Communication/{p=NR+1} NR==p{print "[remote] AMF NGC line: " $0}' "$AMF" || true
 grep -nE '^[[:space:]]*externalIP:' "$AMF" | head -1 | sed 's/^/[remote] /' || true
-# UPF type
 awk '/^ *intfConfig:/{f=1} f&&/^ *type:/{print "[remote] upf.type: "$0; f=0}' "$UPF" || true
-# PCI lines
 awk '/^ *nguInterface:/{f=1} f&&/^ *pciAddress:/{print "[remote] upf.ngu pci: "$0; f=0}' "$UPF" || true
 awk '/^ *n6Interface_0:/{f=1} f&&/^ *pciAddress:/{print "[remote] upf.n6  pci: "$0; f=0}' "$UPF" || true
-# ranges/excludes
 grep -nE '"range"|exclude' "$UPF" "$SMF" | sed "s|${NF_ROOT}/||" || true
 
 echo "[remote] ✅ NF config complete on ${HOST_IP}"
 EOSH
 
   echo "[nf_config][${HOST}] ◀ done"
-done
+done < "${SERVER_FILE}"
 
 echo "[nf_config] All hosts processed."
