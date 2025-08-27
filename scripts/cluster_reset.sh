@@ -6,23 +6,6 @@
 # 2) Ensure requirements.txt under old build's kubespray; if missing, start install_k8s.sh and monitor
 # 3) When requirements.txt appears, stop installer, swap in Jenkins reset.yml + inventory,
 
-UNINSTALL="${server_path}/uninstall_k8s.sh"
-echo "🧹 Running uninstall_k8s.sh on ${ip} (attempt ${tries}/${RETRY_COUNT})..."
-
-ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${HOST_USER:-root}@${ip}" bash -lc "
-  set -euo pipefail
-  if [ ! -f '${UNINSTALL}' ]; then
-    echo '[reset] ❌ Not found: ${UNINSTALL}'; exit 2
-  fi
-  # strip CRLF just in case and ensure executable
-  sed -i 's/\r$//' '${UNINSTALL}' || true
-  chmod +x '${UNINSTALL}'
-  # force bash to avoid /bin/sh parsing errors
-  bash '${UNINSTALL}'
-"
-
-
-
 #    run ./uninstall_k8s.sh with retries; restore swaps.
 
 set -euo pipefail
@@ -53,7 +36,7 @@ IP_MONITOR_INTERVAL="${IP_MONITOR_INTERVAL:-30}"   # seconds between checks
 # ===== Gate & validation =====
 shopt -s nocasematch
 if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
-  echo ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
+  echo "ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
   exit 0
 fi
 shopt -u nocasematch
