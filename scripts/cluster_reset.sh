@@ -36,7 +36,7 @@ IP_MONITOR_INTERVAL="${IP_MONITOR_INTERVAL:-30}"   # seconds between checks
 # ===== Gate & validation =====
 shopt -s nocasematch
 if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
-  echo ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
+  echo "ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
   exit 0
 fi
 shopt -u nocasematch
