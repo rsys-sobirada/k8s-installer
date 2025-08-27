@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # scripts/cluster_reset.sh
+if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
 # Takes OLD_BUILD_PATH per-server from server_pci_map.txt (ignores UI OLD_BUILD_PATH).
 # Flow:
 # 1) Detect Kubernetes on host
@@ -35,7 +36,7 @@ IP_MONITOR_INTERVAL="${IP_MONITOR_INTERVAL:-30}"   # seconds between checks
 # ===== Gate & validation =====
 shopt -s nocasematch
 if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
-  echo ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
+  echo "ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
   exit 0
 fi
 shopt -u nocasematch
