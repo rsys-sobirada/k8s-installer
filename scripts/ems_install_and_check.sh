@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/.ems_stage.sh
+# scripts/ems_install_and_check.sh
 # EMS install + health check + GUI probe (remote via SSH)
 # Exits non-zero on any failure so Jenkins aborts.
 
@@ -21,7 +21,7 @@ HPU="${HTTP_PROXY:-}"; HPSU="${HTTPS_PROXY:-}"; NPU="${NO_PROXY:-}"
 die(){ echo "ERROR: $*" 1>&2; exit 1; }
 req(){ command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
-req awk; req grep; req sed; req ssh; req curl
+req awk; req ssh; req curl
 
 SSH_OPTS="-i ${SSH_KEY} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 rsh(){ ssh $SSH_OPTS "${SSH_USER}@${SERVER_IP}" -- "$@"; }
@@ -66,10 +66,9 @@ EMS_SCRIPTS_DIR="${NEW_BUILD_PATH}/${TAG}/TRILLIUM_5GCN_CNF_REL_${BASE_VER}/nf-s
 echo "EMS scripts dir (remote): ${EMS_SCRIPTS_DIR}"
 
 # ---------- Remote env bootstrap (profile, PATH, KUBECONFIG, proxies) ----------
-# NOTE: Temporarily disable nounset while sourcing profiles (they touch PS1/XDG_*).
-REMOTE_ENV="\
-export http_proxy='${HP}'; export https_proxy='${HPS}'; export no_proxy='${NP}'; \
-export HTTP_PROXY='${HPU}'; export HTTPS_PROXY='${HPSU}'; export NO_PROXY='${NPU}'; \
+# Use ONLY double quotes so this embeds safely into a single-quoted ssh command.
+REMOTE_ENV="export http_proxy=\"${HP}\"; export https_proxy=\"${HPS}\"; export no_proxy=\"${NP}\"; \
+export HTTP_PROXY=\"${HPU}\"; export HTTPS_PROXY=\"${HPSU}\"; export NO_PROXY=\"${NPU}\"; \
 set +u; \
 [ -f /etc/profile ] && . /etc/profile || true; \
 [ -f /etc/bash.bashrc ] && . /etc/bash.bashrc || true; \
