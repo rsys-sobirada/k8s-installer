@@ -38,31 +38,54 @@ pipeline {
       }
     }
 
-    stage('EMS install & EMS-only health check (remote via SSH)') {
-      options { timeout(time: 20, unit: 'MINUTES') }
-      steps {
-        sh '''
-          set -e
-          chmod +x scripts/ems_install_and_check.sh
+stage('EMS install & EMS-only health check (remote via SSH)') {
+  options { timeout(time: 20, unit: 'MINUTES') }
+  steps {
+    sh '''
+      set -e
 
-          # Optional proxies pass-through
-          export http_proxy="${http_proxy:-}"; export https_proxy="${https_proxy:-}"; export no_proxy="${no_proxy:-}"
-          export HTTP_PROXY="${HTTP_PROXY:-}"; export HTTPS_PROXY="${HTTPS_PROXY:-}"; export NO_PROXY="${NO_PROXY:-}"
+      echo "== Guard =="
+      # 1) Fail if any leftover .ems_stage.sh is referenced anywhere
+      if grep -R --line-number "\\.ems_stage\\.sh" . || true; then
+        echo "ERROR: Remove any use of scripts/.ems_stage.sh; using scripts/ems_install_and_check.sh" >&2
+        exit 2
+      fi
 
-          SERVER_FILE="${SERVER_FILE}" \
-          SSH_KEY="${SSH_KEY}" \
-          NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
-          NEW_VERSION="${NEW_VERSION}" \
-          HOST_USER="${HOST_USER}" \
-          HOST_NAME="${HOST_NAME}" \
-          EMS_NAMESPACE="${EMS_NAMESPACE}" \
-          EMS_SELECTOR="${EMS_SELECTOR}" \
-          EMS_NAME_PREFIX="${EMS_NAME_PREFIX}" \
-          /bin/bash scripts/ems_install_and_check.sh
-        '''
-      }
-    }
+      # 2) Ensure we are running the repo script
+      test -f scripts/ems_install_and_check.sh || { echo "scripts/ems_install_and_check.sh not found" >&2; exit 3; }
+
+      # 3) Force the repo script to avoid loading remote profiles (belt & suspenders)
+      #    - add --noprofile --norc to any remote bash execs
+      sed -i -E "s/bash[[:space:]]+(-[[:alnum:]]+)?[[:space:]]*-c[[:space:]]+'/bash --noprofile --norc -euo pipefail -c '/" scripts/ems_install_and_check.sh || true
+      #    - strip any lines that source /etc/profile, /etc/bash.bashrc, or ~/.bashrc
+      awk '!/\\/etc\\/profile/ && !/bash\\.bashrc/ && !/\\.bashrc/' scripts/ems_install_and_check.sh > scripts/ems_install_and_check.sh.noprof
+      mv scripts/ems_install_and_check.sh.noprof scripts/ems_install_and_check.sh
+
+      chmod +x scripts/ems_install_and_check.sh
+
+      # Optional proxies
+      export http_proxy="${http_proxy:-}"; export https_proxy="${https_proxy:-}"; export no_proxy="${no_proxy:-}"
+      export HTTP_PROXY="${HTTP_PROXY:-}"; export HTTPS_PROXY="${HTTPS_PROXY:-}"; export NO_PROXY="${NO_PROXY:-}"
+
+      # EMS namespace/selector defaults (only EMS pods)
+      : "${EMS_NAMESPACE:=}"           # blank = all namespaces
+      : "${EMS_SELECTOR:=app=ems}"     # adjust to your label (e.g., app.kubernetes.io/name=ems)
+      : "${EMS_NAME_PREFIX:=ems}"      # fallback if selector returns none
+
+      SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}" \
+      SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}" \
+      NEW_BUILD_PATH="${NEW_BUILD_PATH:-/home/labadmin/EA3}" \
+      NEW_VERSION="${NEW_VERSION:-6.3.0_EA3}" \
+      HOST_USER="${HOST_USER:-root}" \
+      HOST_NAME="${HOST_NAME:-}" \
+      EMS_NAMESPACE="${EMS_NAMESPACE}" \
+      EMS_SELECTOR="${EMS_SELECTOR}" \
+      EMS_NAME_PREFIX="${EMS_NAME_PREFIX}" \
+      /bin/bash -x scripts/ems_install_and_check.sh
+    '''
   }
+}
+
 
   post {
     always {
