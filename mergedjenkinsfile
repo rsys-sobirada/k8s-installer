@@ -658,10 +658,10 @@ exit ${PIPESTATUS[0]}
     }
   }
 
+  }  // close stages
   post {
     always {
       archiveArtifacts artifacts: 'health_check.log, ps_config.log, cs_config.log, nf_config.log', allowEmptyArchive: true
     }
   }
-}
 }
