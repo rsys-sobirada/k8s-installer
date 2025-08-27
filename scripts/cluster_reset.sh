@@ -5,7 +5,6 @@
 # 1) Detect Kubernetes on host
 # 2) Ensure requirements.txt under old build's kubespray; if missing, start install_k8s.sh and monitor
 # 3) When requirements.txt appears, stop installer, swap in Jenkins reset.yml + inventory,
-
 #    run ./uninstall_k8s.sh with retries; restore swaps.
 
 set -euo pipefail
@@ -36,7 +35,7 @@ IP_MONITOR_INTERVAL="${IP_MONITOR_INTERVAL:-30}"   # seconds between checks
 # ===== Gate & validation =====
 shopt -s nocasematch
 if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
-  echo "ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
+  echo ℹ️  CLUSTER_RESET gate disabled (got '$CR'). Skipping."
   exit 0
 fi
 shopt -u nocasematch
@@ -153,7 +152,7 @@ read_server_entries(){
     gsub(/\r/,"");           # strip Windows CRs
     sub(/[[:space:]]+$/,""); # strip trailing whitespace
     n=split($0,a,":")
-    if(n>=3){ printf "%s|%s\n", a[2], a[3] }      # name:ip:path
+    if(n==3){ printf "%s|%s\n", a[2], a[3] }      # name:ip:path
     else if(n==2){ printf "%s|%s\n", a[1], a[2] } # ip:path
     else { printf "%s|\n", a[1] }                 # ip only (no path)
   }' "$SERVER_FILE"
