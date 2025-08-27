@@ -1,279 +1,250 @@
 #!/usr/bin/env bash
+# nf_config.sh — configure NF Services YAMLs per CN host
+#
+# Inputs (exported by Jenkins):
+#   SERVER_FILE          (required) -> colon file: name:SERVER_IP:OLD_BUILD_PATH:CN_MODE:N3:N6:N4_BASE:AMF_N2_IP
+#   SSH_KEY              (required) -> Jenkins node private key path
+#   NEW_BUILD_PATH       (required) -> e.g. /home/labadmin/6.3.0/EA3
+#   NEW_VERSION          (required) -> e.g. 6.3.0_EA3  (we use 6.3.0)
+#   DEPLOYMENT_TYPE      (required) -> Low|Medium|High
+# Optional overrides (if set, they override map values):
+#   HOST_USER (default root), CN_DEPLOYMENT, N3_PCI, N6_PCI
+#
+# Effects on each host:
+#   - Edits ${NEW_BUILD_PATH}/TRILLIUM_5GCN_CNF_REL_<VER>/nf-services/scripts/*
+#   - global-values.yaml: capacitySetup=<CAP>; ingressExtFQDN=<SERVER_IP>.nip.io; k8sCpuMgrStaticPolicyEnable=false if CAP=LOW
+#   - amf-1-values.yaml: externalIP=<AMF_N2_IP> (if provided)
+#   - upf-1-values.yaml (CN_MODE=VM): type="devPassthrough"; set pciAddress for nguInterface/n6Interface_0
+#       * N3/N6 may be PCI "0000:BB:DD.F" or interface name (ens7f0, bond0, ...); interface is resolved to PCI on the host
+#   - N4 IPAM: upf-1-values.yaml range=N4_BASE, exclude=base+1; smf-1-values.yaml range=N4_BASE, exclude=base+2
+#   - Replace word-boundary v1 -> <VER> in files directly under nf-services/scripts (non-recursive)
+#
 set -euo pipefail
 
-# --- required env (exported by Jenkins stage) ---
-: "${SERVER_FILE:?missing}"          # host list (we support server_pci_map.txt format)
-: "${SSH_KEY:?missing}"              # Jenkins node private key path
-: "${NEW_VERSION:?missing}"          # e.g. 6.3.0_EA3 (we use only 6.3.0)
-: "${NEW_BUILD_PATH:?missing}"       # e.g. /home/labadmin/6.3.0/EA3
-: "${DEPLOYMENT_TYPE:?missing}"      # Low|Medium|High
+: "${SERVER_FILE:?missing}"
+: "${SSH_KEY:?missing}"
+: "${NEW_BUILD_PATH:?missing}"
+: "${NEW_VERSION:?missing}"
+: "${DEPLOYMENT_TYPE:?missing}"
 
-# Optional overrides (beat map file values if provided)
-#   CN_DEPLOYMENT=VM|SRIOV
-#   N3_PCI=0000:08:00.0
-#   N6_PCI=0000:08:01.1
-SERVER_PCI_MAP="${SERVER_PCI_MAP:-${SERVER_FILE}}"
-SERVER_IP_RANGE_MAP="${SERVER_IP_RANGE_MAP:-${SERVER_FILE}}"
 HOST_USER="${HOST_USER:-root}"
+OVRD_CN_MODE="${CN_DEPLOYMENT:-}"
+OVRD_N3="${N3_PCI:-}"
+OVRD_N6="${N6_PCI:-}"
 
-# capacity from DEPLOYMENT_TYPE
+# Version-only (strip tag like _EA3)
+VER="${NEW_VERSION%%_*}"
+
+# NF root path: <NEW_BUILD_PATH>/TRILLIUM_5GCN_CNF_REL_<VER>/nf-services/scripts
+NF_ROOT_BASE="${NEW_BUILD_PATH%/}/TRILLIUM_5GCN_CNF_REL_${VER}/nf-services/scripts"
+
+# CAP mapping
 case "${DEPLOYMENT_TYPE}" in
-  [Ll]ow)    cap="LOW" ;;
-  [Mm]edium) cap="MEDIUM" ;;
-  [Hh]igh)   cap="HIGH" ;;
-  *)         cap="MEDIUM" ;;
+  [Ll]ow)    CAP="LOW" ;;
+  [Mm]edium) CAP="MEDIUM" ;;
+  [Hh]igh)   CAP="HIGH" ;;
+  *)         CAP="MEDIUM" ;;
 esac
 
 echo "[nf_config] NEW_BUILD_PATH=${NEW_BUILD_PATH}"
-echo "[nf_config] NEW_VERSION=${NEW_VERSION}"
-echo "[nf_config] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE} (${cap})"
+echo "[nf_config] NEW_VERSION=${NEW_VERSION} (VER=${VER})"
+echo "[nf_config] DEPLOYMENT_TYPE=${DEPLOYMENT_TYPE} (CAP=${CAP})"
 echo "[nf_config] SERVER_FILE=${SERVER_FILE}"
-echo "[nf_config] SERVER_PCI_MAP=${SERVER_PCI_MAP}"
-echo "[nf_config] SERVER_IP_RANGE_MAP=${SERVER_IP_RANGE_MAP}"
+echo "[nf_config] NF_ROOT_BASE=${NF_ROOT_BASE}"
 
-# ----- read target host IPs from SERVER_FILE -----
-# supports:
-#   name:IP:path:VM|SRIOV:PCI:PCI:...  (we take 2nd field)
-#   IP                                 (takes the line)
-mapfile -t HOSTS < <(awk '
-  NF && $1 !~ /^#/ {
-    if (index($0,":")>0) { n=split($0,a,":"); print a[2] }
-    else                 { print $1 }
-  }' "${SERVER_FILE}")
+# ---------- helpers on Jenkins node ----------
+trim() { awk '{$1=$1;print}' <<<"${1:-}"; }
+
+# get hosts (field #2 = IP)
+mapfile -t HOSTS < <(awk -F: 'NF && $1 !~ /^#/ {print $2}' "${SERVER_FILE}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' )
 
 if ((${#HOSTS[@]}==0)); then
   echo "[nf_config] ERROR: no hosts parsed from ${SERVER_FILE}" >&2
+  exit 2
+fi
+
+lookup_map_line() {
+  # $1 = map file, $2 = ip, prints first matching line
+  awk -F: -v ip="$2" 'NF && $1 !~ /^#/ && $2==ip {print; exit}' "$1"
+}
+
+extract_field() {
+  # $1 = colon-line, $2 = index (1-based)
+  awk -F: -v idx="$2" '{print $idx}' <<<"$1"
+}
+
+rc_any=0
+for H in "${HOSTS[@]}"; do
+  echo "[nf_config][${H}] start"
+
+  line="$(lookup_map_line "${SERVER_FILE}" "${H}")" || true
+  if [[ -z "${line}" ]]; then
+    echo "[nf_config][${H}] ERROR: not found in ${SERVER_FILE}" >&2
+    rc_any=1; continue
+  fi
+
+  # Map fields (with overrides when provided)
+  cn_mode="$(trim "${OVRD_CN_MODE:-$(extract_field "${line}" 4)}")"
+  n3_arg="$(trim "${OVRD_N3:-$(extract_field "${line}" 5)}")"
+  n6_arg="$(trim "${OVRD_N6:-$(extract_field "${line}" 6)}")"
+  n4_base="$(trim "$(extract_field "${line}" 7)")"
+  amf_ext="$(trim "$(extract_field "${line}" 8)")"
+
+  # Remote execute: pass all args (use defaults on the remote)
+  set +e
+  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${HOST_USER}@${H}" bash -s -- \
+      "${NF_ROOT_BASE}" "${H}" "${CAP}" "${n4_base}" "${cn_mode}" "${n3_arg}" "${n6_arg}" "${VER}" "${amf_ext}" <<'REMOTE'
+set -euo pipefail
+
+NF_ROOT_BASE="${1}"      # e.g. /home/labadmin/6.3.0/EA3/TRILLIUM_5GCN_CNF_REL_6.3.0/nf-services/scripts
+SERVER_IP="${2}"
+CAP="${3}"               # LOW/MEDIUM/HIGH
+N4_BASE="$(echo "${4:-}" | awk '{$1=$1;print}')"   # trim
+CN_MODE="$(echo "${5:-}" | awk '{print toupper($0)}')"  # VM/SRIOV/empty
+N3_ARG="${6:-}"
+N6_ARG="${7:-}"
+NEW_VER="${8:-}"         # 6.3.0
+AMF_EXT="$(echo "${9:-}" | awk '{$1=$1;print}')"   # trim
+
+echo "[remote] NF_ROOT=${NF_ROOT_BASE}"
+test -d "${NF_ROOT_BASE}" || { echo "[remote] ERROR: NF path not found: ${NF_ROOT_BASE}"; exit 3; }
+
+# --- helpers ---
+file_or_die() { test -f "$1" || { echo "[remote] ERROR: missing $1"; exit 4; }; }
+bak() { cp -a "$1" "$1.bak"; }
+
+# Resolve interface -> PCI (or keep PCI if already valid)
+pci_regex='^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$'
+resolve_pci_from_arg() {
+  local arg="$1"
+  [[ -z "$arg" ]] && { echo ""; return; }
+  if [[ "$arg" =~ $pci_regex ]]; then echo "$arg"; return; fi
+  # bond: take first slave
+  if [[ -f "/sys/class/net/$arg/bonding/slaves" ]]; then
+    local slave; slave="$(awk '{print $1; exit}' "/sys/class/net/$arg/bonding/slaves" 2>/dev/null || true)"
+    if [[ -n "$slave" && -e "/sys/class/net/$slave/device" ]]; then
+      basename "$(readlink -f "/sys/class/net/$slave/device")"; return
+    fi
+  fi
+  # plain interface
+  if [[ -e "/sys/class/net/$arg/device" ]]; then
+    basename "$(readlink -f "/sys/class/net/$arg/device")"; return
+  fi
+  echo ""
+}
+
+N3_PCI="$(resolve_pci_from_arg "${N3_ARG}")"
+N6_PCI="$(resolve_pci_from_arg "${N6_ARG}")"
+echo "[remote] N3='${N3_ARG}' -> PCI='${N3_PCI}' ; N6='${N6_ARG}' -> PCI='${N6_PCI}'"
+
+# ---------- 1) global-values.yaml ----------
+GV="${NF_ROOT_BASE}/global-values.yaml"
+file_or_die "${GV}"
+bak "${GV}"
+
+# capacitySetup
+sed -i -E "s|^([[:space:]]*capacitySetup:[[:space:]]*).*$|\\1\"${CAP}\"|" "${GV}"
+
+# ingressExtFQDN -> <server_ip>.nip.io
+sed -i -E "s|^([[:space:]]*ingressExtFQDN:[[:space:]]*).*$|\\1${SERVER_IP}.nip.io|" "${GV}"
+
+# k8sCpuMgrStaticPolicyEnable -> false if LOW
+if [[ "${CAP}" == "LOW" ]]; then
+  sed -i -E "s|^([[:space:]]*k8sCpuMgrStaticPolicyEnable:[[:space:]]*).*$|\\1false|" "${GV}"
+fi
+echo "[remote] global-values.yaml updated."
+
+# ---------- 2) Replace v1 -> NEW_VER in this directory (files only) ----------
+find "${NF_ROOT_BASE}" -maxdepth 1 -type f -print0 | xargs -0 -r sed -i "s/\\bv1\\b/${NEW_VER}/g" || true
+echo "[remote] replaced v1 -> ${NEW_VER} in files under nf-services/scripts."
+
+# ---------- 3) amf-1-values.yaml: externalIP (if provided) ----------
+AMF="${NF_ROOT_BASE}/amf-1-values.yaml"
+if [[ -f "${AMF}" ]]; then
+  bak "${AMF}"
+  if [[ -n "${AMF_EXT}" ]]; then
+    sed -i -E "s|^([[:space:]]*externalIP:[[:space:]]*).*$|\\1${AMF_EXT}|" "${AMF}"
+    echo "[remote] amf-1-values.yaml externalIP set to ${AMF_EXT}."
+  else
+    echo "[remote] amf-1-values.yaml present but AMF_N2_IP not provided — skipping."
+  fi
+fi
+
+# ---------- 4) upf-1-values.yaml: devPassthrough & PCI (only for VM) ----------
+UPF="${NF_ROOT_BASE}/upf-1-values.yaml"
+if [[ -f "${UPF}" ]]; then
+  bak "${UPF}"
+  if [[ "${CN_MODE}" == "VM" ]]; then
+    # Force intfConfig.type to "devPassthrough" (only within intfConfig block)
+    awk -v RS= -v ORS="" '
+      {
+        gsub(/\n([[:space:]]*)type:[[:space:]]*".*"/,"\n\\1type: \"devPassthrough\"");
+        print
+      }' "${UPF}.bak" > "${UPF}"
+
+    # Update pciAddress for nguInterface and n6Interface_0 if we have resolved PCIs
+    awk -v n3="'${N3_PCI}'" -v n6="'${N6_PCI}'" '
+      BEGIN{sec=""}
+      /[[:space:]]+nguInterface:/      {sec="ngu"}
+      /[[:space:]]+n6Interface_0:/     {sec="n6"}
+      /^[[:space:]]+[A-Za-z0-9_]+:/ && $0 !~ /nguInterface:|n6Interface_0:/ { sec="" }
+      {
+        if ($0 ~ /^[[:space:]]*pciAddress:/ && sec=="ngu" && n3!="") sub(/pciAddress:.*/,"pciAddress: " n3)
+        else if ($0 ~ /^[[:space:]]*pciAddress:/ && sec=="n6" && n6!="") sub(/pciAddress:.*/,"pciAddress: " n6)
+        print
+      }' "${UPF}" > "${UPF}.tmp" && mv "${UPF}.tmp" "${UPF}"
+    echo "[remote] upf-1-values.yaml set devPassthrough; N3=${N3_PCI:-skip} N6=${N6_PCI:-skip}"
+  else
+    echo "[remote] upf-1-values.yaml: CN_MODE=${CN_MODE:-unset} -> no PCI/type changes."
+  fi
+fi
+
+# ---------- 5) N4 IPAM in UPF/SMF ----------
+# N4_BASE like 10.11.10.0/30 -> base+1 for UPF exclude, base+2 for SMF exclude
+if [[ -n "${N4_BASE}" ]]; then
+  base="${N4_BASE%%/*}"
+  mask="${N4_BASE#*/}"
+  # parse octets
+  o1="${base%%.*}"; r="${base#*.}"
+  o2="${r%%.*}";   r="${r#*.}"
+  o3="${r%%.*}";   o4="${r#*.}"
+  ip1="${o1}.${o2}.${o3}.$((10#${o4:-0}+1))"
+  ip2="${o1}.${o2}.${o3}.$((10#${o4:-0}+2))"
+
+  if [[ -f "${UPF}" ]]; then
+    bak "${UPF}"
+    sed -i -E "s|(\"range\"[[:space:]]*:[[:space:]]*\")[0-9.]+/[0-9]+(\")|\\1${N4_BASE}\\2|g" "${UPF}"
+    sed -i -E "s|(\"exclude\"[[:space:]]*:[[:space:]]*\\[[[:space:]]*\")[0-9.]+/32|\\1${ip1}/32|g" "${UPF}"
+    echo "[remote] upf-1-values.yaml N4 updated: range=${N4_BASE}, exclude=${ip1}/32"
+  fi
+
+  SMF="${NF_ROOT_BASE}/smf-1-values.yaml"
+  if [[ -f "${SMF}" ]]; then
+    bak "${SMF}"
+    sed -i -E "s|(\"range\"[[:space:]]*:[[:space:]]*\")[0-9.]+/[0-9]+(\")|\\1${N4_BASE}\\2|g" "${SMF}"
+    sed -i -E "s|(\"exclude\"[[:space:]]*:[[:space:]]*\\[[[:space:]]*\")[0-9.]+/32|\\1${ip2}/32|g" "${SMF}"
+    echo "[remote] smf-1-values.yaml N4 updated: range=${N4_BASE}, exclude=${ip2}/32"
+  fi
+else
+  echo "[remote] N4_BASE not provided — skipping N4 IPAM edits."
+fi
+
+echo "[remote] ✅ NF config complete on ${SERVER_IP}."
+REMOTE
+  rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    echo "[nf_config][${H}] ❌ failed (rc=${rc})"
+    rc_any=1
+  else
+    echo "[nf_config][${H}] done"
+  fi
+done
+
+if [[ $rc_any -ne 0 ]]; then
+  echo "[nf_config] One or more hosts failed."
   exit 1
 fi
-
-configure_on_host() {
-  local host="$1"
-  echo "[nf_config][$host] start"
-
-  # ship maps to remote (best effort)
-  [[ -f "${SERVER_PCI_MAP}" ]] && scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${SERVER_PCI_MAP}"      "${HOST_USER}@${host}:/tmp/server_pci_map.txt" || true
-  [[ -f "${SERVER_IP_RANGE_MAP}" ]] && scp -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${SERVER_IP_RANGE_MAP}" "${HOST_USER}@${host}:/tmp/server_map.txt"     || true
-
-  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i "${SSH_KEY}" \
-      "${HOST_USER}@${host}" bash -euo pipefail -s -- \
-      "${NEW_VERSION}" "${NEW_BUILD_PATH}" "${host}" "${cap}" "${CN_DEPLOYMENT:-}" "${N3_PCI:-}" "${N6_PCI:-}" <<'EOSSH'
-set -euo pipefail
-NEW_VERSION="$1"
-BASE="$2"
-TARGET_IP="$3"
-CAP="$4"
-CN_DEPLOYMENT_IN="$5"
-N3_PCI_IN="${6:-}"
-N6_PCI_IN="${7:-}"
-
-# ---- derive paths ----
-VER="${NEW_VERSION%%_*}"                 # 6.3.0_EA3 -> 6.3.0
-BASE="${BASE%/}"
-NF_ROOT="${BASE}/TRILLIUM_5GCN_CNF_REL_${VER}/nf-services/scripts"
-echo "[remote:nf] NF_ROOT=${NF_ROOT}"
-[[ -d "${NF_ROOT}" ]] || { echo "[remote:nf] ERROR: NF_ROOT not found"; exit 2; }
-
-# ---- parse server_pci_map.txt for this IP (mode + PCI + optional build path + optional N4 base) ----
-CN_DEPLOYMENT="${CN_DEPLOYMENT_IN}"
-N3_PCI="${N3_PCI_IN}"
-N6_PCI="${N6_PCI_IN}"
-
-if [[ -z "${CN_DEPLOYMENT}" || -z "${N3_PCI}" || -z "${N6_PCI}" ]]; then
-  if [[ -f /tmp/server_pci_map.txt ]]; then
-    # match line containing :<IP>:
-    map_line="$(grep -E "^[[:space:]]*[^#]*:[[:space:]]*${TARGET_IP}[[:space:]]*:" /tmp/server_pci_map.txt | head -n1 || true)"
-    if [[ -n "${map_line}" ]]; then
-      # Field 3 = old build path, field 4 = mode (safe: PCI fields come later)
-      OLD_BUILD_PATH="$(printf '%s\n' "${map_line}" | awk -F: '{print $3}')"
-      CN_DEPLOYMENT="$(printf '%s\n' "${map_line}" | awk -F: '{print toupper($4)}')"
-
-      # Extract first two valid PCI tokens anywhere on the line
-      readarray -t _pcis < <(printf '%s\n' "${map_line}" | grep -Eo '[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]')
-      N3_PCI="${N3_PCI:-${_pcis[0]:-}}"
-      N6_PCI="${N6_PCI:-${_pcis[1]:-}}"
-      if [[ -n "${OLD_BUILD_PATH:-}" && "${OLD_BUILD_PATH%/}" != "${BASE}" ]]; then
-        echo "[remote:nf] WARNING: OLD_BUILD_PATH in map (${OLD_BUILD_PATH}) != NEW_BUILD_PATH (${BASE})"
-      fi
-    fi
-  fi
-fi
-[[ -n "${CN_DEPLOYMENT:-}" ]] && CN_DEPLOYMENT="$(echo "${CN_DEPLOYMENT}" | tr '[:lower:]' '[:upper:]')"
-echo "[remote:nf] CN_DEPLOYMENT=${CN_DEPLOYMENT:-unknown}  N3_PCI=${N3_PCI:-unset}  N6_PCI=${N6_PCI:-unset}"
-
-# ---- read N4 base (prefer /tmp/server_map.txt, else fallback to server_pci_map.txt) ----
-N4_BASE_CIDR=""
-if [[ -f /tmp/server_map.txt ]]; then
-  map_line2="$(grep -E "^[[:space:]]*[^#]*:[[:space:]]*${TARGET_IP}[[:space:]]*:" /tmp/server_map.txt | head -n1 || true)"
-  [[ -n "${map_line2}" ]] && N4_BASE_CIDR="$(printf '%s\n' "${map_line2}" | grep -Eo '([0-9]{1,3}\.){3}0(/[0-9]{1,2})?' | head -n1 || true)"
-fi
-if [[ -z "${N4_BASE_CIDR}" && -f /tmp/server_pci_map.txt ]]; then
-  map_line3="$(grep -E "^[[:space:]]*[^#]*:[[:space:]]*${TARGET_IP}[[:space:]]*:" /tmp/server_pci_map.txt | head -n1 || true)"
-  [[ -n "${map_line3}" ]] && N4_BASE_CIDR="$(printf '%s\n' "${map_line3}" | grep -Eo '([0-9]{1,3}\.){3}0(/[0-9]{1,2})?' | head -n1 || true)"
-fi
-
-if [[ -z "${N4_BASE_CIDR}" ]]; then
-  echo "[remote:nf] WARNING: No N4 base found for ${TARGET_IP}; skipping SMF/UPF N4 ipam edits"
-fi
-
-# normalize N4 base; default mask /30 if missing
-N4_MASK="30"
-if [[ -n "${N4_BASE_CIDR}" ]]; then
-  if [[ "${N4_BASE_CIDR}" == */* ]]; then
-    N4_MASK="${N4_BASE_CIDR##*/}"
-    N4_BASE="${N4_BASE_CIDR%/*}"
-  else
-    N4_BASE="${N4_BASE_CIDR}"
-  fi
-  IFS='.' read -r a b c d <<<"${N4_BASE}"
-  N4_BASE="${a}.${b}.${c}.0"
-  N4_RANGE="${N4_BASE}/${N4_MASK}"
-  SMF_EXCL="${a}.${b}.${c}.2/32"
-  UPF_EXCL="${a}.${b}.${c}.1/32"
-  echo "[remote:nf] N4_RANGE=${N4_RANGE}  (SMF exclude ${SMF_EXCL} / UPF exclude ${UPF_EXCL})"
-fi
-
-# ---- locate global-values.yaml under NF_ROOT ----
-NF_YAML=""
-for f in "${NF_ROOT}/global-values.yaml" "${NF_ROOT}/global-value.yaml"; do
-  [[ -f "$f" ]] && { NF_YAML="$f"; break; }
-done
-[[ -n "${NF_YAML}" ]] || { echo "[remote:nf] ERROR: global-values.yaml not found"; exit 2; }
-cp -a "${NF_YAML}" "${NF_YAML}.bak"
-
-# 1) capacitySetup based on DEPLOYMENT_TYPE
-sed -i -E "s|^(\s*capacitySetup:\s*).*$|\1\"${CAP}\"|" "${NF_YAML}"
-
-# 2) ingressExtFQDN: <server-ip>.nip.io
-sed -i -E "s|^(\s*ingressExtFQDN:\s*).*$|\1${TARGET_IP}.nip.io|" "${NF_YAML}"
-
-# 3) k8sCpuMgrStaticPolicyEnable: false for LOW
-if [[ "${CAP}" == "LOW" ]]; then
-  sed -i -E "s|^(\s*k8sCpuMgrStaticPolicyEnable:\s*).*$|\1false|" "${NF_YAML}"
-fi
-
-echo "[remote:nf] Diff (global-values.yaml):"
-diff -u "${NF_YAML}.bak" "${NF_YAML}" || true
-
-# 4) whole-word v1 -> VER in all YAMLs under NF_ROOT
-while IFS= read -r -d '' y; do
-  cp -a "$y" "$y.bak" || true
-  sed -i -E "s/(^|[^[:alnum:]_])v1([^[:alnum:]_]|$)/\\1${VER}\\2/g" "$y"
-  diff -u "$y.bak" "$y" || true
-done < <(find -L "${NF_ROOT}" -maxdepth 3 -type f -name '*.yaml' -print0)
-
-# 5) amf externalIP: <server-ip>
-AMF_FILE="$(find -L "${NF_ROOT}" -maxdepth 3 -type f -name 'amf-1-values.yaml' | head -n1 || true)"
-if [[ -n "${AMF_FILE}" ]]; then
-  cp -a "${AMF_FILE}" "${AMF_FILE}.bak"
-  sed -i -E "s|^(\s*externalIP:\s*).*$|\1${TARGET_IP}|" "${AMF_FILE}"
-  echo "[remote:nf] Diff (amf-1-values.yaml):"
-  diff -u "${AMF_FILE}.bak" "${AMF_FILE}" || true
-else
-  echo "[remote:nf] WARNING: amf-1-values.yaml not found (skipping externalIP)"
-fi
-
-# helper to replace first "range": "<cidr>" and first IPv4 /32 inside exclude array
-replace_ipam_range_and_exclude() {
-  local file="$1" new_range="$2" new_excl="$3"
-  [[ -n "${new_range}" && -n "${new_excl}" ]] || return 0
-  awk -v rng="${new_range}" -v ex="${new_excl}" '
-    function is_ipv4range(){ return ($0 ~ /"range":[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+"/) }
-    BEGIN{ inEx=0; doneR=0; doneE=0 }
-    {
-      if ($0 ~ /^[[:space:]]*"?exclude"?:[[:space:]]*\[/) inEx=1
-      if (inEx && $0 ~ /\]/) inEx=0
-      if (!doneR && is_ipv4range()) { sub(/"range":[[:space:]]*"[^"]+"/, "\"range\": \"" rng "\""); doneR=1; print; next }
-      if (inEx && !doneE && $0 ~ /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/) { sub(/"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32"/, "\"" ex "\""); doneE=1; print; next }
-      print
-    }' "${file}" > "${file}.tmp" && mv "${file}.tmp" "${file}"
-}
-
-# 6) SMF N4 ipam edits
-if [[ -n "${N4_RANGE:-}" ]]; then
-  SMF_FILE="$(find -L "${NF_ROOT}" -maxdepth 3 -type f -name 'smf-1-values.yaml' | head -n1 || true)"
-  if [[ -n "${SMF_FILE}" ]]; then
-    cp -a "${SMF_FILE}" "${SMF_FILE}.bak"
-    replace_ipam_range_and_exclude "${SMF_FILE}" "${N4_RANGE}" "${SMF_EXCL}"
-    echo "[remote:nf] Diff (smf-1-values.yaml):"
-    diff -u "${SMF_FILE}.bak" "${SMF_FILE}" || true
-  else
-    echo "[remote:nf] WARNING: smf-1-values.yaml not found; skipping SMF N4 ipam"
-  fi
-fi
-
-# 7) UPF N4 ipam edits (under upfsp.n4.ipam)
-if [[ -n "${N4_RANGE:-}" ]]; then
-  UPF_FILE="$(find -L "${NF_ROOT}" -maxdepth 3 -type f -name 'upf-1-values.yaml' | head -n1 || true)"
-  if [[ -n "${UPF_FILE}" ]]; then
-    cp -a "${UPF_FILE}" "${UPF_FILE}.bak"
-    replace_ipam_range_and_exclude "${UPF_FILE}" "${N4_RANGE}" "${UPF_EXCL}"
-    echo "[remote:nf] Diff (upf-1-values.yaml N4 ipam):"
-    diff -u "${UPF_FILE}.bak" "${UPF_FILE}" || true
-  else
-    echo "[remote:nf] WARNING: upf-1-values.yaml not found; skipping UPF N4 ipam"
-  fi
-fi
-
-# 8) UPF VM-based tweaks (devPassthrough + PCI wiring)
-if [[ "${CN_DEPLOYMENT:-}" == "VM" || "${CN_DEPLOYMENT:-}" == "VM-BASED" || "${CN_DEPLOYMENT:-}" == "VMB" ]]; then
-  UPF_FILE="$(find -L "${NF_ROOT}" -maxdepth 3 -type f -name 'upf-1-values.yaml' | head -n1 || true)"
-  if [[ -z "${UPF_FILE}" ]]; then
-    echo "[remote:nf] WARNING: upf-1-values.yaml not found; skipping UPF PCI edits"
-  else
-    if [[ -z "${N3_PCI}" || -z "${N6_PCI}" ]]; then
-      echo "[remote:nf] ERROR: VM-based CN but N3_PCI or N6_PCI missing (from map or env)"; exit 3
-    fi
-    cp -a "${UPF_FILE}" "${UPF_FILE}.bak.pci" || true
-    awk -v n3="${N3_PCI}" -v n6="${N6_PCI}" '
-      function indent(s){ match(s,/^[ \t]*/); return RLENGTH }
-      BEGIN{ in_ic=0; ic_indent=0; sec="" }
-      {
-        if (!in_ic && $0 ~ /^[[:space:]]*intfConfig:[[:space:]]*$/) { in_ic=1; ic_indent=indent($0); print; next }
-        if (in_ic) {
-          if (indent($0) <= ic_indent && $0 !~ /^[[:space:]]*$/) { in_ic=0; sec="" }
-          else {
-            if ($0 ~ /^[[:space:]]*type:[[:space:]]*/) { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "type: \"devPassthrough\""; print; next }
-            if ($0 ~ /^[[:space:]]*nguInterface:[[:space:]]*$/) { sec="ngu"; print; next }
-            if ($0 ~ /^[[:space:]]*n6Interface_0:[[:space:]]*$/) { sec="n6_0"; print; next }
-            if ($0 ~ /^[[:space:]]*[A-Za-z0-9_]+:[[:space:]]*$/ && indent($0) <= ic_indent+2) { sec="" }
-            if (sec=="ngu") {
-              if ($0 ~ /^[[:space:]]*pciDeviceName:/) { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciDeviceName: PCIDEVICE_INTEL_COM_SRIOV_NETDEVICE_NGU_UPF"; print; next }
-              if ($0 ~ /^[[:space:]]*pciAddress:/)    { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciAddress: " n3; print; next }
-            } else if (sec=="n6_0") {
-              if ($0 ~ /^[[:space:]]*pciDeviceName:/) { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciDeviceName: PCIDEVICE_INTEL_COM_SRIOV_NETDEVICE_N6_UPF"; print; next }
-              if ($0 ~ /^[[:space:]]*pciAddress:/)    { match($0,/^[[:space:]]*/); ind=substr($0,1,RLENGTH); $0=ind "pciAddress: " n6; print; next }
-            }
-            print; next
-          }
-        }
-        print
-      }
-    ' "${UPF_FILE}" > "${UPF_FILE}.tmp" && mv "${UPF_FILE}.tmp" "${UPF_FILE}"
-    echo "[remote:nf] Diff (upf-1-values.yaml PCI edits):"
-    diff -u "${UPF_FILE}.bak.pci" "${UPF_FILE}" || true
-  fi
-else
-  echo "[remote:nf] CN deployment not VM-based; skipping UPF PCI edits"
-fi
-
-echo "[remote:nf] NF services config updates complete."
-EOSSH
-
-  echo "[nf_config][$host] done"
-}
-
-# iterate hosts (3 attempts per host)
-for h in "${HOSTS[@]}"; do
-  ok=0
-  for attempt in 1 2 3; do
-    if configure_on_host "$h"; then ok=1; break; fi
-    echo "[nf_config][$h] attempt ${attempt} failed; retrying in 10s..."
-    sleep 10
-  done
-  if ((ok==0)); then
-    echo "[nf_config][$h] ERROR: failed after retries" >&2
-    exit 1
-  fi
-done
 
 echo "[nf_config] All hosts processed."
