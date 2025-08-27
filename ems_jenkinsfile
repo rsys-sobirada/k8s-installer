@@ -4,32 +4,32 @@ pipeline {
   options {
     timestamps()
     disableConcurrentBuilds()
-    timeout(time: 45, unit: 'MINUTES')
+    timeout(time: 45, unit: 'MINUTES') // overall guard
   }
 
   parameters {
-    // NEW_BUILD_PATH should be the tag folder root (e.g., /home/labadmin/EA3)
-    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/EA3', description: 'Folder containing TRILLIUM_5GCN_CNF_REL_<VER>')
+    // NEW_BUILD_PATH should be the tag folder root, e.g. /home/labadmin/EA3
+    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin/EA3', description: 'Folder that contains TRILLIUM_5GCN_CNF_REL_<VER>')
     string(name: 'NEW_VERSION',    defaultValue: '6.3.0_EA3',          description: 'Version tag (e.g., 6.3.0_EA3)')
-    string(name: 'SERVER_FILE',    defaultValue: 'server_pci_map.txt', description: 'Map of name:ip')
-    string(name: 'HOST_NAME',      defaultValue: '',                   description: 'Optional: pick name from column 1')
-    string(name: 'HOST_USER',      defaultValue: 'root',               description: 'SSH user')
+    string(name: 'SERVER_FILE',    defaultValue: 'server_pci_map.txt', description: 'Map file with lines: <name>:<ip>')
+    string(name: 'HOST_NAME',      defaultValue: '',                   description: 'Optional server name to pick from column 1')
+    string(name: 'HOST_USER',      defaultValue: 'root',               description: 'SSH user (same as nf_config.sh)')
     string(name: 'SSH_KEY',        defaultValue: '/var/lib/jenkins/.ssh/jenkins_key', description: 'Private key path')
 
     // EMS-only readiness controls
-    string(name: 'EMS_NAMESPACE',   defaultValue: '',                  description: 'Optional namespace (blank = all namespaces)')
-    string(name: 'EMS_SELECTOR',    defaultValue: 'app=ems',           description: 'Label selector for EMS pods')
-    string(name: 'EMS_NAME_PREFIX', defaultValue: 'ems',               description: 'Fallback name prefix if selector yields none')
+    string(name: 'EMS_NAMESPACE',   defaultValue: '',        description: 'Optional namespace (blank = all namespaces)')
+    string(name: 'EMS_SELECTOR',    defaultValue: 'app=ems', description: 'Label selector for EMS pods (e.g., app.kubernetes.io/name=ems)')
+    string(name: 'EMS_NAME_PREFIX', defaultValue: 'ems',     description: 'Fallback pod-name substring if selector returns none')
   }
 
   stages {
     stage('Checkout') { steps { checkout scm } }
 
-    stage('Guard: enforce Option A') {
+    stage('Guard: enforce NO .ems_stage.sh') {
       steps {
         sh '''
           set -e
-          echo "== Enforcing Option A (NO .ems_stage.sh) =="
+          echo "== Guard: ensure we do NOT use .ems_stage.sh =="
           if grep -R --line-number "\\.ems_stage\\.sh" .; then
             echo "ERROR: Found references to scripts/.ems_stage.sh. Remove them and use scripts/ems_install_and_check.sh." >&2
             exit 2
@@ -50,7 +50,6 @@ pipeline {
           export http_proxy="${http_proxy:-}"; export https_proxy="${https_proxy:-}"; export no_proxy="${no_proxy:-}"
           export HTTP_PROXY="${HTTP_PROXY:-}"; export HTTPS_PROXY="${HTTPS_PROXY:-}"; export NO_PROXY="${NO_PROXY:-}"
 
-          # Run the repo script that uses nf_config-style SSH and NO profile sourcing
           SERVER_FILE="${SERVER_FILE}" \
           SSH_KEY="${SSH_KEY}" \
           NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
