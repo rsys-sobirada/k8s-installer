@@ -276,11 +276,57 @@ run_uninstall_with_retries(){
   local attempt=1
   while (( attempt <= RETRY_COUNT )); do
     echo "🧹 Running $UNINSTALL_NAME on $ip (attempt $attempt/$RETRY_COUNT)..."
-    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$UNINSTALL_NAME" <<'EOF'
+    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$UNINSTALL_NAME" "${INSTALL_IP_ADDR:-}" "${INSTALL_IP_IFACE:-}" "${IP_MONITOR_INTERVAL:-30}" <<'EOF'
 set -euo pipefail
-SP="$1"; NAME="$2"
+SP="$1"; NAME="$2"; CIDR="\${3:-}"; IFACE_PIN="\${4:-}"; INTERVAL="\${5:-30}"
 cd "$SP"
 sed -i 's/\r$//' "$NAME" 2>/dev/null || true
+
+# ---- Inline alias IP watchdog (keeps INSTALL_IP_ADDR present during uninstall) ----
+if [[ -n "\${CIDR:-}" ]]; then
+  IP="\${CIDR%%/*}"
+  LOG="/var/log/alias_ipmon.log"
+
+  ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG"; }
+  is_present(){ ip -4 addr show | awk '/inet /{print \$2}' | cut -d/ -f1 | grep -qx "$IP"; }
+  pick_if(){
+    if [[ -n "$IFACE_PIN" ]]; then echo "$IFACE_PIN"; return; fi
+    local d; d=\$(ip route 2>/dev/null | awk '/^default/{print \$5; exit}')
+    [[ -n "\$d" ]] && { echo "\$d"; return; }
+    ip -o link | awk -F': ' '{print \$2}' | sed 's/@.*//' \
+      | grep -E '^(en|eth|ens|eno|em|bond|br)' \
+      | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' | head -n1
+  }
+  ensure_once(){
+    local IF; IF="\$(pick_if)"; [[ -n "\$IF" ]] || { ipmon_log "no iface"; return 1; }
+    ip link set dev "\$IF" up || true
+    if ip addr replace "$CIDR" dev "\$IF" 2>/tmp/ipmon_err.log; then
+      sleep 1; is_present && { ipmon_log "ensured $CIDR on \$IF"; return 0; }
+    fi
+    ipmon_log "failed to add $CIDR on \$IF: \$(tr -d \\n </tmp/ipmon_err.log 2>/dev/null || true)"; return 1
+  }
+
+  mkdir -p "/var/log" 2>/dev/null || true; : >>"\$LOG" || true
+  ipmon_log "inline watch start for $CIDR (iface=\${IFACE_PIN:-auto}, interval=\${INTERVAL}s)"
+  ! is_present && ensure_once || true
+
+  # reactive watcher
+  if command -v ip >/dev/null 2>&1; then
+    ( ip monitor address 2>/dev/null | while read -r _; do
+        ! is_present && { ipmon_log "addr change; restoring $CIDR"; ensure_once || true; }
+      done ) &
+    MON_PID=\$!
+    trap '[[ -n "\${MON_PID:-}" ]] && kill "\$MON_PID" 2>/dev/null || true' EXIT
+  fi
+
+  # periodic safety loop
+  ( while true; do
+      ! is_present && { ipmon_log "periodic restore; adding $CIDR"; ensure_once || true; }
+      sleep "\$INTERVAL"
+    done ) &
+fi
+# ---- end inline watchdog ----
+
 bash -x "./$NAME"
 EOF
     then
