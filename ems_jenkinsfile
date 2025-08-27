@@ -10,10 +10,10 @@ pipeline {
   parameters {
     string(name: 'NEW_BUILD_PATH',       defaultValue: '/home/labadmin',                     description: 'Base path where releases are staged')
     string(name: 'NEW_VERSION',          defaultValue: '6.3.0_EA3',                          description: 'Version tag like 6.3.0_EA3')
-    string(name: 'INSTALL_SERVER_FILE',  defaultValue: 'server_pci_map.txt',                 description: 'Path to server map (not exposed contents)')
-    string(name: 'NODE_NAME',            defaultValue: '',                                   description: 'Optional: pick server name from column 1 (blank=first line)')
-    string(name: 'SSH_KEY',              defaultValue: '/var/lib/jenkins/.ssh/jenkins_key',  description: 'Private key used for remote login (same as nf_config.sh)')
-    string(name: 'SSH_USER',             defaultValue: 'root',                               description: 'SSH user (same as nf_config.sh)')
+    string(name: 'INSTALL_SERVER_FILE',  defaultValue: 'server_pci_map.txt',                 description: 'Server map file (contents not exposed)')
+    string(name: 'NODE_NAME',            defaultValue: '',                                   description: 'Optional: server name from column 1 (blank=first)')
+    string(name: 'SSH_KEY',              defaultValue: '/var/lib/jenkins/.ssh/jenkins_key',  description: 'Private key for remote login (like nf_config.sh)')
+    string(name: 'SSH_USER',             defaultValue: 'root',                               description: 'SSH user (like nf_config.sh)')
   }
 
   stages {
@@ -24,10 +24,8 @@ pipeline {
     stage('EMS install & health check (remote via SSH)') {
       options { timeout(time: 15, unit: 'MINUTES') }
       steps {
-        sh '''
-          set -e
-          mkdir -p scripts
-        '''
+        sh 'set -e; mkdir -p scripts'
+
         writeFile file: 'scripts/.ems_stage.sh', text: '''#!/usr/bin/env bash
 set -euo pipefail
 
@@ -164,7 +162,10 @@ fi
 
 echo "DONE: EMS remote install & checks ok (register once: root/root123)"
 '''
+
+        // Run under bash explicitly
         sh '''
+          set -e
           chmod +x scripts/.ems_stage.sh
           /bin/bash scripts/.ems_stage.sh
         '''
