@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # scripts/ems_install_and_check.sh
 # EMS install + EMS-only health check + GUI probe (remote via SSH)
+# Uses nf_config-style SSH; avoids remote profile loading to prevent PS1/XDG errors.
+
 set -euo pipefail
 
 # ---------- Inputs ----------
@@ -11,13 +13,12 @@ set -euo pipefail
 HOST_USER="${HOST_USER:-root}"
 HOST_NAME="${HOST_NAME:-}"
 
-# EMS readiness controls
+# EMS-only readiness controls
 EMS_NAMESPACE="${EMS_NAMESPACE:-}"              # blank = all namespaces
-EMS_SELECTOR="${EMS_SELECTOR:-app=ems}"        # label selector; blank -> fallback to prefix
+EMS_SELECTOR="${EMS_SELECTOR:-app=ems}"        # label selector; blank -> fallback to name prefix
 EMS_NAME_PREFIX="${EMS_NAME_PREFIX:-ems}"      # used if selector yields nothing
 
-# ---------- Derive target ----------
-VER="${NEW_VERSION%%_*}"
+# ---------- Resolve target ----------
 pick_line() {
   if [[ -n "${HOST_NAME}" ]]; then
     awk -F: -v n="${HOST_NAME}" '$0!~/^[[:space:]]*#/ && NF>=2 && $1==n {print; exit}' "${SERVER_FILE}"
@@ -25,6 +26,7 @@ pick_line() {
     awk -F: '$0!~/^[[:space:]]*#/ && NF>=2 {print; exit}' "${SERVER_FILE}"
   fi
 }
+
 RAW="$(pick_line || true)"
 [[ -n "${RAW}" ]] || { echo "[ems] ERROR: no matching entry in ${SERVER_FILE}"; exit 2; }
 TARGET_NAME="$(printf '%s\n' "${RAW}" | awk -F: '{print $1}')"
@@ -32,10 +34,11 @@ TARGET_IP="$(printf '%s\n'   "${RAW}" | awk -F: '{print $2}')"
 [[ "${TARGET_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "[ems] ERROR: invalid IP in ${RAW}"; exit 2; }
 echo "[ems] ▶ target: ${TARGET_NAME} ${TARGET_IP}"
 
+VER="${NEW_VERSION%%_*}"
 EMS_DIR="${NEW_BUILD_PATH%/}/TRILLIUM_5GCN_CNF_REL_${VER}/nf-services/scripts"
 echo "[ems] EMS_DIR=${EMS_DIR}"
 
-# ---------- Remote runner (no profiles) ----------
+# ---------- Remote runner (NO profile sourcing) ----------
 REMOTE_ENV=$(cat <<'EOF'
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
 [ -z "${KUBECONFIG:-}" ] && [ -f /root/.kube/config ] && export KUBECONFIG=/root/.kube/config || true
@@ -59,7 +62,6 @@ cd '${EMS_DIR}'; chmod +x install_ems.sh; ./install_ems.sh
 # ---------- EMS-only readiness ----------
 echo "[ems] waiting up to 180s for EMS pods Ready (n/n) & Running…"
 
-# Build kubectl options for EMS pod selection
 K_NS_OPT="-A"; [ -n "${EMS_NAMESPACE}" ] && K_NS_OPT="-n ${EMS_NAMESPACE}"
 K_SEL_OPT="";  [ -n "${EMS_SELECTOR}"  ] && K_SEL_OPT="-l ${EMS_SELECTOR}"
 
@@ -68,18 +70,15 @@ ${REMOTE_ENV}
 K_NS_OPT='${K_NS_OPT}'; K_SEL_OPT='${K_SEL_OPT}'; NAME_PREFIX='${EMS_NAME_PREFIX}'
 deadline=\$(( \$(date +%s) + 180 ))
 
-# list EMS pods (by selector; fallback to name prefix)
 list_ems() {
   if [ -n \"\$K_SEL_OPT\" ]; then
     kubectl get pods \$K_NS_OPT \$K_SEL_OPT 2>/dev/null | awk 'NR>1{print}'
   else
-    kubectl get pods \$K_NS_OPT 2>/dev/null | awk 'NR>1 && tolower(\$0) ~ /ems/{print}'
+    kubectl get pods \$K_NS_OPT 2>/dev/null | awk 'NR>1 && tolower(\$0) ~ /'\"${EMS_NAME_PREFIX}\"'/ {print}'
   fi
 }
 
-# READY/STATUS columns differ with -A vs -n:
-# -A output: NAMESPACE NAME READY STATUS RESTARTS AGE
-# -n output: NAME READY STATUS RESTARTS AGE
+# READY/STATUS index differs for -A (namespace present)
 ready_idx=2; status_idx=3
 if echo \"\$K_NS_OPT\" | grep -q '^-A'; then ready_idx=3; status_idx=4; fi
 
@@ -87,7 +86,6 @@ ems_all_ready() {
   mapfile -t L < <(list_ems)
   ((${#L[@]})) || return 1
   for ln in \"\${L[@]}\"; do
-    # extract READY and STATUS by index
     r=\$(echo \"\$ln\" | awk -v i=\$ready_idx '{print \$i}')
     s=\$(echo \"\$ln\" | awk -v i=\$status_idx '{print \$i}')
     case \"\$r\" in */*) have=\"\${r%/*}\"; want=\"\${r#*/}\";; *) have=0; want=1;; esac
@@ -102,7 +100,7 @@ while :; do
     if [ -n \"\$K_SEL_OPT\" ]; then
       kubectl get pods \$K_NS_OPT \$K_SEL_OPT
     else
-      kubectl get pods \$K_NS_OPT | grep -i ems || true
+      kubectl get pods \$K_NS_OPT | grep -i '\"${EMS_NAME_PREFIX}\"' || true
     fi
     break
   fi
@@ -114,7 +112,7 @@ echo '[remote] --- short watch ---'
 if [ -n \"\$K_SEL_OPT\" ]; then
   for i in 1 2 3; do kubectl get pods \$K_NS_OPT \$K_SEL_OPT; sleep 3; done
 else
-  for i in 1 2 3; do kubectl get pods \$K_NS_OPT | grep -i ems || true; sleep 3; done
+  for i in 1 2 3; do kubectl get pods \$K_NS_OPT | grep -i '\"${EMS_NAME_PREFIX}\"' || true; sleep 3; done
 fi
 "
 
