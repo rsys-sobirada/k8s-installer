@@ -39,7 +39,7 @@ Fresh_installation''',
     // Visible only for Upgrade_* modes
     [$class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
-      description: 'Base dir of OLD_VERSION (per-host path still read from server_pci_map.txt)',
+      description: 'Base dir of OLD_VERSION (per-host path still comes from server_pci_map.txt)',
       referencedParameters: 'INSTALL_MODE',
       choiceType: 'ET_FORMATTED_HTML',
       omitValueField: true,
@@ -155,7 +155,7 @@ pipeline {
           "SSH_KEY=${env.SSH_KEY}",
           "SERVER_FILE=${env.SERVER_FILE}",
           "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}",
-          "CN_BOOTSTRAP_PASS=${params.CN_BOOTSTRAP_PASS ?: ''}"
+          "CN_BOOTSTRAP_PASS=" + (params.CN_BOOTSTRAP_PASS ?: '')
         ]) {
           sh '''
             chmod +x scripts/preflight.sh || true
@@ -185,8 +185,8 @@ pipeline {
             withEnv([
               "CLUSTER_RESET=true",
               "OLD_VERSION=${params.OLD_VERSION}",
-              // Script uses per-host path from server_pci_map.txt; UI can be ignored
-              "OLD_BUILD_PATH=${params.OLD_BUILD_PATH_UI ?: ''}",
+              // Script uses per-host path from server_pci_map.txt; UI value is optional/ignored
+              "OLD_BUILD_PATH=" + (params.OLD_BUILD_PATH_UI ?: ''),
               "K8S_VER=${env.K8S_VER}",
               "KSPRAY_DIR=${env.KSPRAY_DIR}",
               "RESET_YML_WS=${env.RESET_YML_WS}",
@@ -214,10 +214,10 @@ pipeline {
             withEnv([
               "NEW_VERSION=${params.NEW_VERSION}",
               "NEW_BUILD_PATH=${params.NEW_BUILD_PATH}",
-              "BUILD_SRC_HOST=${params.BUILD_SRC_HOST ?: ''}",
-              "BUILD_SRC_USER=${params.BUILD_SRC_USER ?: ''}",
-              "BUILD_SRC_BASE=${params.BUILD_SRC_BASE ?: ''}",
-              "BUILD_SRC_PASS=${params.BUILD_SRC_PASS ?: ''}",
+              "BUILD_SRC_HOST=" + (params.BUILD_SRC_HOST ?: ''),
+              "BUILD_SRC_USER=" + (params.BUILD_SRC_USER ?: ''),
+              "BUILD_SRC_BASE=" + (params.BUILD_SRC_BASE ?: ''),
+              "BUILD_SRC_PASS=" + (params.BUILD_SRC_PASS ?: ''),
               "SSH_KEY=${env.SSH_KEY}",
               "SERVER_FILE=${env.SERVER_FILE}"
             ]) {
