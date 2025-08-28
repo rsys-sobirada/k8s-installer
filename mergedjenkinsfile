@@ -1,397 +1,209 @@
-/******************** PARAMETERS (use Active Choices + properties) ********************/
-properties([
-  parameters([
-    choice(
-      name: 'DEPLOYMENT_TYPE',
-      choices: '''Low
-Medium
-High''',
-      description: 'Deployment footprint'
-    ),
-    choice(
-      name: 'INSTALL_MODE',
-      choices: '''Upgrade_with_cluster_reset
-Upgrade_without_cluster_reset
-Fresh_installation''',
-      description: 'Installation mode'
-    ),
-    string(name: 'NEW_BUILD_PATH', defaultValue: '/home/labadmin', description: 'Base dir for NEW_VERSION'),
-    choice(
-      name: 'NEW_VERSION',
-      choices: '''6.2.0_EA6
-6.3.0
-6.3.0_EA1
-6.3.0_EA2
-6.3.0_EA3''',
-      description: 'Target bundle version'
-    ),
-    choice(
-      name: 'OLD_VERSION',
-      choices: '''6.2.0_EA6
-6.3.0
-6.3.0_EA1
-6.3.0_EA2
-6.3.0_EA3''',
-      description: 'Existing bundle version (used if upgrading)'
-    ),
-    booleanParam(name: 'FETCH_BUILD', defaultValue: false, description: 'Fetch NEW_VERSION from build host to CN servers'),
-    string(name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24', description: 'Alias IP/CIDR to plumb on CN servers'),
-    password(name: 'CN_BOOTSTRAP_PASS', description: 'One-time CN root password (optional; to push Jenkins key)'),
-
-    // Show ONLY when INSTALL_MODE is Upgrade_*
-    [$class: 'DynamicReferenceParameter',
-      name: 'OLD_BUILD_PATH_UI',
-      description: 'Base dir of OLD_VERSION (per-host path still read from server_pci_map.txt)',
-      referencedParameters: 'INSTALL_MODE',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [$class: 'GroovyScript', script: [
-        script: '''def m=(INSTALL_MODE?:'').toString()
-if (m == 'Upgrade_with_cluster_reset' || m == 'Upgrade_without_cluster_reset')
-  return "<input class='setting-input' name='value' type='text' value='/home/labadmin'/>"
-return ""''', sandbox: true
-      ], fallbackScript: [script: 'return ""', sandbox: true]]
-    ],
-
-    // The four build-source fields appear ONLY when FETCH_BUILD is true
-    [$class: 'DynamicReferenceParameter',
-      name: 'BUILD_SRC_HOST',
-      description: 'Build repo host',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [$class: 'GroovyScript', script: [
-        script: '''def fb=(FETCH_BUILD?:'').toString().trim().toLowerCase()
-def on=['true','on','1','yes','y'].contains(fb)
-if (!on) return ""
-return "<select class='setting-input' name='value'><option value='172.26.2.96'>172.26.2.96</option><option value='172.26.2.95'>172.26.2.95</option></select>"''',
-        sandbox: true
-      ], fallbackScript: [script: 'return ""', sandbox: true]]
-    ],
-    [$class: 'DynamicReferenceParameter',
-      name: 'BUILD_SRC_USER',
-      description: 'Build repo user',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [$class: 'GroovyScript', script: [
-        script: '''def fb=(FETCH_BUILD?:'').toString().trim().toLowerCase()
-def on=['true','on','1','yes','y'].contains(fb)
-if (!on) return ""
-return "<select class='setting-input' name='value'><option value='sobirada'>sobirada</option><option value='labadmin'>labadmin</option></select>"''',
-        sandbox: true
-      ], fallbackScript: [script: 'return ""', sandbox: true]]
-    ],
-    [$class: 'DynamicReferenceParameter',
-      name: 'BUILD_SRC_BASE',
-      description: 'Path on build host containing the tar.gz files',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [$class: 'GroovyScript', script: [
-        script: '''def fb=(FETCH_BUILD?:'').toString().trim().toLowerCase()
-def on=['true','on','1','yes','y'].contains(fb)
-if (!on) return ""
-return "<input class='setting-input' name='value' type='text' value='/CNBuild/6.3.0_EA2'/>"''',
-        sandbox: true
-      ], fallbackScript: [script: 'return ""', sandbox: true]]
-    ],
-    [$class: 'DynamicReferenceParameter',
-      name: 'BUILD_SRC_PASS',
-      description: 'Build host password (for SCP/SSH from build repo)',
-      referencedParameters: 'FETCH_BUILD',
-      choiceType: 'ET_FORMATTED_HTML',
-      omitValueField: true,
-      script: [$class: 'GroovyScript', script: [
-        script: '''def fb=(FETCH_BUILD?:'').toString().trim().toLowerCase()
-def on=['true','on','1','yes','y'].contains(fb)
-if (!on) return ""
-return "<input type='password' class='setting-input' name='value' value=''/>"''',
-        sandbox: true
-      ], fallbackScript: [script: 'return ""', sandbox: true]]
-    ]
-  ])
-])
-
 pipeline {
   agent any
+  options { timestamps(); disableConcurrentBuilds() }
 
-  options {
-    timestamps()
-    disableConcurrentBuilds()
+  /**************** GUI (minimal) ****************/
+  parameters {
+    choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'], description: 'Capacity preset')
+    choice(name: 'INSTALL_MODE', choices: [
+      'Upgrade_with_cluster_reset',
+      'Upgrade_without_cluster_reset',
+      'Fresh_installation'
+    ], description: 'Install mode')
+    string(name: 'NEW_BUILD_PATH',  defaultValue: '/home/labadmin/6.3.0/EA3', description: 'Base dir containing TRILLIUM_5GCN_CNF_REL_<VER>')
+    string(name: 'NEW_VERSION',     defaultValue: '6.3.0_EA3',                description: 'Target version')
+    string(name: 'OLD_VERSION',     defaultValue: '6.3.0_EA3',                description: 'Existing version (for upgrade)')
+    string(name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24',           description: 'Alias IP/CIDR if your scripts use it')
   }
 
+  /**************** Hidden (hard-coded) ****************/
   environment {
-    // Hidden knobs (not shown in GUI)
+    SERVER_FILE = 'server_pci_map.txt'                 // <name>:<ip>:<build_path>:<VM|SRIOV>:<N3>:<N6>:<N4_CIDR>:<AMF_N2_IP>
+    SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'  // not shown in GUI
+
+    // Hard-coded defaults as requested
     HEALTH_RETRY_WAIT_SECS = '300'
     HEALTH_RETRIES          = '1'
     PS_STAGE_TIMEOUT_MIN    = '60'
     CS_STAGE_TIMEOUT_MIN    = '60'
 
-    SSH_KEY      = "${JENKINS_HOME}/.ssh/jenkins_key"
-    SERVER_FILE  = "server_pci_map.txt"
-    K8S_VER      = "1.31.4"
-    KSPRAY_DIR   = "kubespray-2.27.0"
+    // Versions/paths used by cluster_reset.sh (unchanged logic)
+    K8S_VER      = '1.31.4'
+    KSPRAY_DIR   = 'kubespray-2.27.0'
     RESET_YML_WS = "${WORKSPACE}/reset.yml"
   }
 
   stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
+    stage('Checkout') { steps { checkout scm } }
 
-    stage('Show inputs') {
+    /************ Cluster reset (from Jenkinsfile.sh) ************/
+    stage('Cluster reset (auto from INSTALL_MODE)') {
+      when { expression { (params.INSTALL_MODE ?: '') == 'Upgrade_with_cluster_reset' } }
+      options { timeout(time: 15, unit: 'MINUTES') }
       steps {
-        echo "INSTALL_MODE='${params.INSTALL_MODE}'  FETCH_BUILD='${params.FETCH_BUILD}'  NEW_VERSION='${params.NEW_VERSION}'  OLD_VERSION='${params.OLD_VERSION}'  INSTALL_IP_ADDR='${params.INSTALL_IP_ADDR}'"
-      }
-    }
-
-stage('Preflight SSH to CNs') {
-  options { timeout(time: 10, unit: 'MINUTES') }
-  steps {
-    withEnv([
-      "SSH_KEY=${env.SSH_KEY}",
-      "SERVER_FILE=${env.SERVER_FILE}",
-      "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}",
-      "CN_BOOTSTRAP_PASS=" + (params.CN_BOOTSTRAP_PASS ?: '')
-    ]) {
-      sh '''
-bash -euo pipefail <<'BASH'
+        sh '''#!/usr/bin/env bash
 set -euo pipefail
+test -f scripts/cluster_reset.sh || { echo "scripts/cluster_reset.sh not found"; exit 2; }
+sed -i 's/\\r$//' scripts/cluster_reset.sh || true
+chmod +x scripts/cluster_reset.sh
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=10"
-
-# Show hosts from server_pci_map.txt (field #2)
-HOSTS="$(awk -F: '!/^#/ && NF>=2 {print $2}' "$SERVER_FILE" | xargs || true)"
-echo "[preflight] Hosts: ${HOSTS:-<none>}"
-
-# 1) SSH key test to each host
-while IFS=: read -r name ip rest; do
-  [ -n "${name:-}" ] || continue
-  case "$name" in '#*'|'') continue ;; esac
-  [ -n "${ip:-}" ] || continue
-  echo "[preflight] Testing $ip…"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" echo ok >/dev/null
-done < "$SERVER_FILE"
-echo "[preflight] ✅ All CNs accept Jenkins key"
-
-# 2) Ensure alias IP (auto-pick interface) on each host
-while IFS=: read -r name ip rest; do
-  [ -n "${name:-}" ] || continue
-  case "$name" in '#*'|'') continue ;; esac
-  [ -n "${ip:-}" ] || continue
-
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -lc '
-    CIDR="'"${INSTALL_IP_ADDR}"'"
-    IP_ONLY="${CIDR%/*}"
-    if ip -4 addr show | awk "/inet /{print \$2}" | cut -d/ -f1 | grep -qx "$IP_ONLY"; then
-      echo "[alias-ip] ✅ Already present: $IP_ONLY"
-      exit 0
-    fi
-    DEFIF=$(ip route | awk "/^default/{print \$5; exit}")
-    IFACE=${DEFIF:-$(ip -o link | awk -F": " "{print \$2}" | sed "s/@.*//" \
-      | grep -E "^(en|eth|ens|eno|em|bond|br)" \
-      | grep -Ev "(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)" | head -n1)}
-    [ -n "$IFACE" ] || { echo "[alias-ip] ❌ no iface"; exit 2; }
-    ip addr replace "$CIDR" dev "$IFACE"
-    echo "[alias-ip] ✅ $CIDR present on $IFACE"
-  '
-done < "$SERVER_FILE"
-BASH
-      '''
-    }
-  }
-}
-
-
-
-    stage('Validate inputs') {
-      steps {
-        script {
-          def mode = (params.INSTALL_MODE ?: '').toString().trim()
-          if (mode != 'Fresh_installation' && !((params.OLD_VERSION ?: '').toString().trim())) {
-            error "OLD_VERSION is required for ${mode}"
-          }
-        }
+echo "[pipeline] Running cluster_reset.sh …"
+env \
+  CLUSTER_RESET=true \
+  OLD_VERSION="${OLD_VERSION}" \
+  OLD_BUILD_PATH="" \
+  K8S_VER="${K8S_VER}" \
+  KSPRAY_DIR="${KSPRAY_DIR}" \
+  RESET_YML_WS="${RESET_YML_WS}" \
+  SSH_KEY="${SSH_KEY}" \
+  SERVER_FILE="${SERVER_FILE}" \
+  REQ_WAIT_SECS="360" \
+  RETRY_COUNT="3" \
+  RETRY_DELAY_SECS="10" \
+  INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
+bash -euo pipefail scripts/cluster_reset.sh |& tee cluster_reset.log
+'''
       }
     }
 
-    stage('Reset &/or Fetch (parallel)') {
-      parallel {
-        stage('Cluster reset (auto from INSTALL_MODE)') {
-          when { expression { params.INSTALL_MODE == 'Upgrade_with_cluster_reset' } }
-          options { timeout(time: 15, unit: 'MINUTES') }
-          steps {
-            withEnv([
-              "CLUSTER_RESET=true",
-              "OLD_VERSION=${params.OLD_VERSION}",
-              // Script uses per-host path from server_pci_map.txt; UI value can be ignored
-              "OLD_BUILD_PATH=" + (params.OLD_BUILD_PATH_UI ?: ''),
-              "K8S_VER=${env.K8S_VER}",
-              "KSPRAY_DIR=${env.KSPRAY_DIR}",
-              "RESET_YML_WS=${env.RESET_YML_WS}",
-              "SSH_KEY=${env.SSH_KEY}",
-              "SERVER_FILE=${env.SERVER_FILE}",
-              "REQ_WAIT_SECS=360",
-              "RETRY_COUNT=3",
-              "RETRY_DELAY_SECS=10",
-              "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}"
-            ]) {
-              sh '''
-                sed -i 's/\r$//' scripts/cluster_reset.sh || true
-                chmod +x scripts/cluster_reset.sh
-                echo "[`date +%F' '%T`] Jenkins reset.yml: ${RESET_YML_WS}"
-                bash -euo pipefail scripts/cluster_reset.sh
-              '''
-            }
-          }
-        }
-
-        stage('Fetch build to CN (optional)') {
-          when { expression { return params.FETCH_BUILD } }
-          options { timeout(time: 30, unit: 'MINUTES') }
-          steps {
-            withEnv([
-              "NEW_VERSION=${params.NEW_VERSION}",
-              "NEW_BUILD_PATH=${params.NEW_BUILD_PATH}",
-              "BUILD_SRC_HOST=" + (params.BUILD_SRC_HOST ?: ''),
-              "BUILD_SRC_USER=" + (params.BUILD_SRC_USER ?: ''),
-              "BUILD_SRC_BASE=" + (params.BUILD_SRC_BASE ?: ''),
-              "BUILD_SRC_PASS=" + (params.BUILD_SRC_PASS ?: ''),
-              "SSH_KEY=${env.SSH_KEY}",
-              "SERVER_FILE=${env.SERVER_FILE}"
-            ]) {
-              sh '''
-                if [ -x scripts/fetch_build.sh ]; then
-                  bash -euo pipefail scripts/fetch_build.sh
-                else
-                  echo "[fetch] ⚠️ scripts/fetch_build.sh not found; skipping"
-                fi
-              '''
-            }
-          }
-        }
-      }
-    }
-
+    /************ Cluster install (your jenkinsfile.sh) ************/
     stage('Cluster install') {
-      when { expression { params.INSTALL_MODE != 'Upgrade_without_cluster_reset' || true } }
-      options { timeout(time: 60, unit: 'MINUTES') }
       steps {
-        withEnv([
-          "NEW_VERSION=${params.NEW_VERSION}",
-          "NEW_BUILD_PATH=${params.NEW_BUILD_PATH}",
-          "SSH_KEY=${env.SSH_KEY}",
-          "SERVER_FILE=${env.SERVER_FILE}",
-          "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}"
-        ]) {
-          sh '''
-            sed -i 's/\r$//' scripts/cluster_install.sh || true
-            if [ -x scripts/cluster_install.sh ]; then
-              bash -euo pipefail scripts/cluster_install.sh
-            else
-              echo "[install] ⚠️ scripts/cluster_install.sh not found; skipping"
-            fi
-          '''
-        }
+        sh '''#!/usr/bin/env bash
+set -euo pipefail
+test -f scripts/cluster_install.sh || { echo "scripts/cluster_install.sh not found"; exit 2; }
+sed -i 's/\\r$//' scripts/cluster_install.sh || true
+chmod +x scripts/cluster_install.sh
+
+echo "[pipeline] Running cluster_install.sh …"
+env \
+  SERVER_FILE="${SERVER_FILE}" \
+  SSH_KEY="${SSH_KEY}" \
+  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+  NEW_VERSION="${NEW_VERSION}" \
+  INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
+  DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+bash -euo pipefail scripts/cluster_install.sh |& tee cluster_install.log
+'''
       }
     }
 
+    /************ K8s health check (post-install) — from Jenkinsfile.health.txt ************/
     stage('K8s health check (post-install)') {
       steps {
-        withEnv([
-          "HEALTH_RETRY_WAIT_SECS=${env.HEALTH_RETRY_WAIT_SECS}",
-          "HEALTH_RETRIES=${env.HEALTH_RETRIES}",
-          "SSH_KEY=${env.SSH_KEY}",
-          "SERVER_FILE=${env.SERVER_FILE}"
-        ]) {
-          sh '''
-            if [ -x scripts/k8s_health_check.sh ]; then
-              bash -euo pipefail scripts/k8s_health_check.sh
-            else
-              echo "[health] ⚠️ scripts/k8s_health_check.sh not found; skipping"
-            fi
-          '''
+        timeout(time: 20, unit: 'MINUTES') {
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+: "${HEALTH_RETRY_WAIT_SECS:=300}"
+: "${HEALTH_RETRIES:=1}"
+: "${SERVER_FILE:=server_pci_map.txt}"
+: "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
+
+test -f scripts/k8s_health_check.sh || { echo "scripts/k8s_health_check.sh not found"; exit 2; }
+sed -i 's/\\r$//' scripts/k8s_health_check.sh || true
+chmod +x scripts/k8s_health_check.sh
+
+env \
+  SERVER_FILE="${SERVER_FILE}" \
+  SSH_KEY="${SSH_KEY}" \
+  HEALTH_RETRY_WAIT_SECS="${HEALTH_RETRY_WAIT_SECS}" \
+  HEALTH_RETRIES="${HEALTH_RETRIES}" \
+bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.post_install.log
+'''
         }
       }
     }
 
+    /************ PS config & install ************/
     stage('PS config & install') {
       options { timeout(time: env.PS_STAGE_TIMEOUT_MIN as Integer, unit: 'MINUTES') }
       steps {
-        withEnv([
-          "SSH_KEY=${env.SSH_KEY}",
-          "SERVER_FILE=${env.SERVER_FILE}"
-        ]) {
-          sh '''
-            if [ -x scripts/ps_config.sh ]; then
-              bash -euo pipefail scripts/ps_config.sh
-            else
-              echo "[ps] ⚠️ scripts/ps_config.sh not found; skipping"
-            fi
-          '''
-        }
+        sh '''#!/usr/bin/env bash
+set -euo pipefail
+: "${PS_SCRIPT:=scripts/ps_config.sh}"
+test -f "${PS_SCRIPT}" || { echo "PS script not found at ${PS_SCRIPT}"; exit 2; }
+sed -i 's/\\r$//' "${PS_SCRIPT}" || true
+chmod +x "${PS_SCRIPT}"
+
+echo "[pipeline] Running ${PS_SCRIPT} …"
+env \
+  SERVER_FILE="${SERVER_FILE}" \
+  SSH_KEY="${SSH_KEY}" \
+  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+  NEW_VERSION="${NEW_VERSION}" \
+  DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+bash -euo pipefail "${PS_SCRIPT}" |& tee ps_config.log
+'''
       }
     }
 
-    stage('K8s health check (post-PS)') {
+    /************ K8s health check (post-PS) — from Jenkinsfile.health.txt ************/
+    stage('PS health check') {
       steps {
-        withEnv([
-          "HEALTH_RETRY_WAIT_SECS=${env.HEALTH_RETRY_WAIT_SECS}",
-          "HEALTH_RETRIES=${env.HEALTH_RETRIES}",
-          "SSH_KEY=${env.SSH_KEY}",
-          "SERVER_FILE=${env.SERVER_FILE}"
-        ]) {
-          sh '''
-            if [ -x scripts/k8s_health_check.sh ]; then
-              bash -euo pipefail scripts/k8s_health_check.sh
-            else
-              echo "[health] ⚠️ scripts/k8s_health_check.sh not found; skipping"
-            fi
-          '''
+        timeout(time: 10, unit: 'MINUTES') {
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+test -f scripts/k8s_health_check.sh || { echo "scripts/k8s_health_check.sh not found"; exit 2; }
+# Re-use same health script for post-PS check
+env \
+  SERVER_FILE="${SERVER_FILE}" \
+  SSH_KEY="${SSH_KEY}" \
+  HEALTH_RETRY_WAIT_SECS="${HEALTH_RETRY_WAIT_SECS}" \
+  HEALTH_RETRIES="${HEALTH_RETRIES}" \
+bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.post_ps.log
+'''
         }
       }
     }
 
+    /************ CS config & install — from Jenkinsfile_cs.txt ************/
     stage('CS config & install') {
       options { timeout(time: env.CS_STAGE_TIMEOUT_MIN as Integer, unit: 'MINUTES') }
       steps {
-        withEnv([
-          "SSH_KEY=${env.SSH_KEY}",
-          "SERVER_FILE=${env.SERVER_FILE}"
-        ]) {
-          sh '''
-            if [ -x scripts/cs_config.sh ]; then
-              bash -euo pipefail scripts/cs_config.sh
-            else
-              echo "[cs] ⚠️ scripts/cs_config.sh not found; skipping"
-            fi
-          '''
-        }
+        sh '''#!/usr/bin/env bash
+set -euo pipefail
+: "${CS_SCRIPT:=scripts/cs_config.sh}"
+test -f "${CS_SCRIPT}" || { echo "CS script not found at ${CS_SCRIPT}"; exit 2; }
+sed -i 's/\\r$//' "${CS_SCRIPT}" || true
+chmod +x "${CS_SCRIPT}"
+
+echo "[pipeline] Running ${CS_SCRIPT} …"
+env \
+  SERVER_FILE="${SERVER_FILE}" \
+  SSH_KEY="${SSH_KEY}" \
+  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+  NEW_VERSION="${NEW_VERSION}" \
+  DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+bash -euo pipefail "${CS_SCRIPT}" |& tee cs_config.log
+'''
       }
     }
 
+    /************ NF services config — from Jenkinsfile.nf_config.txt ************/
     stage('NF services config') {
       steps {
-        withEnv([
-          "SSH_KEY=${env.SSH_KEY}",
-          "SERVER_FILE=${env.SERVER_FILE}"
-        ]) {
-          sh '''
-            if [ -x scripts/nf_config.sh ]; then
-              bash -euo pipefail scripts/nf_config.sh
-            else
-              echo "[nf] ⚠️ scripts/nf_config.sh not found; skipping"
-            fi
-          '''
-        }
+        sh '''#!/usr/bin/env bash
+set -euo pipefail
+test -f scripts/nf_config.sh || { echo "ERROR: scripts/nf_config.sh not found"; exit 2; }
+sed -i 's/\\r$//' scripts/nf_config.sh || true
+chmod +x scripts/nf_config.sh
+
+echo "[pipeline] Running scripts/nf_config.sh …"
+env \
+  SERVER_FILE="${SERVER_FILE}" \
+  SSH_KEY="${SSH_KEY}" \
+  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+  NEW_VERSION="${NEW_VERSION}" \
+  DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
+bash -euo pipefail scripts/nf_config.sh |& tee nf_config.log
+'''
       }
     }
   }
 
   post {
     always {
-      archiveArtifacts artifacts: '**/*.log', fingerprint: true, allowEmptyArchive: true
+      archiveArtifacts artifacts: '**/*.log', allowEmptyArchive: true
     }
   }
 }
