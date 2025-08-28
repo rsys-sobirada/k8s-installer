@@ -146,7 +146,16 @@ pipeline {
       }
     }
 
-sh '''
+stage('Preflight SSH to CNs') {
+  options { timeout(time: 10, unit: 'MINUTES') }
+  steps {
+    withEnv([
+      "SSH_KEY=${env.SSH_KEY}",
+      "SERVER_FILE=${env.SERVER_FILE}",
+      "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}",
+      "CN_BOOTSTRAP_PASS=" + (params.CN_BOOTSTRAP_PASS ?: '')
+    ]) {
+      sh '''
 bash -euo pipefail <<'BASH'
 set -euo pipefail
 
@@ -159,7 +168,7 @@ echo "[preflight] Hosts: ${HOSTS:-<none>}"
 # 1) SSH key test to each host
 while IFS=: read -r name ip rest; do
   [ -n "${name:-}" ] || continue
-  case "$name" in '#*'|'') continue ;; esac   # <-- no backslash
+  case "$name" in '#*'|'') continue ;; esac
   [ -n "${ip:-}" ] || continue
   echo "[preflight] Testing $ip…"
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" echo ok >/dev/null
@@ -169,7 +178,7 @@ echo "[preflight] ✅ All CNs accept Jenkins key"
 # 2) Ensure alias IP (auto-pick interface) on each host
 while IFS=: read -r name ip rest; do
   [ -n "${name:-}" ] || continue
-  case "$name" in '#*'|'') continue ;; esac   # <-- no backslash
+  case "$name" in '#*'|'') continue ;; esac
   [ -n "${ip:-}" ] || continue
 
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -lc '
@@ -189,7 +198,11 @@ while IFS=: read -r name ip rest; do
   '
 done < "$SERVER_FILE"
 BASH
-'''
+      '''
+    }
+  }
+}
+
 
 
     stage('Validate inputs') {
