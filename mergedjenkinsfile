@@ -35,10 +35,11 @@ Fresh_installation''',
       description: 'Existing bundle version (used if upgrading)'
     ),
     booleanParam(name: 'FETCH_BUILD', defaultValue: false, description: 'Fetch NEW_VERSION from build host to CN servers'),
-    // -- OLD_BUILD_PATH only shows for Upgrade_* modes
+
+    // Visible only for Upgrade_* modes
     [$class: 'DynamicReferenceParameter',
       name: 'OLD_BUILD_PATH_UI',
-      description: 'Base dir of OLD_VERSION (per-host path will still be read from server_pci_map.txt)',
+      description: 'Base dir of OLD_VERSION (per-host path still read from server_pci_map.txt)',
       referencedParameters: 'INSTALL_MODE',
       choiceType: 'ET_FORMATTED_HTML',
       omitValueField: true,
@@ -49,7 +50,8 @@ if (mode == 'Upgrade_with_cluster_reset' || mode == 'Upgrade_without_cluster_res
 return ""''', sandbox: true
       ], fallbackScript: [script: 'return ""', sandbox: true]]
     ],
-    // -- Build source fields show only when FETCH_BUILD is true
+
+    // Visible only when FETCH_BUILD is true
     [$class: 'DynamicReferenceParameter',
       name: 'BUILD_SRC_HOST',
       description: 'Build repo host',
@@ -106,8 +108,9 @@ return "<input type='password' class='setting-input' name='value' value=''/>"'''
         sandbox: true
       ], fallbackScript: [script: 'return ""', sandbox: true]]
     ],
+
     string(name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24', description: 'Alias IP/CIDR to plumb on CN servers'),
-    password(name: 'CN_BOOTSTRAP_PASS', description: 'One-time CN root password (used to push Jenkins key if needed; optional)')
+    password(name: 'CN_BOOTSTRAP_PASS', description: 'One-time CN root password (optional; used to push Jenkins key)')
   ])
 ])
 
@@ -136,9 +139,7 @@ pipeline {
 
   stages {
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage('Show inputs') {
@@ -157,7 +158,6 @@ pipeline {
           "CN_BOOTSTRAP_PASS=${params.CN_BOOTSTRAP_PASS ?: ''}"
         ]) {
           sh '''
-            set -euo pipefail
             chmod +x scripts/preflight.sh || true
             bash -euo pipefail scripts/preflight.sh
           '''
@@ -185,7 +185,7 @@ pipeline {
             withEnv([
               "CLUSTER_RESET=true",
               "OLD_VERSION=${params.OLD_VERSION}",
-              // The script reads per-host path from server_pci_map.txt; UI path is optional/ignored
+              // Script uses per-host path from server_pci_map.txt; UI can be ignored
               "OLD_BUILD_PATH=${params.OLD_BUILD_PATH_UI ?: ''}",
               "K8S_VER=${env.K8S_VER}",
               "KSPRAY_DIR=${env.KSPRAY_DIR}",
@@ -198,10 +198,9 @@ pipeline {
               "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}"
             ]) {
               sh '''
-                set -euo pipefail
                 sed -i 's/\r$//' scripts/cluster_reset.sh || true
                 chmod +x scripts/cluster_reset.sh
-                echo "[${date +%F\\ %T}] Jenkins reset.yml: ${RESET_YML_WS}"
+                echo "[`date +%F' '%T`] Jenkins reset.yml: ${RESET_YML_WS}"
                 bash -euo pipefail scripts/cluster_reset.sh
               '''
             }
@@ -223,7 +222,6 @@ pipeline {
               "SERVER_FILE=${env.SERVER_FILE}"
             ]) {
               sh '''
-                set -euo pipefail
                 chmod +x scripts/fetch_build.sh || true
                 bash -euo pipefail scripts/fetch_build.sh
               '''
@@ -245,7 +243,6 @@ pipeline {
           "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}"
         ]) {
           sh '''
-            set -euo pipefail
             sed -i 's/\r$//' scripts/cluster_install.sh || true
             chmod +x scripts/cluster_install.sh
             bash -euo pipefail scripts/cluster_install.sh
@@ -263,7 +260,6 @@ pipeline {
           "SERVER_FILE=${env.SERVER_FILE}"
         ]) {
           sh '''
-            set -euo pipefail
             chmod +x scripts/k8s_health_check.sh || true
             bash -euo pipefail scripts/k8s_health_check.sh
           '''
@@ -279,7 +275,6 @@ pipeline {
           "SERVER_FILE=${env.SERVER_FILE}"
         ]) {
           sh '''
-            set -euo pipefail
             chmod +x scripts/ps_config.sh || true
             bash -euo pipefail scripts/ps_config.sh
           '''
@@ -296,7 +291,6 @@ pipeline {
           "SERVER_FILE=${env.SERVER_FILE}"
         ]) {
           sh '''
-            set -euo pipefail
             chmod +x scripts/k8s_health_check.sh || true
             bash -euo pipefail scripts/k8s_health_check.sh
           '''
@@ -312,7 +306,6 @@ pipeline {
           "SERVER_FILE=${env.SERVER_FILE}"
         ]) {
           sh '''
-            set -euo pipefail
             chmod +x scripts/cs_config.sh || true
             bash -euo pipefail scripts/cs_config.sh
           '''
@@ -327,7 +320,6 @@ pipeline {
           "SERVER_FILE=${env.SERVER_FILE}"
         ]) {
           sh '''
-            set -euo pipefail
             chmod +x scripts/nf_config.sh || true
             bash -euo pipefail scripts/nf_config.sh
           '''
