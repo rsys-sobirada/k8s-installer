@@ -322,7 +322,7 @@ if [[ -n "${CIDR:-}" ]]; then
     ( ip monitor address 2>/dev/null | while read -r _; do
         ! is_present && { ipmon_log "addr change; restoring $CIDR"; ensure_once || true; }
       done ) & MON_PID=$!
-    trap '[[ -n "${MON_PID:-}" ]] && kill "$MON_PID" 2>/dev/null || true' EXIT
+    trap '[[ -n "${MON_PID:-}" ]] && kill "$MON_PID" 2>/dev/null || true; on_exit_stop_ipmon' EXIT
   fi
 
   ( while true; do
@@ -351,37 +351,35 @@ declare -a IP_MON_IDS=()  # "<ip>|<tag>"
 
 start_ip_monitor(){
   local ip="$1" ip_cidr="$2" iface="$3"
-  [[ -z "$ip_cidr" ]] && { echo "[IPMON][$ip] skipped (INSTALL_IP_ADDR empty)"; return 0; }
+  [[ -z "${ip_cidr:-}" ]] && { echo "[IPMON][$ip] skipped (INSTALL_IP_ADDR empty)"; return 0; }
 
-  # Stable one-per-host+CIDR tag
-  local cidr_sanitized="${ip_cidr//\//_}"               # e.g. 10.10.10.20_24
+  # stable identifiers
+  local cidr_sanitized="${ip_cidr//\//_}"
   local tag="ipmon_${ip//./-}_${cidr_sanitized}"
-  IP_MON_IDS+=("$ip|$tag")
-
   local remote="/tmp/${tag}"
   local sh="${remote}.sh"
   local pidf="${remote}.pid"
   local pgf="${remote}.pgid"
   local log="/var/log/alias_ipmon.log"
+  local interval="${IP_MONITOR_INTERVAL:-30}"
 
+  # launch watcher on node (non-fatal)
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -eo pipefail -s -- \
-      "${ip_cidr:-}" "${iface:-}" "${IP_MONITOR_INTERVAL:-30}" \
-      "${sh:-}" "${pidf:-}" "${pgf:-}" "${log:-/var/log/alias_ipmon.log}" <<'EOF'
+      "$ip_cidr" "${iface:-}" "$interval" "$sh" "$pidf" "$pgf" "$log" <<'EOF'
 CIDR="${1:-}"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"
 SH="${4:-/tmp/ipmon.sh}"; PIDF="${5:-/tmp/ipmon.pid}"; PGF="${6:-/tmp/ipmon.pgid}"
 LOG_PATH="${7:-/var/log/alias_ipmon.log}"
 IP="${CIDR%%/*}"
 
-# ensure log file usable
+# log file
 if ! { mkdir -p "$(dirname "$LOG_PATH")" 2>/dev/null && : >>"$LOG_PATH"; }; then
   LOG_PATH="/tmp/alias_ipmon.log"
   mkdir -p /tmp >/dev/null 2>&1 || true
   : >>"$LOG_PATH" || true
 fi
-
 ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG_PATH"; }
 
-# If already running, keep it
+# already running?
 if [[ -s "$PIDF" ]] && ps -p "$(cat "$PIDF" 2>/dev/null)" >/dev/null 2>&1; then
   ipmon_log "already running (PID=$(cat "$PIDF")) logging to $LOG_PATH"
   exit 0
@@ -392,20 +390,57 @@ cat >"$SH" <<'MON'
 set -euo pipefail
 CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; LOG_PATH="$4"
 IP="${CIDR%%/*}"
-
 ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG_PATH"; }
-
 is_present(){ ip -4 addr show | awk "/inet /{print \$2}" | cut -d/ -f1 | grep -qx "$IP"; }
-
 pick_if(){
   [[ -n "$IFACE" ]] && { echo "$IFACE"; return; }
-  DEFIF=$(ip route 2>/dev/null | awk "/^default/{print \$5; exit}" || true)
+  local DEFIF; DEFIF=$(ip route 2>/dev/null | awk "/^default/{print \$5; exit}" || true)
   if [[ -n "$DEFIF" ]]; then echo "$DEFIF"; return; fi
-  ip -o link | awk -F': ' '{print $2}' \
-    | sed 's/@.*//' \
+  ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
     | grep -E '^(en|eth|ens|eno|em|bond|br)' \
     | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
     | head -n1
+}
+ensure_once(){
+  local IF; IF="$(pick_if)"; [[ -n "$IF" ]] || { ipmon_log "no iface candidates"; return 1; }
+  ip link show "$IF" >/dev/null 2>&1 || { ipmon_log "iface not found: $IF"; return 1; }
+  ip link set dev "$IF" up >/dev/null 2>&1 || true
+  ipmon_log "…trying $CIDR on $IF"
+  if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ip_alias_err.log; then
+    sleep 1; is_present && { ipmon_log "✅ $CIDR present on $IF"; return 0; }
+  fi
+  ipmon_log "add failed: $(tr -d \\n </tmp/ip_alias_err.log 2>/dev/null || true)"
+  return 1
+}
+
+# initial ensure
+ipmon_log "watch start for $CIDR (interval=${SLEEP_SEC}s)"
+is_present && ipmon_log "Already present: $IP" || ensure_once || true
+
+# event-driven
+( ip monitor address 2>/dev/null | while read -r _; do
+    if ! is_present; then ipmon_log "addr change; restoring $CIDR"; ensure_once || true; fi
+  done ) & MON_PID=$!
+echo "$MON_PID" >"$PGF" || true
+ipmon_log "event monitor pid=$MON_PID"
+
+# periodic
+case "$SLEEP_SEC" in ''|*[!0-9]*) SLEEP_SEC=30 ;; esac
+while :; do
+  if ! is_present; then ipmon_log "periodic restore; re-adding $CIDR"; ensure_once || true; fi
+  ipmon_log "heartbeat (present=$(is_present && echo yes || echo no))"
+  sleep "$SLEEP_SEC"
+done
+MON
+chmod +x "$SH" || true
+
+# run in its own process group so we can kill group later
+setsid nohup "$SH" "$CIDR" "$IFACE" "$SLEEP_SEC" "$LOG_PATH" >/dev/null 2>&1 &
+echo "$!" >"$PIDF" || true
+EOF
+
+  # record mapping locally so we can stop later
+  IP_MON_IDS+=("$ip|$cidr_sanitized")
 }
 
 ensure_once(){
@@ -466,16 +501,21 @@ EOF
 
 
 stop_ip_monitor(){
-  local ip="$1" tag="$2"
-  local remote="/tmp/${tag}"; local pidf="${remote}.pid"; local pgf="${remote}.pgid"; local sh="${remote}.sh"
+  local ip="$1" cidr_sanitized="$2"
+  local tag="ipmon_${ip//./-}_${cidr_sanitized}"
+  local remote="/tmp/${tag}"
+  local pidf="${remote}.pid"
+  local pgf="${remote}.pgid"
+  local sh="${remote}.sh"
+
   ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$pidf" "$pgf" "$sh" <<'EOF'
 set +e
 PIDF="${1:?}"; PGF="${2:?}"; SH="${3:?}"
 if [[ -f "$PGF" ]]; then
   PGID="$(tr -d ' ' < "$PGF" 2>/dev/null)"
-  [[ -n "$PGID" ]] && { kill -TERM -"$PGID" 2>/dev/null; sleep 1; kill -KILL -"$PGID" 2>/dev/null; }
+  [[ -n "$PGID" ]] && { kill -TERM "$PGID" 2>/dev/null; kill -KILL "$PGID" 2>/dev/null; }
 fi
-[[ -f "$PIDF" ]] && { kill -TERM "$(cat "$PIDF")" 2>/dev/null; sleep 1; kill -KILL "$(cat "$PIDF")" 2>/dev/null; }
+[[ -f "$PIDF" ]] && { kill -TERM "$(cat "$PIDF")" 2>/dev/null; kill -KILL "$(cat "$PIDF")" 2>/dev/null; }
 rm -f "$PGF" "$PIDF" "$SH" 2>/dev/null || true
 echo "[IPMON] stopped"
 EOF
@@ -492,10 +532,10 @@ on_exit_restore_all(){
   done
 }
 on_exit_stop_ipmon(){
-  local item ip tag
-  for item in "${IP_MON_IDS[@]}"; do
-    ip="${item%%|*}"; tag="${item#*|}"
-    stop_ip_monitor "$ip" "$tag" || true
+  local item ip cidr
+  for item in "${IP_MON_IDS[@]:-}"; do
+    ip="${item%%|*}"; cidr="${item#*|}"
+    stop_ip_monitor "$ip" "$cidr" || true
   done
 }
 trap 'on_exit_restore_all; on_exit_stop_ipmon' EXIT
