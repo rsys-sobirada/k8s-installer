@@ -61,6 +61,7 @@ env \
   RETRY_COUNT="3" \
   RETRY_DELAY_SECS="10" \
   INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
+  CIDR="${INSTALL_IP_ADDR}" \
 bash -euo pipefail scripts/cluster_reset.sh |& tee cluster_reset.log
 '''
       }
