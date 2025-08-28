@@ -2,7 +2,7 @@ pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
 
-  /**************** GUI (minimal) ****************/
+  /*************** GUI (minimal) ***************/
   parameters {
     choice(name: 'DEPLOYMENT_TYPE', choices: ['Low','Medium','High'], description: 'Capacity preset')
     choice(name: 'INSTALL_MODE', choices: [
@@ -10,24 +10,31 @@ pipeline {
       'Upgrade_without_cluster_reset',
       'Fresh_installation'
     ], description: 'Install mode')
+
     string(name: 'NEW_BUILD_PATH',  defaultValue: '/home/labadmin/6.3.0/EA3', description: 'Base dir containing TRILLIUM_5GCN_CNF_REL_<VER>')
     string(name: 'NEW_VERSION',     defaultValue: '6.3.0_EA3',                description: 'Target version')
     string(name: 'OLD_VERSION',     defaultValue: '6.3.0_EA3',                description: 'Existing version (for upgrade)')
-    string(name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24',           description: 'Alias IP/CIDR if your scripts use it')
+    string(name: 'INSTALL_IP_ADDR', defaultValue: '10.10.10.20/24',           description: 'Alias IP/CIDR if used by scripts')
+
+    // Fetch stage inputs (simple; conditional execution keeps UI minimal)
+    booleanParam(name: 'FETCH_BUILD', defaultValue: false, description: 'Fetch NEW_VERSION to CNs before install')
+    string(name: 'BUILD_SRC_HOST', defaultValue: '', description: 'Build repo host (e.g. 172.26.2.96)')
+    string(name: 'BUILD_SRC_USER', defaultValue: '', description: 'Build repo user (e.g. labadmin)')
+    string(name: 'BUILD_SRC_BASE', defaultValue: '', description: 'Path on build host (e.g. /CNBuild/6.3.0_EA3)')
+    password(name: 'BUILD_SRC_PASS', description: 'Build repo password')
   }
 
-  /**************** Hidden (hard-coded) ****************/
+  /*************** Hidden (hard-coded) ***************/
   environment {
     SERVER_FILE = 'server_pci_map.txt'                 // <name>:<ip>:<build_path>:<VM|SRIOV>:<N3>:<N6>:<N4_CIDR>:<AMF_N2_IP>
     SSH_KEY     = '/var/lib/jenkins/.ssh/jenkins_key'  // not shown in GUI
 
-    // Hard-coded defaults as requested
     HEALTH_RETRY_WAIT_SECS = '300'
     HEALTH_RETRIES          = '1'
     PS_STAGE_TIMEOUT_MIN    = '60'
     CS_STAGE_TIMEOUT_MIN    = '60'
 
-    // Versions/paths used by cluster_reset.sh (unchanged logic)
+    // Used by cluster_reset.sh (script logic unchanged)
     K8S_VER      = '1.31.4'
     KSPRAY_DIR   = 'kubespray-2.27.0'
     RESET_YML_WS = "${WORKSPACE}/reset.yml"
@@ -36,7 +43,7 @@ pipeline {
   stages {
     stage('Checkout') { steps { checkout scm } }
 
-    /************ Cluster reset (from Jenkinsfile.sh) ************/
+    /************ Cluster reset (from your main Jenkinsfile.sh) ************/
     stage('Cluster reset (auto from INSTALL_MODE)') {
       when { expression { (params.INSTALL_MODE ?: '') == 'Upgrade_with_cluster_reset' } }
       options { timeout(time: 15, unit: 'MINUTES') }
@@ -44,7 +51,7 @@ pipeline {
         sh '''#!/usr/bin/env bash
 set -euo pipefail
 test -f scripts/cluster_reset.sh || { echo "scripts/cluster_reset.sh not found"; exit 2; }
-sed -i 's/\\r$//' scripts/cluster_reset.sh || true
+sed -i 's/\r$//' scripts/cluster_reset.sh || true
 chmod +x scripts/cluster_reset.sh
 
 echo "[pipeline] Running cluster_reset.sh …"
@@ -62,18 +69,44 @@ env \
   RETRY_DELAY_SECS="10" \
   INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
   CIDR="${INSTALL_IP_ADDR}" \
-bash -euo pipefail scripts/cluster_reset.sh |& tee cluster_reset.log
+bash -euo pipefail scripts/cluster_reset.sh
 '''
       }
     }
 
-    /************ Cluster install (your jenkinsfile.sh) ************/
+    /************ Fetch build (optional; matched to your original flow) ************/
+    stage('Fetch build to CN (optional)') {
+      when { expression { return params.FETCH_BUILD } }
+      options { timeout(time: 30, unit: 'MINUTES') }
+      steps {
+        sh '''#!/usr/bin/env bash
+set -euo pipefail
+test -f scripts/fetch_build.sh || { echo "scripts/fetch_build.sh not found"; exit 2; }
+sed -i 's/\r$//' scripts/fetch_build.sh || true
+chmod +x scripts/fetch_build.sh
+
+echo "[pipeline] Running fetch_build.sh …"
+env \
+  NEW_VERSION="${NEW_VERSION}" \
+  NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
+  BUILD_SRC_HOST="${BUILD_SRC_HOST}" \
+  BUILD_SRC_USER="${BUILD_SRC_USER}" \
+  BUILD_SRC_BASE="${BUILD_SRC_BASE}" \
+  BUILD_SRC_PASS="${BUILD_SRC_PASS}" \
+  SSH_KEY="${SSH_KEY}" \
+  SERVER_FILE="${SERVER_FILE}" \
+bash -euo pipefail scripts/fetch_build.sh
+'''
+      }
+    }
+
+    /************ Cluster install (your Jenkinsfile.sh content) ************/
     stage('Cluster install') {
       steps {
         sh '''#!/usr/bin/env bash
 set -euo pipefail
 test -f scripts/cluster_install.sh || { echo "scripts/cluster_install.sh not found"; exit 2; }
-sed -i 's/\\r$//' scripts/cluster_install.sh || true
+sed -i 's/\r$//' scripts/cluster_install.sh || true
 chmod +x scripts/cluster_install.sh
 
 echo "[pipeline] Running cluster_install.sh …"
@@ -84,7 +117,7 @@ env \
   NEW_VERSION="${NEW_VERSION}" \
   INSTALL_IP_ADDR="${INSTALL_IP_ADDR}" \
   DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-bash -euo pipefail scripts/cluster_install.sh |& tee cluster_install.log
+bash -euo pipefail scripts/cluster_install.sh
 '''
       }
     }
@@ -101,7 +134,7 @@ set -euo pipefail
 : "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
 
 test -f scripts/k8s_health_check.sh || { echo "scripts/k8s_health_check.sh not found"; exit 2; }
-sed -i 's/\\r$//' scripts/k8s_health_check.sh || true
+sed -i 's/\r$//' scripts/k8s_health_check.sh || true
 chmod +x scripts/k8s_health_check.sh
 
 env \
@@ -109,13 +142,13 @@ env \
   SSH_KEY="${SSH_KEY}" \
   HEALTH_RETRY_WAIT_SECS="${HEALTH_RETRY_WAIT_SECS}" \
   HEALTH_RETRIES="${HEALTH_RETRIES}" \
-bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.post_install.log
+bash -euo pipefail scripts/k8s_health_check.sh
 '''
         }
       }
     }
 
-    /************ PS config & install ************/
+    /************ PS config & install — matches Jenkinsfile.health.txt ************/
     stage('PS config & install') {
       options { timeout(time: env.PS_STAGE_TIMEOUT_MIN as Integer, unit: 'MINUTES') }
       steps {
@@ -123,7 +156,7 @@ bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.post_install.
 set -euo pipefail
 : "${PS_SCRIPT:=scripts/ps_config.sh}"
 test -f "${PS_SCRIPT}" || { echo "PS script not found at ${PS_SCRIPT}"; exit 2; }
-sed -i 's/\\r$//' "${PS_SCRIPT}" || true
+sed -i 's/\r$//' "${PS_SCRIPT}" || true
 chmod +x "${PS_SCRIPT}"
 
 echo "[pipeline] Running ${PS_SCRIPT} …"
@@ -133,25 +166,29 @@ env \
   NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
   NEW_VERSION="${NEW_VERSION}" \
   DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-bash -euo pipefail "${PS_SCRIPT}" |& tee ps_config.log
+bash -euo pipefail "${PS_SCRIPT}"
 '''
       }
     }
 
-    /************ K8s health check (post-PS) — from Jenkinsfile.health.txt ************/
-    stage('PS health check') {
+    /************ K8s health check (post-PS) — same health code ************/
+    stage('K8s health check (post-PS)') {
       steps {
-        timeout(time: 10, unit: 'MINUTES') {
+        timeout(time: 20, unit: 'MINUTES') {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
+: "${HEALTH_RETRY_WAIT_SECS:=300}"
+: "${HEALTH_RETRIES:=1}"
+: "${SERVER_FILE:=server_pci_map.txt}"
+: "${SSH_KEY:=/var/lib/jenkins/.ssh/jenkins_key}"
+
 test -f scripts/k8s_health_check.sh || { echo "scripts/k8s_health_check.sh not found"; exit 2; }
-# Re-use same health script for post-PS check
 env \
   SERVER_FILE="${SERVER_FILE}" \
   SSH_KEY="${SSH_KEY}" \
   HEALTH_RETRY_WAIT_SECS="${HEALTH_RETRY_WAIT_SECS}" \
   HEALTH_RETRIES="${HEALTH_RETRIES}" \
-bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.post_ps.log
+bash -euo pipefail scripts/k8s_health_check.sh
 '''
         }
       }
@@ -165,7 +202,7 @@ bash -euo pipefail scripts/k8s_health_check.sh |& tee health_check.post_ps.log
 set -euo pipefail
 : "${CS_SCRIPT:=scripts/cs_config.sh}"
 test -f "${CS_SCRIPT}" || { echo "CS script not found at ${CS_SCRIPT}"; exit 2; }
-sed -i 's/\\r$//' "${CS_SCRIPT}" || true
+sed -i 's/\r$//' "${CS_SCRIPT}" || true
 chmod +x "${CS_SCRIPT}"
 
 echo "[pipeline] Running ${CS_SCRIPT} …"
@@ -175,7 +212,7 @@ env \
   NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
   NEW_VERSION="${NEW_VERSION}" \
   DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-bash -euo pipefail "${CS_SCRIPT}" |& tee cs_config.log
+bash -euo pipefail "${CS_SCRIPT}"
 '''
       }
     }
@@ -185,8 +222,8 @@ bash -euo pipefail "${CS_SCRIPT}" |& tee cs_config.log
       steps {
         sh '''#!/usr/bin/env bash
 set -euo pipefail
-test -f scripts/nf_config.sh || { echo "ERROR: scripts/nf_config.sh not found"; exit 2; }
-sed -i 's/\\r$//' scripts/nf_config.sh || true
+test -f scripts/nf_config.sh || { echo "scripts/nf_config.sh not found"; exit 2; }
+sed -i 's/\r$//' scripts/nf_config.sh || true
 chmod +x scripts/nf_config.sh
 
 echo "[pipeline] Running scripts/nf_config.sh …"
@@ -196,7 +233,7 @@ env \
   NEW_BUILD_PATH="${NEW_BUILD_PATH}" \
   NEW_VERSION="${NEW_VERSION}" \
   DEPLOYMENT_TYPE="${DEPLOYMENT_TYPE}" \
-bash -euo pipefail scripts/nf_config.sh |& tee nf_config.log
+bash -euo pipefail scripts/nf_config.sh
 '''
       }
     }
@@ -204,7 +241,7 @@ bash -euo pipefail scripts/nf_config.sh |& tee nf_config.log
 
   post {
     always {
-      archiveArtifacts artifacts: '**/*.log', allowEmptyArchive: true
+      archiveArtifacts artifacts: '**/*.log', allowEmptyArchive: true, fingerprint: true
     }
   }
 }
