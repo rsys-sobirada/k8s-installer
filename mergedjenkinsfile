@@ -146,51 +146,56 @@ pipeline {
       }
     }
 
-    stage('Preflight SSH to CNs') {
-      options { timeout(time: 10, unit: 'MINUTES') }
-      steps {
-        withEnv([
-          "SSH_KEY=${env.SSH_KEY}",
-          "SERVER_FILE=${env.SERVER_FILE}",
-          "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}",
-          "CN_BOOTSTRAP_PASS=" + (params.CN_BOOTSTRAP_PASS ?: '')
-        ]) {
-          sh '''
-            # Inline preflight (no scripts/preflight.sh required)
-            bash -euo pipefail <<'BASH'
-            set -euo pipefail
-            SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=10"
-            echo "[preflight] Hosts: $(awk -F: '!/^#/ && NF>=2 {print $2}' "$SERVER_FILE" | xargs)"
-            while IFS=: read -r name ip _; do
-              ccase "$name" in '#*'|'') continue ;; esac
-              [ -z "${ip:-}" ] && continue
-              echo "[preflight] Testing $ip…"
-              ssh $SSH_OPTS -i "$SSH_KEY" root@"$ip" 'echo ok' >/dev/null
-            done < "$SERVER_FILE"
-            echo "[preflight] ✅ All CNs accept Jenkins key"
-            echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
-            while IFS=: read -r name ip _; do
-              case "$name" in '#*'|'') continue ;; esac
-              [ -z "${ip:-}" ] && continue
-              ssh $SSH_OPTS -i "$SSH_KEY" root@"$ip" bash -lc '
-                CIDR="'"${INSTALL_IP_ADDR}"'"
-                IP_ONLY="${CIDR%/*}"
-                if ip -4 addr show | awk "/inet /{print \$2}" | cut -d/ -f1 | grep -qx "$IP_ONLY"; then
-                  echo "[alias-ip] ✅ Already present: $IP_ONLY"
-                else
-                  DEFIF=$(ip route | awk "/^default/{print \$5; exit}")
-                  IFACE=${DEFIF:-$(ip -o link | awk -F": " "{print \$2}" | sed "s/@.*//" | grep -E "^(en|eth|ens|eno|em|bond|br)" | grep -Ev "(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)" | head -n1)}
-                  [ -n "$IFACE" ] || { echo "[alias-ip] ❌ no iface"; exit 2; }
-                  ip addr replace "$CIDR" dev "$IFACE"
-                  echo "[alias-ip] ✅ $CIDR present on $IFACE"
-                fi
-              '
-            done < "$SERVER_FILE"
-            BASH
-          '''
-        }
-      }
+stage('Preflight SSH to CNs') {
+  options { timeout(time: 10, unit: 'MINUTES') }
+  steps {
+    withEnv([
+      "SSH_KEY=${env.SSH_KEY}",
+      "SERVER_FILE=${env.SERVER_FILE}",
+      "INSTALL_IP_ADDR=${params.INSTALL_IP_ADDR}",
+      "CN_BOOTSTRAP_PASS=" + (params.CN_BOOTSTRAP_PASS ?: '')
+    ]) {
+      sh '''
+        # Inline preflight (no external script)
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=10"
+
+        echo "[preflight] Hosts: $(awk -F: '!/^#/ && NF>=2 {print $2}' "$SERVER_FILE" | xargs)"
+
+        # 1) SSH key test
+        while IFS=: read -r name ip _; do
+          [ -z "${name:-}" ] && continue
+          case "$name" in '#*'|'') continue ;; esac
+          [ -z "${ip:-}" ] && continue
+          echo "[preflight] Testing $ip…"
+          ssh $SSH_OPTS -i "$SSH_KEY" root@"$ip" 'echo ok' >/dev/null
+        done < "$SERVER_FILE"
+        echo "[preflight] ✅ All CNs accept Jenkins key"
+
+        # 2) Ensure alias IP on each node (auto-pick iface)
+        echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
+        while IFS=: read -r name ip _; do
+          [ -z "${name:-}" ] && continue
+          case "$name" in '#*'|'') continue ;; esac
+          [ -z "${ip:-}" ] && continue
+
+          ssh $SSH_OPTS -i "$SSH_KEY" root@"$ip" bash -lc "
+            CIDR='${INSTALL_IP_ADDR}'
+            IP_ONLY=\"\${CIDR%/*}\"
+            if ip -4 addr show | awk '/inet /{print \$2}' | cut -d/ -f1 | grep -qx \"\$IP_ONLY\"; then
+              echo '[alias-ip] ✅ Already present: '\"\$IP_ONLY\"
+            else
+              DEFIF=\$(ip route | awk '/^default/{print \$5; exit}')
+              IFACE=\${DEFIF:-\$(ip -o link | awk -F': ' '{print \$2}' | sed 's/@.*//' | grep -E '^(en|eth|ens|eno|em|bond|br)' | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' | head -n1)}
+              [ -n \"\$IFACE\" ] || { echo '[alias-ip] ❌ no iface'; exit 2; }
+              ip addr replace \"\$CIDR\" dev \"\$IFACE\"
+              echo '[alias-ip] ✅ '\"\$CIDR\"' present on '\"\$IFACE\"
+            fi
+          "
+        done < "$SERVER_FILE"
+      '''
     }
+  }
+}
 
     stage('Validate inputs') {
       steps {
