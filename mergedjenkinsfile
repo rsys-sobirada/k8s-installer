@@ -162,7 +162,7 @@ pipeline {
             SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=10"
             echo "[preflight] Hosts: $(awk -F: '!/^#/ && NF>=2 {print $2}' "$SERVER_FILE" | xargs)"
             while IFS=: read -r name ip _; do
-              case "$name" in \#*|"") continue ;; esac
+              ccase "$name" in '#*'|'') continue ;; esac
               [ -z "${ip:-}" ] && continue
               echo "[preflight] Testing $ip…"
               ssh $SSH_OPTS -i "$SSH_KEY" root@"$ip" 'echo ok' >/dev/null
@@ -170,7 +170,7 @@ pipeline {
             echo "[preflight] ✅ All CNs accept Jenkins key"
             echo "[alias-ip] Ensuring ${INSTALL_IP_ADDR} on all CNs…"
             while IFS=: read -r name ip _; do
-              case "$name" in \#*|"") continue ;; esac
+              case "$name" in '#*'|'') continue ;; esac
               [ -z "${ip:-}" ] && continue
               ssh $SSH_OPTS -i "$SSH_KEY" root@"$ip" bash -lc '
                 CIDR="'"${INSTALL_IP_ADDR}"'"
