@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
 # scripts/cluster_reset.sh
 if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
-# Takes OLD_BUILD_PATH per-server from server_pci_map.txt (ignores UI OLD_BUILD_PATH).
-# Flow:
-# 1) Detect Kubernetes on host
-# 2) Ensure requirements.txt under old build's kubespray; if missing, start install_k8s.sh and monitor
-# 3) When requirements.txt appears, stop installer, swap in Jenkins reset.yml + inventory,
-#    run ./uninstall_k8s.sh with retries; restore swaps.
 
 set -euo pipefail
 
 # ===== Inputs =====
-CR="${CLUSTER_RESET:-Yes}"                         # gate (Yes/True/1 to run)
+CR="${CLUSTER_RESET:-Yes}"                         # run gate (Yes/True/1)
 SSH_KEY="${SSH_KEY:-/var/lib/jenkins/.ssh/jenkins_key}"
-SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}"   # lines: name:ip:path  |  ip:path
+SERVER_FILE="${SERVER_FILE:-server_pci_map.txt}"   # <name>:<ip>:<path>:...
 KSPRAY_DIR="${KSPRAY_DIR:-kubespray-2.27.0}"
 K8S_VER="${K8S_VER:-1.31.4}"
-OLD_VERSION="${OLD_VERSION:-}"                     # e.g. 6.3.0_EA2 or 6.3.0
+OLD_VERSION="${OLD_VERSION:-}"                     # e.g., 6.3.0_EA3
 
 RESET_YML_WS="${RESET_YML_WS:-$WORKSPACE/reset.yml}"
 REQ_WAIT_SECS="${REQ_WAIT_SECS:-360}"
@@ -24,14 +18,11 @@ RETRY_COUNT="${RETRY_COUNT:-3}"
 RETRY_DELAY_SECS="${RETRY_DELAY_SECS:-10}"
 INSTALL_NAME="${INSTALL_NAME:-install_k8s.sh}"
 UNINSTALL_NAME="${UNINSTALL_NAME:-uninstall_k8s.sh}"
-REL_SUFFIX="${REL_SUFFIX:-}"                       # optional suffix in TRILLIUM dir name
 
-# Optional inputs for alias IP ensure (same semantics as install)
-: "${INSTALL_IP_ADDR:=}"                           # e.g. 10.10.10.20/24 ; if empty, skipped
-: "${INSTALL_IP_IFACE:=}"                          # optional explicit iface
-
-# ---- NEW (IP Monitor) ----
-IP_MONITOR_INTERVAL="${IP_MONITOR_INTERVAL:-30}"   # seconds between checks
+# Alias IP watch parameters
+: "${INSTALL_IP_ADDR:=}"                           # e.g. 10.10.10.20/24
+CIDR="${CIDR:-${INSTALL_IP_ADDR:-}}"
+IP_MONITOR_INTERVAL="${IP_MONITOR_INTERVAL:-30}"
 
 # ===== Gate & validation =====
 shopt -s nocasematch
@@ -41,240 +32,153 @@ if [[ ! "$CR" =~ ^(yes|true|1)$ ]]; then
 fi
 shopt -u nocasematch
 
-[[ -f "$SSH_KEY" ]]      || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
+[[ -f "$SSH_KEY" ]]     || { echo "❌ SSH key not found: $SSH_KEY"; exit 1; }
 chmod 600 "$SSH_KEY" || true
-[[ -f "$SERVER_FILE" ]]  || { echo "❌ $SERVER_FILE not found"; exit 1; }
-[[ -f "$RESET_YML_WS" ]] || { echo "❌ Jenkins reset.yml not found: $RESET_YML_WS"; exit 1; }
-[[ -n "$OLD_VERSION" ]]  || { echo "❌ OLD_VERSION is required (e.g. 6.3.0_EA2)"; exit 1; }
+[[ -f "$SERVER_FILE" ]] || { echo "❌ $SERVER_FILE not found"; exit 1; }
 
-# ===== Helpers =====
-log() { printf '[%(%F %T)T] %s\n' -1 "$*"; }
-ver_num(){ echo "${1%%_*}"; }   # 6.3.0_EA1 -> 6.3.0
-ver_tag(){ [[ "$1" == *_* ]] && echo "${1##*_}" || echo ""; }
+# ===== Utils =====
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=15"
 
-SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=5m -o ControlPath=/tmp/ssh_mux_%h_%p_%r'
+ts(){ date '+%Y-%m-%d %H:%M:%S'; }
+log(){ printf '[%s] %s\n' "$(ts)" "$*"; }
+rsh(){ ssh $SSH_OPTS -i "$SSH_KEY" "root@$1" "${@:2}"; }
+rscp(){ scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$SSH_KEY" "$2" "root@$1:$3"; }
+trim(){ awk '{$1=$1;print}' <<<"$*"; }
 
-# Version-safe path normalizer (prevents double-versioning; probes EA/non-EA)
-normalize_k8s_path() {
-  local base="${1%/}" old_ver="$2"
+# Parse server file into: name ip base mode n3 n6 n4 amf
+parse_line(){
+  local line="$1"
+  if [[ "$line" == \#* || -z "$line" ]]; then return 1; fi
+  IFS=':' read -r f1 f2 f3 f4 f5 f6 f7 f8 <<<"$line"
+  if [[ "$f1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf 'NA %s %s VM NA NA NA NA\n' "$f1" "$f2"
+  else
+    printf '%s %s %s %s %s %s %s %s\n' "$f1" "$f2" "$f3" "${f4:-VM}" "${f5:-NA}" "${f6:-NA}" "${f7:-NA}" "${f8:-NA}"
+  fi
+}
 
-  # 1) Already a full k8s root → return as-is
-  if [[ "$base" =~ /common/tools/install/k8s-v[^/]+$ ]]; then
+remote_has_k8s(){
+  local ip="$1"
+  rsh "$ip" bash -lc '
+    set -e
+    command -v kubectl >/dev/null 2>&1 || command -v crictl >/dev/null 2>&1 || command -v kubeadm >/dev/null 2>&1
+  '
+}
+
+remote_find_old_sp(){
+  local ip="$1" base="$2"
+  if [[ "$base" =~ /k8s-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "$base"; return
   fi
-
-  # 2) Already at TRILLIUM install dir → just add k8s-v
+  if [[ "$base" =~ /TRILLIUM_5GCN_CNF_REL_ ]]; then
+    if rsh "$ip" test -d "$base/common/tools/install/k8s-v${K8S_VER}"; then
+      echo "$base/common/tools/install/k8s-v${K8S_VER}"; return
+    fi
+    echo "$base"; return
+  fi
   if [[ "$base" =~ /TRILLIUM_5GCN_CNF_REL_[0-9]+\.[0-9]+\.[0-9]+[^/]*/common/tools/install$ ]]; then
     echo "$base/k8s-v${K8S_VER}"; return
   fi
-
-  # 3) If base ends with ".../<num>[/EAx]" use version/tag from path and PROBE remote
   if [[ "$base" =~ /([0-9]+\.[0-9]+\.[0-9]+)(/(EA[0-9]+))?$ ]]; then
-    local num_in_path tag_in_path rel_with rel_without
-    num_in_path="$(printf '%s\n' "$base" | sed -n 's#.*/\([0-9]\+\.[0-9]\+\.[0-9]\+\)\(/\(EA[0-9]\+\)\)\?$#\1#p')"
-    tag_in_path="$(printf '%s\n' "$base" | sed -n 's#.*/[0-9]\+\.[0-9]\+\.[0-9]\+\(/\(EA[0-9]\+\)\)\?$#\2#p' | sed 's#^/##')"
+    local num tag rel_with rel_without probe
+    num="$(printf '%s\n' "$base" | sed -n 's#.*/\([0-9]\+\.[0-9]\+\.[0-9]\+\)\(/\(EA[0-9]\+\)\)\?$#\1#p')"
+    tag="$(printf '%s\n' "$base" | sed -n 's#.*/[0-9]\+\.[0-9]\+\.[0-9]\+\(/\(EA[0-9]\+\)\)\?$#\2#p' | sed 's#^/##')"
+    rel_with="TRILLIUM_5GCN_CNF_REL_${num}${tag:+_${tag}}"
+    rel_without="TRILLIUM_5GCN_CNF_REL_${num}"
+    for rel in "$rel_with" "$rel_without"; do
+      probe="$base/$rel/common/tools/install/k8s-v${K8S_VER}"
+      if rsh "$ip" test -d "$probe"; then echo "$probe"; return; fi
+    done
+  fi
+  echo "$base"
+}
 
-    rel_with="TRILLIUM_5GCN_CNF_REL_${num_in_path}${tag_in_path:+_${tag_in_path}}"
-    rel_without="TRILLIUM_5GCN_CNF_REL_${num_in_path}"
-
-    local cand_with="$base/${rel_with}/common/tools/install/k8s-v${K8S_VER}"
-    local cand_wo="$base/${rel_without}/common/tools/install/k8s-v${K8S_VER}"
-
-    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_with"; then
-      echo "$cand_with"; return
-    elif ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_wo"; then
-      echo "$cand_wo"; return
-    else
-      echo "$cand_wo"; return
+ensure_requirements_or_k8s(){
+  local ip="$1" sp="$2"
+  if remote_has_k8s "$ip"; then
+    log "✅ Kubernetes detected on $ip — proceeding."
+    return 0
+  fi
+  log "ℹ️ Kubernetes not detected — ensuring $sp/requirements.txt via $INSTALL_NAME"
+  rsh "$ip" bash -lc '
+    set -euo pipefail
+    cd "'"$sp"'"
+    if [ -x "./'"$INSTALL_NAME"'" ]; then
+      sed -i "s/\r$//" "./'"$INSTALL_NAME"'" 2>/dev/null || true
+      chmod +x "./'"$INSTALL_NAME"'" || true
+      nohup bash -lc "./'"$INSTALL_NAME"'" >/tmp/_install.out 2>&1 &
+      echo $! >/tmp/_install.pid
     fi
-  fi
-
-  # 4) If base ends right at ".../common/tools/install" without k8s-v
-  if [[ "$base" =~ /common/tools/install$ ]]; then
-    echo "$base/k8s-v${K8S_VER}"; return
-  fi
-
-  # 5) Fallback: use OLD_VERSION to build under base, then probe both TRILLIUM variants
-  local num tag rel_with rel_without parent cand_with cand_wo
-  num="${old_ver%%_*}"
-  tag=""; [[ "$old_ver" == *_* ]] && tag="${old_ver##*_}"
-  rel_with="TRILLIUM_5GCN_CNF_REL_${num}${tag:+_${tag}}"
-  rel_without="TRILLIUM_5GCN_CNF_REL_${num}"
-
-  parent="$base/${num}${tag:+/${tag}}"
-  cand_with="$parent/${rel_with}/common/tools/install/k8s-v${K8S_VER}"
-  cand_wo="$parent/${rel_without}/common/tools/install/k8s-v${K8S_VER}"
-
-  if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_with"; then
-    echo "$cand_with"
-  elif ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" test -d "$cand_wo"; then
-    echo "$cand_wo"
-  else
-    echo "$cand_wo"
-  fi
+  '
+  local waited=0
+  while (( waited < REQ_WAIT_SECS )); do
+    if rsh "$ip" test -f "$sp/requirements.txt"; then
+      log "✅ requirements.txt present"
+      break
+    fi
+    sleep 5; (( waited+=5 ))
+  done
+  rsh "$ip" bash -lc '
+    set -e
+    if [ -s /tmp/_install.pid ] && ps -p "$(cat /tmp/_install.pid 2>/dev/null)" >/dev/null 2>&1; then
+      kill "$(cat /tmp/_install.pid)" 2>/dev/null || true
+      sleep 2
+      ps -p "$(cat /tmp/_install.pid)" >/dev/null 2>&1 && kill -9 "$(cat /tmp/_install.pid)" 2>/dev/null || true
+    fi
+    rm -f /tmp/_install.pid /tmp/_install.out 2>/dev/null || true
+  '
 }
 
-# Robust alias-IP ensure snippet (present → no-op; missing → add)
-read -r -d '' ENSURE_IP_SNIPPET <<'RS' || true
-set -euo pipefail
-IP_CIDR="$1"; FORCE_IFACE="${2-}"
-IP_ONLY="${IP_CIDR%%/*}"
-is_present(){ ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY"; }
-echo "[IP] Ensuring ${IP_CIDR}"
-if is_present; then
-  echo "[IP] Already present: ${IP_ONLY}"
-  exit 0
-fi
-declare -a CAND=()
-[[ -n "$FORCE_IFACE" ]] && CAND+=("$FORCE_IFACE")
-DEF_IF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || true)
-[[ -n "${DEF_IF:-}" ]] && CAND+=("$DEF_IF")
-while IFS= read -r ifc; do CAND+=("$ifc"); done < <(
-  ip -o link | awk -F': ' '{print $2}' \
-    | grep -E '^(en|eth|ens|eno|em|bond|br)[0-9A-Za-z._-]+' \
-    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
-    | sort -u
-)
-for IF in "${CAND[@]}"; do
-  [[ -z "$IF" ]] && continue
-  echo "[IP] Trying ${IP_CIDR} on iface ${IF}..."
-  ip link set dev "$IF" up || true
-  if ip addr replace "$IP_CIDR" dev "$IF" 2>"/tmp/ip_err_${IF}.log"; then
-    ip -4 addr show dev "$IF" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY" && { echo "[IP] OK on ${IF}"; exit 0; }
-  fi
-done
-echo "[IP] ERROR: Could not plumb ${IP_CIDR} (tried: ${CAND[*]})"
-exit 2
-RS
-
-# Read "ip|path" from server_pci_map.txt (supports name:ip:path or ip:path)
-# Read "ip|path" from server_pci_map.txt (supports name:ip:path or ip:path)
-read_server_entries(){
-  awk -F':' 'NF && $1 !~ /^#/ {
-    gsub(/\r/, "", $0);               # strip Windows CRs
-    sub(/[[:space:]]+$/, "", $0);     # strip trailing whitespace
-    if (NF >= 2) {
-      ip   = $2
-      path = (NF >= 3 ? $3 : "")
-      printf "%s|%s\n", ip, path
-    } else {
-      printf "%s|\n", $1
-    }
-  }' "$SERVER_FILE"
-}
-
-
-remote_file_exists(){
-  local ip="$1" p="$2"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$p" <<'EOF'
-set -euo pipefail; p="$1"; [[ -e "$p" ]]
-EOF
-}
-
-remote_cluster_present(){
-  local ip="$1"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail <<'EOF'
-set +e
-if command -v kubectl >/dev/null 2>&1; then
-  kubectl get nodes --no-headers 2>/dev/null | grep -q . && exit 0
-  kubectl get pods  -A --no-headers 2>/dev/null | grep -q . && exit 0
-fi
-exit 1
-EOF
-}
-
-start_installer_bg(){
+swap_reset_and_inventory(){
   local ip="$1" sp="$2"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$INSTALL_NAME" <<'EOF'
-set -euo pipefail
-SP="$1"; NAME="$2"
-cd "$SP"
-if [[ -x "./$NAME" || -f "./$NAME" ]]; then
-  ( setsid bash -c "yes yes | bash ./$NAME" > install.log 2>&1 & echo $! > install.pid )
-  PGID="$(ps -o pgid= -p "$(cat install.pid)" | tr -d ' ')"
-  echo "$PGID" > install.pgid
-  echo "[START] $NAME pid=$(cat install.pid) pgid=$PGID"
-else
-  echo "❌ $NAME not found in $(pwd)"; exit 127
-fi
-EOF
-}
-
-stop_installer_pg(){
-  local ip="$1" sp="$2"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" <<'EOF'
-set +e
-SP="$1"; cd "$SP" 2>/dev/null || exit 0
-echo "[STOP] Pre-kill:"; pgrep -a -f 'install_k8s.sh|ansible-playbook|kubespray' || true
-[[ -f install.pgid ]] && PGID="$(tr -d ' ' < install.pgid 2>/dev/null)" && [[ -n "$PGID" ]] && { kill -TERM -"$PGID" 2>/dev/null; sleep 2; kill -KILL -"$PGID" 2>/dev/null; }
-[[ -f install.pid  ]] && PID="$(tr -d ' ' < install.pid  2>/dev/null)" && [[ -n "$PID"  ]] && { kill -TERM "$PID"    2>/dev/null; sleep 2; kill -KILL "$PID"    2>/dev/null; }
-pkill -f 'install_k8s.sh' 2>/dev/null || true
-pkill -f 'ansible-playbook.*kubespray' 2>/dev/null || true
-rm -f install.pid install.pgid 2>/dev/null || true
-echo "[STOP] Post-kill:"; pgrep -a -f 'install_k8s.sh|ansible-playbook|kubespray' || true
-exit 0
-EOF
-}
-
-push_reset_override(){
-  local ip="$1" sp="$2" swap_id="$3"
-  local remote_tmp="/tmp/ci_reset_${swap_id}.yml"
-  scp $SSH_OPTS -i "$SSH_KEY" "$RESET_YML_WS" "root@$ip:${remote_tmp}"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$KSPRAY_DIR" "$remote_tmp" "$swap_id" <<'EOF'
-set -euo pipefail
-SP="$1"; KS="$2"; TMP="$3"; ID="$4"
-BASE="$SP/$KS"
-TGT=""
-if [[ -f "$BASE/playbooks/reset.yml" || ! -f "$BASE/reset.yml" ]]; then
-  mkdir -p "$BASE/playbooks"; TGT="$BASE/playbooks/reset.yml"
-else
-  TGT="$BASE/reset.yml"
-fi
-BK="/tmp/reset_backup_${ID}.yml"; [[ -f "$TGT" ]] && cp -f "$TGT" "$BK" || : > "$BK"
-mv -f "$TMP" "$TGT"
-CTX="/tmp/reset_swap_ctx_${ID}"; printf "TGT=%s\nBK=%s\n" "$TGT" "$BK" > "$CTX"
-echo "[SWAP] reset.yml -> $TGT (backup $BK)"
-EOF
+  local kdir="$sp/$KSPRAY_DIR"
+  rsh "$ip" bash -lc '
+    set -euo pipefail
+    cd "'"$kdir"'" || exit 0
+    mkdir -p /tmp >/dev/null 2>&1 || true
+    if [ -f playbooks/reset.yml ]; then
+      cp -f playbooks/reset.yml "/tmp/reset_backup_$(date +%s)_$$.yml"
+      echo "[SWAP] reset.yml -> '"$kdir"'/playbooks/reset.yml (backup $(ls -1t /tmp/reset_backup_*_*.yml | head -n1))"
+    fi
+    if [ -f inventory/sample/hosts.yaml ]; then
+      cp -f inventory/sample/hosts.yaml "/tmp/inventory_backup_$(date +%s)_$$.yml"
+      echo "[SWAP] inventory: '"$kdir"'/inventory/sample/hosts.yaml ← '"$sp"'/k8s-yamls/hosts.yaml (backup $(ls -1t /tmp/inventory_backup_*_*.yml | head -n1))"
+    fi
+  '
+  [[ -f "$RESET_YML_WS" ]] && rscp "$ip" "$RESET_YML_WS" "$kdir/playbooks/reset.yml"
+  rsh "$ip" bash -lc '
+    set -e
+    if [ -f "'"$sp"'/k8s-yamls/hosts.yaml" ]; then
+      cp -f "'"$sp"'/k8s-yamls/hosts.yaml" "'"$kdir"'/inventory/sample/hosts.yaml"
+    fi
+  '
 }
 
 restore_reset_override(){
-  local ip="$1" swap_id="$2"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$swap_id" <<'EOF'
-set +e
-ID="$1"; CTX="/tmp/reset_swap_ctx_${ID}"; [[ -f "$CTX" ]] || { echo "[RESTORE] reset: no ctx"; exit 0; }
-. "$CTX"
-mkdir -p "$(dirname "$TGT")"
-if [[ -s "$BK" ]]; then mv -f "$BK" "$TGT"; echo "[RESTORE] reset: restored $TGT"; else rm -f "$TGT"; echo "[RESTORE] reset: removed temp"; fi
-rm -f "$CTX" 2>/dev/null || true
-EOF
+  local ip="$1" sp="$2"
+  rsh "$ip" bash -lc '
+    set -e
+    last="$(ls -1t /tmp/reset_backup_*_*.yml 2>/dev/null | head -n1 || true)"
+    if [ -n "$last" ]; then
+      cp -f "$last" "'"$sp"'/'"$KSPRAY_DIR"'/playbooks/reset.yml"
+      echo "[RESTORE] reset: restored '"$sp"'/'"$KSPRAY_DIR"'/playbooks/reset.yml"
+    else
+      echo "[RESTORE] reset: no ctx"
+    fi
+  '
 }
-
-push_inventory_override(){
-  local ip="$1" sp="$2" swap_id="$3"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$KSPRAY_DIR" "$swap_id" <<'EOF'
-set -euo pipefail
-SP="$1"; KS="$2"; ID="$3"
-INV_SAMPLE="$SP/$KS/inventory/sample/hosts.yaml"
-INV_REAL="$SP/k8s-yamls/hosts.yaml"
-[[ -f "$INV_REAL" ]] || { echo "[ERROR] Missing real inventory $INV_REAL"; exit 2; }
-mkdir -p "$(dirname "$INV_SAMPLE")"
-BK="/tmp/inventory_backup_${ID}.yml"; [[ -f "$INV_SAMPLE" ]] && cp -f "$INV_SAMPLE" "$BK" || : > "$BK"
-cp -f "$INV_REAL" "$INV_SAMPLE"
-CTX="/tmp/inventory_swap_ctx_${ID}"; printf "INV_SAMPLE=%s\nBK=%s\n" "$INV_SAMPLE" "$BK" > "$CTX"
-echo "[SWAP] inventory: $INV_SAMPLE ← $INV_REAL (backup $BK)"
-EOF
-}
-
 restore_inventory_override(){
-  local ip="$1" swap_id="$2"
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$swap_id" <<'EOF'
-set +e
-ID="$1"; CTX="/tmp/inventory_swap_ctx_${ID}"; [[ -f "$CTX" ]] || { echo "[RESTORE] inventory: no ctx"; exit 0; }
-. "$CTX"
-mkdir -p "$(dirname "$INV_SAMPLE")"
-if [[ -s "$BK" ]]; then mv -f "$BK" "$INV_SAMPLE"; echo "[RESTORE] inventory: restored $INV_SAMPLE"; else rm -f "$INV_SAMPLE"; echo "[RESTORE] inventory: removed temp"; fi
-rm -f "$CTX" 2>/dev/null || true
-EOF
+  local ip="$1" sp="$2"
+  rsh "$ip" bash -lc '
+    set -e
+    last="$(ls -1t /tmp/inventory_backup_*_*.yml 2>/dev/null | head -n1 || true)"
+    if [ -n "$last" ]; then
+      cp -f "$last" "'"$sp"'/'"$KSPRAY_DIR"'/inventory/sample/hosts.yaml"
+      echo "[RESTORE] inventory: restored '"$sp"'/'"$KSPRAY_DIR"'/inventory/sample/hosts.yaml"
+    else
+      echo "[RESTORE] inventory: no ctx"
+    fi
+  '
 }
 
 run_uninstall_with_retries(){
@@ -282,59 +186,125 @@ run_uninstall_with_retries(){
   local attempt=1
   while (( attempt <= RETRY_COUNT )); do
     echo "🧹 Running $UNINSTALL_NAME on $ip (attempt $attempt/$RETRY_COUNT)..."
-    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$UNINSTALL_NAME" "${INSTALL_IP_ADDR:-}" "${INSTALL_IP_IFACE:-}" "${IP_MONITOR_INTERVAL:-30}" <<'EOF'
+    if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$sp" "$UNINSTALL_NAME" "${CIDR:-}" "${IP_MONITOR_INTERVAL:-30}" <<'EOF'
 set -euo pipefail
-SP="$1"; NAME="$2"; CIDR="${3:-}"; IFACE_PIN="${4:-}"; INTERVAL="${5:-30}"
+SP="$1"; NAME="$2"; CIDR="${3:-}"; WATCH="${4:-30}"
 cd "$SP"
 
-# normalize & ensure bash for uninstall script
+# normalize uninstall script
 sed -i 's/\r$//' "$NAME" 2>/dev/null || true
 chmod +x "$NAME" || true
 head -n1 "$NAME" | grep -q bash || sed -i '1s|^#!.*|#!/usr/bin/env bash|' "$NAME"
 
-# ---- Inline alias IP watchdog (keeps INSTALL_IP_ADDR present during uninstall) ----
-if [[ -n "${CIDR:-}" ]]; then
-  IP="${CIDR%%/*}"
-  LOG="/var/log/alias_ipmon.log"
+# Put your ip_alias_check.sh onto the node (verbatim), then launch it
+if [ -n "${CIDR:-}" ]; then
+  cat >/tmp/ip_alias_check.sh <<'MON'
+#!/usr/bin/env sh
+# Keep <CIDR> present; auto-pick iface (default-route first, then physical NICs)
+# Usage:
+#   sudo ./ip_alias_auto_watch.sh 10.10.10.20/24
+#   sudo ./ip_alias_auto_watch.sh -w 15 -l /var/log/alias_ipmon.log 10.10.10.20/24
+set -eu
+export PATH="/sbin:/usr/sbin:/bin:/usr/bin:$PATH"
 
-  ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG"; }
-  is_present(){ ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP"; }
-  pick_if(){
-    if [[ -n "$IFACE_PIN" ]]; then echo "$IFACE_PIN"; return; fi
-    local d; d=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
-    [[ -n "$d" ]] && { echo "$d"; return; }
-    ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
-      | grep -E '^(en|eth|ens|eno|em|bond|br)' \
-      | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' | head -n1
-  }
-  ensure_once(){
-    local IF; IF="$(pick_if)"; [[ -n "$IF" ]] || { ipmon_log "no iface"; return 1; }
-    ip link set dev "$IF" up || true
-    if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ipmon_err.log; then
-      sleep 1; is_present && { ipmon_log "ensured $CIDR on $IF"; return 0; }
+# ---- args ----
+WATCH=30
+LOG="/var/log/alias_ipmon.log"
+CIDR="${1:-${INSTALL_IP_ADDR:-}}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -w|--watch) WATCH="${2:-30}"; shift 2 ;;
+    -l|--log) LOG="${2:-/var/log/alias_ipmon.log}"; shift 2 ;;
+    -h|--help) echo "Usage: $0 [-w SECS] [-l LOGFILE] <CIDR>"; exit 0 ;;
+    *) CIDR="$1"; shift ;;
+  esac
+done
+: "${CIDR:?usage: $0 [-w SECS] [-l LOGFILE] <CIDR>  e.g. 10.10.10.20/24}"
+
+# ---- validate CIDR (no regex) ----
+case "$CIDR" in */*) : ;; *) echo "[ipmon] ❌ invalid CIDR (missing /): '$CIDR'"; exit 2 ;; esac
+IP_ONLY="${CIDR%/*}"
+MASK="${CIDR#*/}"
+case "$MASK" in ''|*[!0-9]*) echo "[ipmon] ❌ invalid mask: '$MASK'"; exit 2 ;; esac
+[ "$MASK" -ge 0 ] && [ "$MASK" -le 32 ] || { echo "[ipmon] ❌ mask OOR: $MASK"; exit 2; }
+# octets
+set -- $(printf "%s" "$IP_ONLY" | awk -F. 'NF==4{print $1,$2,$3,$4}')
+[ $# -eq 4 ] || { echo "[ipmon] ❌ invalid IPv4: '$IP_ONLY'"; exit 2; }
+for o in "$1" "$2" "$3" "$4"; do
+  case "$o" in ''|*[!0-9]*) echo "[ipmon] ❌ bad octet: '$o'"; exit 2 ;; esac
+  [ "$o" -ge 0 ] && [ "$o" -le 255 ] || { echo "[ipmon] ❌ octet OOR: '$o'"; exit 2; }
+done
+
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "[ipmon] ❌ missing '$1'"; exit 2; }; }
+need ip
+ts(){ date '+%F %T' 2>/dev/null || echo ""; }
+log(){ printf "[%s] [ipmon] %s\n" "$(ts)" "$*" | tee -a "$LOG" >/dev/null; }
+
+present_any(){ ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY"; }
+present_if(){ ip -4 addr show dev "$1" | awk '/inet /{print $2}' | cut -d/ -f1 | grep -qx "$IP_ONLY"; }
+
+cands(){
+  DEFIF="$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')"
+  PHYS="$(ip -o link 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' \
+    | grep -E '^(en|eth|ens|eno|em|bond|br)' \
+    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)')"
+  C=""; [ -n "${DEFIF:-}" ] && C="$DEFIF"
+  for n in $PHYS; do [ "$n" = "$DEFIF" ] && continue; C="$C $n"; done
+  echo "$C"
+}
+
+ensure_once(){
+  C="$(cands)"; [ -n "$(printf %s "$C" | tr -d ' ')" ] || { log "no iface candidates"; return 1; }
+  for IF in $C; do
+    ip link show "$IF" >/dev/null 2>&1 || continue
+    ip link set dev "$IF" up >/dev/null 2>&1 || true
+    log "…trying $CIDR on $IF"
+    if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ip_alias_err.log; then
+      sleep 1
+      if present_if "$IF"; then log "✅ $CIDR present on $IF"; return 0; fi
     fi
-    ipmon_log "failed to add $CIDR on $IF: $(tr -d \\n </tmp/ipmon_err.log 2>/dev/null || true)"; return 1
-  }
+  done
+  ERR="$(tr -d '\n' </tmp/ip_alias_err.log 2>/dev/null || true)"
+  log "❌ add failed: ${ERR:-unknown}"
+  return 1
+}
 
-  mkdir -p "/var/log" 2>/dev/null || true; : >>"$LOG" || true
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+: >>"$LOG" 2>/dev/null || true
+log "watch start for $CIDR (interval=${WATCH}s)"
 
-  if command -v ip >/dev/null 2>&1; then
-    ( ip monitor address 2>/dev/null | while read -r _; do
-        ! is_present && { ipmon_log "addr change; restoring $CIDR"; ensure_once || true; }
-      done ) & MON_PID=$!
-    trap '[[ -n "${MON_PID:-}" ]] && kill "$MON_PID" 2>/dev/null || true; on_exit_stop_ipmon' EXIT
-  fi
-
-  ( while true; do
-      ! is_present && { ipmon_log "periodic restore; adding $CIDR"; ensure_once || true; }
-      sleep "$INTERVAL"
-    done ) & disown
+if present_any; then
+  log "Already present: $IP_ONLY"
+else
+  ensure_once || true
 fi
-# ---- end watchdog ----
 
-echo "[uninstall] using bash -xeuo pipefail"
+MON_PID=""
+( ip monitor address 2>/dev/null | while read -r _; do
+    if ! present_any; then log "addr change; restoring $CIDR"; ensure_once || true; fi
+  done ) &
+MON_PID=$!
+log "event monitor pid=$MON_PID"
+trap ' [ -n "$MON_PID" ] && kill "$MON_PID" 2>/dev/null || true; log "stopped"; exit 0 ' INT TERM EXIT
+
+case "$WATCH" in ''|*[!0-9]*) WATCH=30 ;; esac
+while :; do
+  if ! present_any; then
+    log "periodic restore; re-adding $CIDR"
+    ensure_once || true
+  fi
+  log "heartbeat (present=$(present_any && echo yes || echo no))"
+  sleep "$WATCH"
+done
+MON
+  chmod +x /tmp/ip_alias_check.sh || true
+  nohup /tmp/ip_alias_check.sh -w "$WATCH" -l /var/log/alias_ipmon.log "$CIDR" >/dev/null 2>&1 &
+  echo $! >/tmp/_ipmon.pid
+  trap ' PID=$(cat /tmp/_ipmon.pid 2>/dev/null || true); [ -n "$PID" ] && kill "$PID" 2>/dev/null || true ' EXIT
+fi
+
+echo "[uninstall] starting"
 bash -xeuo pipefail "$NAME"
-
 EOF
     then
       echo "✅ Uninstall succeeded on $ip"; return 0
@@ -346,288 +316,49 @@ EOF
   echo "❌ Uninstall failed after $RETRY_COUNT attempts on $ip"; return 1
 }
 
-# ===== NEW: IP monitor helpers (start/stop, hardened & logged) =====
-declare -a IP_MON_IDS=()  # "<ip>|<tag>"
+echo "Jenkins reset.yml: ${RESET_YML_WS:-<none>}"
+while IFS= read -r raw || [[ -n "$raw" ]]; do
+  line="$(trim "$raw")"; [[ -z "$line" || "$line" == \#* ]] && continue
+  read -r name ip base mode n3 n6 n4 amf <<<"$(parse_line "$line")"
 
-start_ip_monitor(){
-  local ip="$1" ip_cidr="$2" iface="$3"
-  [[ -z "${ip_cidr:-}" ]] && { echo "[IPMON][$ip] skipped (INSTALL_IP_ADDR empty)"; return 0; }
+  echo; echo "🔧 Server: $ip"
 
-  # stable identifiers
-  local cidr_sanitized="${ip_cidr//\//_}"
-  local tag="ipmon_${ip//./-}_${cidr_sanitized}"
-  local remote="/tmp/${tag}"
-  local sh="${remote}.sh"
-  local pidf="${remote}.pid"
-  local pgf="${remote}.pgid"
-  local log="/var/log/alias_ipmon.log"
-  local interval="${IP_MONITOR_INTERVAL:-30}"
-
-  # launch watcher on node (non-fatal)
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -eo pipefail -s -- \
-      "$ip_cidr" "${iface:-}" "$interval" "$sh" "$pidf" "$pgf" "$log" <<'EOF'
-CIDR="${1:-}"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"
-SH="${4:-/tmp/ipmon.sh}"; PIDF="${5:-/tmp/ipmon.pid}"; PGF="${6:-/tmp/ipmon.pgid}"
-LOG_PATH="${7:-/var/log/alias_ipmon.log}"
-IP="${CIDR%%/*}"
-
-# log file
-if ! { mkdir -p "$(dirname "$LOG_PATH")" 2>/dev/null && : >>"$LOG_PATH"; }; then
-  LOG_PATH="/tmp/alias_ipmon.log"
-  mkdir -p /tmp >/dev/null 2>&1 || true
-  : >>"$LOG_PATH" || true
-fi
-ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG_PATH"; }
-
-# already running?
-if [[ -s "$PIDF" ]] && ps -p "$(cat "$PIDF" 2>/dev/null)" >/dev/null 2>&1; then
-  ipmon_log "already running (PID=$(cat "$PIDF")) logging to $LOG_PATH"
-  exit 0
-fi
-
-cat >"$SH" <<'MON'
-#!/usr/bin/env bash
-set -euo pipefail
-CIDR="$1"; IFACE="${2:-}"; SLEEP_SEC="${3:-30}"; LOG_PATH="$4"
-IP="${CIDR%%/*}"
-ipmon_log(){ printf '[%(%F %T)T] [IPMON] %s\n' -1 "$*" >>"$LOG_PATH"; }
-is_present(){ ip -4 addr show | awk "/inet /{print \$2}" | cut -d/ -f1 | grep -qx "$IP"; }
-pick_if(){
-  [[ -n "$IFACE" ]] && { echo "$IFACE"; return; }
-  local DEFIF; DEFIF=$(ip route 2>/dev/null | awk "/^default/{print \$5; exit}" || true)
-  if [[ -n "$DEFIF" ]]; then echo "$DEFIF"; return; fi
-  ip -o link | awk -F': ' '{print $2}' | sed 's/@.*//' \
-    | grep -E '^(en|eth|ens|eno|em|bond|br)' \
-    | grep -Ev '(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)' \
-    | head -n1
-}
-ensure_once(){
-  local IF; IF="$(pick_if)"; [[ -n "$IF" ]] || { ipmon_log "no iface candidates"; return 1; }
-  ip link show "$IF" >/dev/null 2>&1 || { ipmon_log "iface not found: $IF"; return 1; }
-  ip link set dev "$IF" up >/dev/null 2>&1 || true
-  ipmon_log "…trying $CIDR on $IF"
-  if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ip_alias_err.log; then
-    sleep 1; is_present && { ipmon_log "✅ $CIDR present on $IF"; return 0; }
-  fi
-  ipmon_log "add failed: $(tr -d \\n </tmp/ip_alias_err.log 2>/dev/null || true)"
-  return 1
-}
-
-# initial ensure
-ipmon_log "watch start for $CIDR (interval=${SLEEP_SEC}s)"
-is_present && ipmon_log "Already present: $IP" || ensure_once || true
-
-# event-driven
-( ip monitor address 2>/dev/null | while read -r _; do
-    if ! is_present; then ipmon_log "addr change; restoring $CIDR"; ensure_once || true; fi
-  done ) & MON_PID=$!
-echo "$MON_PID" >"$PGF" || true
-ipmon_log "event monitor pid=$MON_PID"
-
-# periodic
-case "$SLEEP_SEC" in ''|*[!0-9]*) SLEEP_SEC=30 ;; esac
-while :; do
-  if ! is_present; then ipmon_log "periodic restore; re-adding $CIDR"; ensure_once || true; fi
-  ipmon_log "heartbeat (present=$(is_present && echo yes || echo no))"
-  sleep "$SLEEP_SEC"
-done
-MON
-chmod +x "$SH" || true
-
-# run in its own process group so we can kill group later
-setsid nohup "$SH" "$CIDR" "$IFACE" "$SLEEP_SEC" "$LOG_PATH" >/dev/null 2>&1 &
-echo "$!" >"$PIDF" || true
-EOF
-
-  # record mapping locally so we can stop later
-  IP_MON_IDS+=("$ip|$cidr_sanitized")
-}
-
-ensure_once(){
-  local IF
-  IF="$(pick_if)"
-  if [[ -z "$IF" ]]; then ipmon_log "no suitable iface"; return 1; fi
-  ip link set dev "$IF" up || true
-  if ip addr replace "$CIDR" dev "$IF" 2>/tmp/ipmon_err.log; then
-    sleep 1
-    if is_present; then
-      ipmon_log "added $CIDR on $IF"
-      return 0
-    fi
-  fi
-  local ERR="$(tr -d '\n' </tmp/ipmon_err.log 2>/dev/null || true)"
-  ipmon_log "failed to add $CIDR on $IF: ${ERR:-unknown}"
-  return 1
-}
-
-ipmon_log "watchdog start for $CIDR (IFACE=${IFACE:-auto})"
-
-# Ensure once at start
-if ! is_present; then
-  ensure_once || true
-fi
-
-# React to address changes immediately
-if command -v ip >/dev/null 2>&1; then
-  (
-    ip monitor address 2>/dev/null | while read -r _; do
-      if ! is_present; then
-        ipmon_log "detected address change; re-adding $CIDR"
-        ensure_once || true
-      fi
-    done
-  ) &
-fi
-
-# Periodic safety check
-while true; do
-  if ! is_present; then
-    ipmon_log "missing; re-adding $CIDR"
-    ensure_once || true
-  fi
-  sleep "$SLEEP_SEC"
-done
-MON
-chmod +x "$SH"
-
-# Launch detached; persist beyond SSH session; record PID+PGID
-nohup setsid bash -lc "bash '$SH' '$CIDR' '${IFACE:-}' '$SLEEP_SEC' '$LOG_PATH'" >/dev/null 2>&1 &
-echo $! >"$PIDF"
-PGID="$(ps -o pgid= -p "$(cat "$PIDF")" | tr -d ' ')"
-echo "$PGID" >"$PGF"
-ipmon_log "started PID=$(cat "$PIDF") PGID=$PGID → $LOG_PATH"
-EOF
-}
-
-
-stop_ip_monitor(){
-  local ip="$1" cidr_sanitized="$2"
-  local tag="ipmon_${ip//./-}_${cidr_sanitized}"
-  local remote="/tmp/${tag}"
-  local pidf="${remote}.pid"
-  local pgf="${remote}.pgid"
-  local sh="${remote}.sh"
-
-  ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -euo pipefail -s -- "$pidf" "$pgf" "$sh" <<'EOF'
-set +e
-PIDF="${1:?}"; PGF="${2:?}"; SH="${3:?}"
-if [[ -f "$PGF" ]]; then
-  PGID="$(tr -d ' ' < "$PGF" 2>/dev/null)"
-  [[ -n "$PGID" ]] && { kill -TERM "$PGID" 2>/dev/null; kill -KILL "$PGID" 2>/dev/null; }
-fi
-[[ -f "$PIDF" ]] && { kill -TERM "$(cat "$PIDF")" 2>/dev/null; kill -KILL "$(cat "$PIDF")" 2>/dev/null; }
-rm -f "$PGF" "$PIDF" "$SH" 2>/dev/null || true
-echo "[IPMON] stopped"
-EOF
-}
-
-# ===== Ensure swaps are restored & monitors stopped on exit =====
-declare -a SWAP_IDS=()   # "<ip>|<id>"
-on_exit_restore_all(){
-  local item ip id
-  for item in "${SWAP_IDS[@]}"; do
-    ip="${item%%|*}"; id="${item#*|}"
-    restore_reset_override "$ip" "$id" || true
-    restore_inventory_override "$ip" "$id" || true
-  done
-}
-on_exit_stop_ipmon(){
-  local item ip cidr
-  for item in "${IP_MON_IDS[@]:-}"; do
-    ip="${item%%|*}"; cidr="${item#*|}"
-    stop_ip_monitor "$ip" "$cidr" || true
-  done
-}
-trap 'on_exit_restore_all; on_exit_stop_ipmon' EXIT
-
-# ===== Main =====
-log "Jenkins reset.yml: $RESET_YML_WS"
-
-any_failed=0
-while IFS= read -r entry; do
-  [[ -n "${entry// }" ]] || continue
-  ip="${entry%%|*}"
-  pth="${entry#*|}"
-
-  echo ""
-  echo "🔧 Server: $ip"
-
-  # Ensure alias IP (only if configured)
+  # Ensure alias IP once (best-effort) before uninstall begins
   if [[ -n "${INSTALL_IP_ADDR:-}" ]]; then
-    ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" bash -s -- "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE" <<<"$ENSURE_IP_SNIPPET" || true
-    # ---- NEW: start a watchdog that re-adds the IP if removed ----
-    start_ip_monitor "$ip" "$INSTALL_IP_ADDR" "$INSTALL_IP_IFACE"
-  else
-    echo "[IP] Skipping ensure; INSTALL_IP_ADDR is empty"
-  fi
-
-  if [[ -z "$pth" || "$pth" == "$ip" ]]; then
-    echo "❌ No OLD_BUILD_PATH specified for $ip in $SERVER_FILE (UI param ignored by design). Skipping."
-    any_failed=1
-    continue
-  fi
-
-  server_path="$(normalize_k8s_path "$pth" "$OLD_VERSION")"
-  echo "📁 Using (normalized): $server_path"
-
-  # 1) Pre-check: Kubernetes present?
-  if remote_cluster_present "$ip"; then
-    echo "✅ Kubernetes detected on $ip — proceeding."
-  else
-    echo "ℹ️  No Kubernetes detected on $ip — skipping this server."
-    continue
-  fi
-
-  req="$server_path/$KSPRAY_DIR/requirements.txt"
-
-  # 2) Ensure requirements.txt; if missing, start installer briefly to generate it
-  if remote_file_exists "$ip" "$req"; then
-    echo "✅ requirements.txt present"
-  else
-    echo "⏳ requirements.txt not found → starting $INSTALL_NAME in background to generate it"
-    start_installer_bg "$ip" "$server_path"
-
-    detected=0; loops=$(( REQ_WAIT_SECS / 2 ))
-    for _ in $(seq 1 "$loops"); do
-      if remote_file_exists "$ip" "$req"; then
-        echo "📄 $req detected → stopping installer"
-        stop_installer_pg "$ip" "$server_path"
-        detected=1; break
+    echo "[IP] Ensuring ${INSTALL_IP_ADDR}"
+    rsh "$ip" bash -lc '
+      set -euo pipefail
+      CIDR="'"${INSTALL_IP_ADDR}"'"; IP="${CIDR%%/*}"
+      if ip -4 addr show | awk "/inet /{print \$2}" | cut -d/ -f1 | grep -qx "$IP"; then
+        echo "[IP] Already present: $IP"
+      else
+        DEFIF=$(ip route | awk "/^default/{print \$5; exit}" || true)
+        IF=${DEFIF:-$(ip -o link | awk -F": " "{print \$2}" | sed "s/@.*//" | grep -E "^(en|eth|ens|eno|em|bond|br)" | grep -Ev "(^lo$|docker|podman|cni|flannel|cilium|calico|weave|veth|tun|tap|virbr|wg)" | head -n1)}
+        [ -n "$IF" ] || { echo "[IP] ❌ no suitable iface"; exit 1; }
+        ip addr replace "$CIDR" dev "$IF"
+        echo "[IP] Added $CIDR on $IF"
       fi
-      sleep 2
-    done
-
-    if [[ "$detected" -eq 0 ]]; then
-      echo "❌ Timed out waiting for $req on $ip"
-      stop_installer_pg "$ip" "$server_path"
-      any_failed=1
-      continue
-    fi
+    '
   fi
 
-  # 3) Swap Jenkins reset.yml + inventory; run uninstall; restore
-  swap_id="$(date +%s)_$$_$RANDOM"; SWAP_IDS+=("$ip|$swap_id")
-  push_reset_override      "$ip" "$server_path" "$swap_id"
-  push_inventory_override  "$ip" "$server_path" "$swap_id"
+  # Locate old build path on remote
+  sp="$(remote_find_old_sp "$ip" "$base")"
+  echo "📁 Using (normalized): $sp"
 
-  if ! run_uninstall_with_retries "$ip" "$server_path"; then
-    any_failed=1
+  # Ensure requirements/k8s presence (non-fatal if timeout)
+  ensure_requirements_or_k8s "$ip" "$sp" || true
+
+  # Swap reset.yml + inventory
+  swap_reset_and_inventory "$ip" "$sp"
+
+  # Uninstall with retries (with your ip_alias_check.sh watchdog running remotely)
+  if ! run_uninstall_with_retries "$ip" "$sp"; then
+    echo "❌ Uninstall failed after ${RETRY_COUNT} attempts on $ip"
   fi
 
-  restore_reset_override     "$ip" "$swap_id"
-  restore_inventory_override "$ip" "$swap_id"
+  # Restore backups
+  restore_reset_override "$ip" "$sp" || true
+  restore_inventory_override "$ip" "$sp" || true
+done < "$SERVER_FILE"
 
-  # ---- NEW: stop the per-host IP monitor now that this host's reset flow is done ----
-  for _it in "${IP_MON_IDS[@]}"; do
-    [[ "${_it%%|*}" == "$ip" ]] || continue
-    stop_ip_monitor "$ip" "${_it#*|}" || true
-  done
-
-done < <(read_server_entries)
-
-echo ""
-if [[ $any_failed -ne 0 ]]; then
-  echo "❌ One or more servers failed."
-  exit 1
-fi
-echo "🎉 Completed all servers successfully."
+echo; echo "✅ Cluster reset step finished."
