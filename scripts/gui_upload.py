@@ -2,7 +2,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import time, os
+import time, os, tempfile
 
 # EMS credentials and config path
 url = "https://172.27.28.165.nip.io/ems/login"
@@ -17,9 +17,12 @@ suffix_tab_map = {
     "_upf": "UPF"
 }
 
+# Create a temporary user data directory for Chrome
+user_data_dir = tempfile.mkdtemp()
+
 # Start browser (headless disabled for debugging)
 options = webdriver.ChromeOptions()
-# options.add_argument("--headless")  # Commented out for visible browser
+options.add_argument(f"--user-data-dir={user_data_dir}")
 driver = webdriver.Chrome(options=options)
 
 # Open EMS login page
