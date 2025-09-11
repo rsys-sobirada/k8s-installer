@@ -23,6 +23,10 @@ user_data_dir = tempfile.mkdtemp()
 # Start browser (headless disabled for debugging)
 options = webdriver.ChromeOptions()
 options.add_argument(f"--user-data-dir={user_data_dir}")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+# options.add_argument("--headless")  # Uncomment for headless mode in production
+
 driver = webdriver.Chrome(options=options)
 
 # Open EMS login page
