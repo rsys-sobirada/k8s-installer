@@ -17,16 +17,20 @@ suffix_tab_map = {
     "_upf": "UPF"
 }
 
-# Start browser
+# Start browser (headless disabled for debugging)
 options = webdriver.ChromeOptions()
-options.add_argument("--headless")  # Remove this line to see browser
+# options.add_argument("--headless")  # Commented out for visible browser
 driver = webdriver.Chrome(options=options)
 
-# Login
+# Open EMS login page
 driver.get(url)
+time.sleep(2)
 
-# Wait for login fields
-WebDriverWait(driver, 10).until(
+# Save screenshot for debugging
+driver.save_screenshot("login_page_debug.png")
+
+# Wait for login form to appear
+WebDriverWait(driver, 15).until(
     EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Enter your username']"))
 )
 
@@ -43,7 +47,7 @@ for file in os.listdir(config_dir):
             print(f"Uploading {file} to {tab_name} tab")
 
             # Click on tab
-            WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 15).until(
                 EC.element_to_be_clickable((By.LINK_TEXT, tab_name))
             ).click()
             time.sleep(2)
