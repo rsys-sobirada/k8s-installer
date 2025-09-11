@@ -20,26 +20,57 @@ suffix_tab_map = {
 
 # Setup Firefox options for Jenkins
 options = Options()
-options.add_argument("--headless")  # Required for Jenkins
+options.add_argument("--headless")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 
 # Start Firefox WebDriver
 driver = webdriver.Firefox(options=options)
 
-# Open EMS login page
+# Utility Functions
+def click_nf_tab(driver, nf_name):
+    driver.save_screenshot(f"{nf_name.lower()}_tab_debug.png")
+    xpath = f"//div[contains(text(), '{nf_name}') or contains(text(), '{nf_name.lower()}')]"
+    WebDriverWait(driver, 15).until(
+        EC.element_to_be_clickable((By.XPATH, xpath))
+    ).click()
+
+def click_add_button(driver, nf_name):
+    xpath = f"//div[contains(text(), 'Add') and contains(text(), '{nf_name.lower()}')]"
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, xpath))
+    ).click()
+
+def upload_config_file(driver, file_path):
+    file_input = WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
+    )
+    file_input.send_keys(file_path)
+
+def click_import(driver):
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Import')]"))
+    ).click()
+
+def click_apply(driver):
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Apply')]"))
+    ).click()
+
+def confirm_popup(driver):
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'OK')]"))
+    ).click()
+
+# Start automation
 driver.get(url)
 time.sleep(2)
-
-# Save screenshot for debugging
 driver.save_screenshot("login_page_debug.png")
 
-# Wait for login form to appear
+# Login
 WebDriverWait(driver, 15).until(
     EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Enter your username']"))
 )
-
-# Fill login form
 driver.find_element(By.XPATH, "//input[@placeholder='Enter your username']").send_keys(username)
 driver.find_element(By.XPATH, "//input[@placeholder='Enter your password']").send_keys(password)
 driver.find_element(By.XPATH, "//button[contains(text(),'Login')]").click()
@@ -47,46 +78,16 @@ time.sleep(3)
 
 # Loop through config files
 for file in os.listdir(config_dir):
-    for suffix, tab_name in suffix_tab_map.items():
+    for suffix, nf_name in suffix_tab_map.items():
         if file.endswith(suffix + ".json"):
-            print(f"Uploading {file} to {tab_name} tab")
-
-            # Click on tab
-            WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.LINK_TEXT, tab_name))
-            ).click()
-            time.sleep(2)
-
-            # Click on "Add" button (assumed ID format)
-            WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.ID, f"add-{tab_name.lower()}"))
-            ).click()
-            time.sleep(1)
-
-            # Choose file
-            file_input = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.ID, "choose-file"))
-            )
+            print(f"Uploading {file} to {nf_name} tab")
             file_path = os.path.abspath(os.path.join(config_dir, file))
-            file_input.send_keys(file_path)
-            time.sleep(1)
 
-            # Click Import
-            WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.ID, "import-button"))
-            ).click()
-            time.sleep(1)
-
-            # Click Apply
-            WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.ID, "apply-button"))
-            ).click()
-            time.sleep(1)
-
-            # Confirm pop-up
-            WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.ID, "popup-ok"))
-            ).click()
-            time.sleep(1)
+            click_nf_tab(driver, nf_name)
+            click_add_button(driver, nf_name)
+            upload_config_file(driver, file_path)
+            click_import(driver)
+            click_apply(driver)
+            confirm_popup(driver)
 
 driver.quit()
