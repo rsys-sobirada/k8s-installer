@@ -435,6 +435,14 @@ def click_apply(driver):
             driver.execute_script("arguments[0].click();", btn)
         time.sleep(0.6)
         print("Clicked Apply")
+        # Handle confirmation alert
+        try:
+            alert = driver.switch_to.alert
+            print("Alert text:", alert.text)
+            alert.accept()
+            print("Alert accepted")
+        except NoAlertPresentException:
+            print("No alert present after Apply")
     except Exception as e:
         _save_page_source("apply_button_error")
         print("Error clicking Apply:", e)
