@@ -1,44 +1,96 @@
-import os
-import re
-import asyncio
-from playwright.async_api import async_playwright
+from selenium import webdriver
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time, os
 
-async def automate_amf_upload():
-    config_dir = "config_files"
-    url = "https://172.27.28.193.nip.io/ems/login"
-    username = "root"
-    password = "root123"
+# EMS credentials and config path
+url = "https://172.27.28.193.nip.io/ems/login"
+username = "root"
+password = "root123"
+config_dir = "config_files"
 
-    amf_file = None
-    for file in os.listdir(config_dir):
-        if re.search(r"(amf-function-.*_amf\\.json|.*_amf\\.json|amf\\.json)$", file):
-            amf_file = os.path.abspath(os.path.join(config_dir, file))
-            break
+# Mapping suffix to tab name
+suffix_tab_map = {
+    "_amf": "AMF",
+    "_smf": "SMF",
+    "_upf": "UPF"
+}
 
-    if not amf_file:
-        raise FileNotFoundError("No AMF config file found in config_files directory.")
+# Setup Firefox options for Jenkins
+options = Options()
+options.add_argument("--headless")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
+# Start Firefox WebDriver
+driver = webdriver.Firefox(options=options)
 
-        await page.goto(url)
-        await page.fill("input[placeholder='Enter your username']", username)
-        await page.fill("input[placeholder='Enter your password']", password)
-        await page.click("button:has-text('Login')")
-        await page.wait_for_timeout(3000)
+# Utility Functions
+def click_nf_tab(driver, nf_name):
+    driver.save_screenshot(f"{nf_name.lower()}_tab_debug.png")
+    xpath = f"//div[contains(text(), '{nf_name}') or contains(text(), '{nf_name.lower()}')]"
+    WebDriverWait(driver, 15).until(
+        EC.element_to_be_clickable((By.XPATH, xpath))
+    ).click()
 
-        await page.click("text=Configure")
-        await page.click("text=AMF")
-        await page.click("text=Add")
-        await page.click("text=amf")
-        await page.set_input_files("input[type='file']", amf_file)
-        await page.click("button:has-text('Import')")
-        await page.click("button:has-text('Apply')")
-        await page.click("button:has-text('OK')")
+def click_add_button(driver, nf_name):
+    xpath = f"//div[contains(text(), 'Add') and contains(text(), '{nf_name.lower()}')]"
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, xpath))
+    ).click()
 
-        await browser.close()
+def upload_config_file(driver, file_path):
+    file_input = WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
+    )
+    file_input.send_keys(file_path)
 
-if __name__ == "__main__":
-    asyncio.run(automate_amf_upload())
+def click_import(driver):
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Import')]"))
+    ).click()
+
+def click_apply(driver):
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Apply')]"))
+    ).click()
+
+def confirm_popup(driver):
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'OK')]"))
+    ).click()
+
+# Start automation
+driver.get(url)
+time.sleep(2)
+driver.save_screenshot("login_page_debug.png")
+
+# Login
+WebDriverWait(driver, 15).until(
+    EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Enter your username']"))
+)
+driver.find_element(By.XPATH, "//input[@placeholder='Enter your username']").send_keys(username)
+driver.find_element(By.XPATH, "//input[@placeholder='Enter your password']").send_keys(password)
+driver.find_element(By.XPATH, "//button[contains(text(),'Login')]").click()
+time.sleep(3)
+
+# Loop through config files with logging
+print("Scanning config_files directory...")
+for file in os.listdir(config_dir):
+    print(f"Checking file: {file}")
+    for suffix, nf_name in suffix_tab_map.items():
+        expected_suffix = suffix + ".json"
+        if file.endswith(expected_suffix):
+            print(f"Matched file '{file}' with suffix '{suffix}' → NF tab: {nf_name}")
+            file_path = os.path.abspath(os.path.join(config_dir, file))
+
+            click_nf_tab(driver, nf_name)
+            click_add_button(driver, nf_name)
+            upload_config_file(driver, file_path)
+            click_import(driver)
+            click_apply(driver)
+            confirm_popup(driver)
+
+driver.quit()
