@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        EMS_URL = "https://172.27.28.165.nip.io/ems/login"
+        EMS_URL = "https://172.27.28.193.nip.io/ems/login"
         EMS_USER = "root"
         EMS_PASS = "root123"
         CONFIG_ZIP = "/var/lib/jenkins/downloads/merged_config.zip"
