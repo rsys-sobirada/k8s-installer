@@ -424,21 +424,57 @@ def click_import(driver):
         driver.save_screenshot(f"debug_screenshots/{int(time.time())}_error_persist_config.png")
         raise
 
+
 def click_apply(driver):
+    try:
+        # Handle alert before locating the button
+        try:
+            alert = driver.switch_to.alert
+            print("Pre-Apply Alert text:", alert.text)
+            alert.accept()
+            print("Pre-Apply Alert accepted")
+            time.sleep(0.5)
+        except NoAlertPresentException:
+            pass
+
         try:
             btn = WebDriverWait(driver, 12).until(
                 EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
             )
+        except UnexpectedAlertPresentException:
             try:
-                btn.click()
-            except Exception:
-                driver.execute_script("arguments[0].click();", btn)
-            time.sleep(0.6)
-            print("Clicked Apply")
-        except Exception as e:
-            _save_page_source("apply_button_error")
-            print("Error clicking Apply:", e)
-            raise
+                alert = driver.switch_to.alert
+                print("Alert during Apply button wait:", alert.text)
+                alert.accept()
+                print("Alert accepted during Apply button wait")
+                time.sleep(0.5)
+                btn = WebDriverWait(driver, 12).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
+                )
+            except Exception as e:
+                print("Failed to handle alert during Apply button wait:", e)
+                raise
+
+        try:
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
+        time.sleep(0.6)
+        print("Clicked Apply")
+
+        # Handle alert after clicking Apply
+        try:
+            alert = driver.switch_to.alert
+            print("Post-Apply Alert text:", alert.text)
+            alert.accept()
+            print("Post-Apply Alert accepted")
+        except NoAlertPresentException:
+            print("No alert present after Apply")
+
+    except Exception as e:
+        _save_page_source("apply_button_error")
+        print("Error clicking Apply:", e)
+        raise
 
 def confirm_popup(driver):
     try:
