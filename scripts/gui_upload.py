@@ -1,5 +1,5 @@
 from selenium import webdriver
-from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -11,17 +11,19 @@ username = "root"
 password = "root123"
 config_dir = "config_files"
 
-# Setup Firefox options for Jenkins
+# Setup Chrome options for Jenkins
 options = Options()
-options.add_argument("--headless")
+options.add_argument("--headless=new")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 
-driver = webdriver.Firefox(options=options)
+# Start Chrome WebDriver
+driver = webdriver.Chrome(options=options)
 
 # Utility Functions
 def click_element_by_text(text, timeout=15):
     xpath = f"//div[contains(text(), '{text}')]"
+    driver.save_screenshot("before_click_configure.png")
     WebDriverWait(driver, timeout).until(
         EC.element_to_be_clickable((By.XPATH, xpath))
     ).click()
@@ -52,7 +54,7 @@ driver.find_element(By.XPATH, "//button[contains(text(),'Login')]").click()
 time.sleep(3)
 
 # Click through GUI tabs
-click_element_by_text("Persist Configurations")
+click_element_by_text("Configure")
 click_element_by_text("AMF")
 click_element_by_text("Add")
 click_element_by_text("amf")
