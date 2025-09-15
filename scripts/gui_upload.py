@@ -12,7 +12,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time, os, traceback
-from selenium.common.exceptions import UnexpectedAlertPresentException
 
 # -------- Config ----------
 url = "https://172.27.28.193.nip.io/ems/login"
@@ -442,6 +441,7 @@ def click_apply(driver):
         raise
 
 def confirm_popup(driver):
+        verify_amf_config_applied(driver)
     try:
         btn = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'ok') or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'yes')]"))
@@ -454,6 +454,26 @@ def confirm_popup(driver):
         print("Confirmed popup")
     except Exception:
         print("No confirmation popup found (or click failed)")
+
+
+def verify_amf_config_applied(driver):
+    try:
+        print("Verifying if AMF configuration was successfully applied...")
+        success_indicators = [
+            "//div[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'success')]",
+            "//span[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'configuration applied')]",
+            "//div[contains(@class, 'toast') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'applied')]"
+        ]
+        for xp in success_indicators:
+            try:
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, xp)))
+                print("✅ AMF configuration applied successfully.")
+                return
+            except Exception:
+                continue
+        print("⚠️ Could not verify success message. Please check UI manually.")
+    except Exception as e:
+        print("Error during verification:", e)
 
 # -------- Main flow ----------
 try:
