@@ -1,28 +1,55 @@
 pipeline {
     agent any
 
+    environment {
+        VENV_PATH = "./venv"
+        PYTHON_BIN = "${VENV_PATH}/bin/python"
+        PIP_BIN = "${VENV_PATH}/bin/pip"
+    }
+
     stages {
+        stage('Unzip Config Files') {
+            steps {
+                sh '''
+                    rm -rf config_files
+                    mkdir config_files
+                    unzip -o /var/lib/jenkins/downloads/merged_config.zip -d config_files
+                '''
+            }
+        }
+
         stage('Setup Python Environment') {
             steps {
                 sh '''
-                    if [ ! -f "./venv/bin/python" ]; then
-                        python3 -m venv venv
+                    if [ ! -f "${PYTHON_BIN}" ]; then
+                        python3 -m venv ${VENV_PATH}
                     fi
 
-                    ./venv/bin/pip install --upgrade pip
+                    ${PIP_BIN} install --upgrade pip
 
-                    if ! ./venv/bin/python -c "import playwright" 2>/dev/null; then
-                        ./venv/bin/pip install playwright
-                        ./venv/bin/python -m playwright install chromium
+                    if ! ${PYTHON_BIN} -c "import playwright" 2>/dev/null; then
+                        ${PIP_BIN} install playwright
+                        ${PYTHON_BIN} -m playwright install chromium
                     fi
+                '''
+            }
+        }
+
+        stage('Debug Config Files') {
+            steps {
+                sh '''
+                    echo "Current directory: $(pwd)"
+                    echo "Contents of config_files:"
+                    ls -l config_files || echo "config_files directory not found"
                 '''
             }
         }
 
         stage('Run GUI Automation') {
             steps {
-                sh './venv/bin/python scripts/gui_upload.py'
+                sh '${PYTHON_BIN} scripts/gui_upload.py'
             }
         }
     }
 }
+
