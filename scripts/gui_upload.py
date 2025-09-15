@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # scripts/gui_upload.py
-# AMF-only GUI upload automation (robust)
+# AMF-only upload automation: Configure -> AMF -> amf entry -> upload JSON
 #
-# Usage: CONFIG_DIR=/absolute/or/relative/path ./venv/bin/python scripts/gui_upload.py
-# If CONFIG_DIR not set, defaults to "config_files" relative to current working directory.
+# Usage:
+#   CONFIG_DIR=/path/to/configs ./venv/bin/python scripts/gui_upload.py
+# Defaults to ./config_files if CONFIG_DIR not set.
 
 from selenium import webdriver
 from selenium.webdriver.firefox.options import Options
@@ -12,22 +13,19 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time, os, traceback
 
-# -------- Configurable variables --------
+# -------- Config ----------
 url = "https://172.27.28.193.nip.io/ems/login"
 username = "root"
 password = "root123"
 
-# read config dir from env or fallback to relative path
 config_dir = os.environ.get("CONFIG_DIR", "config_files")
-
-# debug artifacts
 debug_dir = "debug_screenshots"
 os.makedirs(debug_dir, exist_ok=True)
 
-# Only AMF mapping (AMF-only run)
+# Only AMF for this run
 suffix_tab_map = {"_amf": "AMF"}
 
-# -------- WebDriver setup --------
+# -------- WebDriver setup ----------
 options = Options()
 options.add_argument("--headless")
 options.add_argument("--no-sandbox")
@@ -36,9 +34,8 @@ options.accept_insecure_certs = True
 
 driver = webdriver.Firefox(options=options)
 
-# -------- Helpers for debugging --------
+# -------- Debug helpers ----------
 def save_debug(name):
-    """Save screenshot into debug_dir with a timestamped filename."""
     path = os.path.join(debug_dir, f"{int(time.time())}_{name}.png")
     try:
         driver.save_screenshot(path)
@@ -47,7 +44,6 @@ def save_debug(name):
         print(f"Failed to save screenshot {path}: {e}")
 
 def _save_page_source(name):
-    """Save current page_source to an HTML file for inspection."""
     path = os.path.join(debug_dir, f"{int(time.time())}_{name}.html")
     try:
         with open(path, "w", encoding="utf-8") as fh:
@@ -56,16 +52,11 @@ def _save_page_source(name):
     except Exception as e:
         print(f"Failed to save page source {path}: {e}")
 
-# -------- Robust element lookup (text/attributes/iframes) --------
+# -------- Robust finder (text/attributes/iframes) ----------
 def find_element_by_text_any(tag_text, timeout=6):
     """
-    Robust search for an element containing tag_text (case-insensitive).
-    Strategies:
-      1) case-insensitive XPath on text()
-      2) iterate visible elements and match .text
-      3) check common attributes (title, aria-label, data-*, alt, id, class, name)
-      4) scan inside iframes
-    Returns a WebElement if found, otherwise raises Exception and saves page source.
+    Find an element containing tag_text (case-insensitive) using several strategies.
+    Raises Exception if not found and saves page source for debugging.
     """
     lower_text = tag_text.lower()
     xpaths = [
@@ -73,7 +64,7 @@ def find_element_by_text_any(tag_text, timeout=6):
         f"//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{lower_text}')]",
     ]
 
-    # 1) try XPath quickly
+    # 1) try quick XPath attempts
     for xp in xpaths:
         try:
             elem = WebDriverWait(driver, timeout).until(
@@ -83,7 +74,7 @@ def find_element_by_text_any(tag_text, timeout=6):
         except Exception:
             pass
 
-    # 2) scan many elements and check .text
+    # 2) scan visible elements by tag names
     candidate_tags = ["a", "button", "div", "span", "li", "label", "td", "th", "*"]
     try:
         for tag in candidate_tags:
@@ -102,7 +93,7 @@ def find_element_by_text_any(tag_text, timeout=6):
     except Exception:
         pass
 
-    # 3) check attributes on all elements
+    # 3) scan attributes
     attrs = ["title", "aria-label", "data-testid", "data-test", "alt", "role", "placeholder", "id", "class", "name"]
     try:
         els = driver.find_elements(By.XPATH, "//*")
@@ -125,11 +116,10 @@ def find_element_by_text_any(tag_text, timeout=6):
     try:
         iframes = driver.find_elements(By.TAG_NAME, "iframe")
         if iframes:
-            print(f"Found {len(iframes)} iframe(s); scanning inside them for '{tag_text}'")
+            print(f"Found {len(iframes)} iframe(s); scanning them for '{tag_text}'")
         for idx, fr in enumerate(iframes):
             try:
                 driver.switch_to.frame(fr)
-                # quick xpath inside frame
                 for xp in xpaths:
                     try:
                         elem = WebDriverWait(driver, 1).until(
@@ -139,7 +129,6 @@ def find_element_by_text_any(tag_text, timeout=6):
                         return elem
                     except Exception:
                         pass
-                # attribute scan inside frame
                 inner_els = driver.find_elements(By.XPATH, "//*")
                 for e in inner_els:
                     try:
@@ -161,31 +150,22 @@ def find_element_by_text_any(tag_text, timeout=6):
     except Exception:
         pass
 
-    # not found: save page source for debugging and raise
+    # not found: save page source and raise
     _save_page_source(f"no_elem_{tag_text}")
     raise Exception(f"Element containing text '{tag_text}' not found using candidate strategies.")
 
-# -------- Click helpers --------
+# -------- Click helpers ----------
 def click_element_via_js(elem):
-    """Scroll element into view and click via JS for headless reliability."""
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", elem)
-        driver.execute_script("arguments[0].click();", elem)
-    except Exception as e:
-        raise
+    driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", elem)
+    driver.execute_script("arguments[0].click();", elem)
 
 def open_configure_menu():
-    """
-    Click the 'Configure' entry in the left sidebar so NF icons become visible.
-    Tries several strategies (text, aria-label, title, known sidebar container).
-    """
+    """Click 'Configure' in the left sidebar so NF icons/list appear."""
     print("Attempting to open 'Configure' menu...")
-    # Common XPaths to find sidebar Configure entry (case-insensitive)
     candidate_xps = [
         "//nav//a//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'configure')]",
         "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'configure')]",
         "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'configure')]",
-        # try elements with aria-label/title containing 'Configure'
         "//*[@aria-label and contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'configure')]",
         "//*[@title and contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'configure')]",
     ]
@@ -202,7 +182,7 @@ def open_configure_menu():
         except Exception:
             continue
 
-    # fallback: search by visible text
+    # fallback: find by visible text
     try:
         el = find_element_by_text_any("Configure", timeout=3)
         try:
@@ -218,96 +198,216 @@ def open_configure_menu():
         raise
 
 def click_nf_tab(driver, nf_name):
-    """
-    Open Configure first (if needed) then find and click the NF icon/tab (AMF/SMF/UPF).
-    """
+    """Open Configure and click the NF tab (AMF/SMF/UPF)."""
     try:
-        # Ensure Configure is open so NF icons are present
         try:
             open_configure_menu()
         except Exception:
-            # If configure cannot be opened, continue to attempt to find NF (may already be visible)
-            print("Proceeding to find NF tab even though Configure couldn’t be opened (maybe already visible).")
+            print("Configure open failed; continuing (maybe already open).")
 
         print(f"Looking for NF tab '{nf_name}'")
         elem = find_element_by_text_any(nf_name, timeout=6)
-
-        # scroll and try to click
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
             time.sleep(0.4)
         except Exception:
             pass
-
         try:
             elem.click()
             time.sleep(0.6)
         except Exception:
-            # JS fallback
-            try:
-                driver.execute_script("arguments[0].click();", elem)
-                time.sleep(0.6)
-            except Exception as e2:
-                print(f"Both normal click and JS click failed for '{nf_name}': {e2}")
-                _save_page_source(f"click_failed_{nf_name}")
-                raise
+            driver.execute_script("arguments[0].click();", elem)
+            time.sleep(0.6)
         print(f"Clicked NF tab '{nf_name}'")
     except Exception as e:
         _save_page_source(f"click_lookup_failed_{nf_name}")
         print(f"Error clicking NF tab '{nf_name}': {e}")
         raise
 
-def click_add_button(driver, nf_name):
-    """
-    Click an 'Add' button associated with the NF. Tries button text 'Add' first.
-    """
+def click_nf_entry(driver, entry_text):
+    """Click the NF list item inside the NF panel (e.g., 'amf')."""
     try:
-        candidate_xps = [
-            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add')]",
-            "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add')]"
-        ]
-        for xp in candidate_xps:
-            try:
-                btn = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.XPATH, xp)))
-                try:
-                    btn.click()
-                except Exception:
-                    driver.execute_script("arguments[0].click();", btn)
-                time.sleep(0.6)
-                print("Clicked Add button via XPath:", xp)
-                return
-            except Exception:
-                continue
-
-        # last resort: find elements with '+' icon or role='button' near nf area
-        raise Exception("Add button not found by candidate XPaths.")
-    except Exception as e:
-        _save_page_source("add_button_not_found")
-        print(f"Error clicking Add button for '{nf_name}': {e}")
-        raise
-
-def upload_config_file(driver, file_path):
-    """
-    Locate file input and send the file path.
-    Makes hidden input visible if needed.
-    """
-    try:
-        file_input = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, "//input[@type='file' or contains(@type,'file')]"))
-        )
-        # Unhide if hidden
+        print(f"Looking for NF entry '{entry_text}' (inside NF panel)...")
+        elem = find_element_by_text_any(entry_text, timeout=8)
         try:
-            driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible';", file_input)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+            time.sleep(0.3)
         except Exception:
             pass
-        file_input.send_keys(file_path)
-        time.sleep(0.6)
-        print(f"Provided file path to upload input: {file_path}")
+        try:
+            elem.click()
+            time.sleep(0.6)
+        except Exception:
+            driver.execute_script("arguments[0].click();", elem)
+            time.sleep(0.6)
+        print(f"Clicked NF entry '{entry_text}'")
     except Exception as e:
-        _save_page_source("file_input_error")
-        print(f"Error uploading file '{file_path}': {e}")
+        _save_page_source(f"nf_entry_not_found_{entry_text}")
+        print(f"Error clicking NF entry '{entry_text}': {e}")
         raise
 
+def click_add_button(driver):
+    """Click a generic 'Add' button (keeps for safety though not needed in amf path)."""
+    try:
+        xp = "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add')]"
+        btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.XPATH, xp)))
+        try:
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
+        time.sleep(0.6)
+        print("Clicked Add button")
+    except Exception as e:
+        _save_page_source("add_button_not_found")
+        print("Add button not found:", e)
+        raise
+
+# -------- Robust upload function ----------
+def upload_config_file(driver, file_path):
+    """
+    Robust upload:
+      - waits for input[type=file] with extended timeout
+      - tries multiple selectors
+      - clicks 'Choose/Browse' triggers and searches in iframes
+      - unhides input if necessary
+      - injects a temporary input as last resort
+    """
+    print(f"Attempting to upload file: {file_path}")
+    selectors = [
+        "//input[@type='file']",
+        "//input[contains(@class,'file') and @type='file']",
+        "//input[contains(@id,'file') and @type='file']",
+        "//input[contains(@name,'file') and @type='file']",
+        "//input[contains(@data-test,'file') and @type='file']",
+    ]
+
+    # give UI some time to render
+    time.sleep(0.6)
+
+    # 1) try with a larger wait (race conditions)
+    for sel in selectors:
+        try:
+            file_input = WebDriverWait(driver, 12).until(
+                EC.presence_of_element_located((By.XPATH, sel))
+            )
+            print(f"Found file input by xpath: {sel}")
+            try:
+                driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible'; arguments[0].style.height='1px';", file_input)
+            except Exception:
+                pass
+            file_input.send_keys(file_path)
+            print("Sent file path to input (xpath path)")
+            time.sleep(0.5)
+            return
+        except Exception:
+            continue
+
+    # 2) find any input[type=file] without wait
+    try:
+        els = driver.find_elements(By.XPATH, "//input[@type='file']")
+        if els:
+            print(f"Found {len(els)} input[type=file] via find_elements")
+            for e in els:
+                try:
+                    driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible';", e)
+                    e.send_keys(file_path)
+                    print("Sent file path to one of the inputs")
+                    time.sleep(0.5)
+                    return
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # 3) Click Choose/Browse/Select UI controls to reveal input
+    choose_xps = [
+        "//label[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'choose')]",
+        "//label[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'browse')]",
+        "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'choose')]",
+        "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'browse')]",
+        "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'select file')]",
+        "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'select')]",
+    ]
+    for xp in choose_xps:
+        try:
+            btn = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((By.XPATH, xp)))
+            print("Clicking 'Choose/Browse' element:", xp)
+            try:
+                btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+            time.sleep(0.6)
+            try:
+                file_input = WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.XPATH, "//input[@type='file']")))
+                driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible';", file_input)
+                file_input.send_keys(file_path)
+                print("Sent file path after clicking choose/browse")
+                time.sleep(0.5)
+                return
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    # 4) try inside iframes
+    try:
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        print(f"Scanning {len(iframes)} iframe(s) for input[type=file]")
+        for idx, fr in enumerate(iframes):
+            try:
+                driver.switch_to.frame(fr)
+                found = False
+                for sel in selectors:
+                    try:
+                        file_input = driver.find_element(By.XPATH, sel)
+                        print(f"Found input in iframe[{idx}] by {sel}")
+                        try:
+                            driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible';", file_input)
+                        except Exception:
+                            pass
+                        file_input.send_keys(file_path)
+                        found = True
+                        time.sleep(0.5)
+                        break
+                    except Exception:
+                        continue
+                driver.switch_to.default_content()
+                if found:
+                    return
+            except Exception:
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+                continue
+    except Exception:
+        pass
+
+    # 5) Last resort: inject temporary input
+    try:
+        unique_id = f"tmp_upload_{int(time.time())}"
+        js = (
+            "var inp = document.createElement('input');"
+            "inp.type='file'; inp.id=arguments[0];"
+            "inp.style.display='block'; inp.style.visibility='visible';"
+            "document.body.appendChild(inp);"
+            "return inp;"
+        )
+        driver.execute_script(js, unique_id)
+        tmp = driver.find_element(By.ID, unique_id)
+        tmp.send_keys(file_path)
+        print("Injected temporary input and sent file path.")
+        time.sleep(0.5)
+        return
+    except Exception as e:
+        print("Failed to inject/use temporary input:", e)
+
+    # nothing worked — save artifacts and raise
+    _save_page_source("file_input_error")
+    save_debug("file_input_error")
+    raise Exception("Could not locate file input element to upload the config file.")
+
+# -------- Import / Apply / Confirm ----------
 def click_import(driver):
     try:
         btn = WebDriverWait(driver, 12).until(
@@ -352,10 +452,9 @@ def confirm_popup(driver):
         time.sleep(0.5)
         print("Confirmed popup")
     except Exception:
-        # popup might not appear; that's fine
-        print("No confirmation popup found (or confirmation click failed)")
+        print("No confirmation popup found (or click failed)")
 
-# -------- Main script flow --------
+# -------- Main flow ----------
 try:
     print("Using config_dir:", os.path.abspath(config_dir))
     driver.get(url)
@@ -367,7 +466,7 @@ try:
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Enter your username' or @name='username' or @id='username']"))
         )
-        # Try a few locators for username
+        # username
         try:
             driver.find_element(By.XPATH, "//input[@placeholder='Enter your username']").send_keys(username)
         except Exception:
@@ -375,8 +474,7 @@ try:
                 driver.find_element(By.XPATH, "//input[@name='username']").send_keys(username)
             except Exception:
                 driver.find_element(By.XPATH, "//input[@id='username']").send_keys(username)
-
-        # password field
+        # password
         try:
             driver.find_element(By.XPATH, "//input[@placeholder='Enter your password']").send_keys(password)
         except Exception:
@@ -385,7 +483,7 @@ try:
             except Exception:
                 driver.find_element(By.XPATH, "//input[@id='password']").send_keys(password)
 
-        # click login button (several options)
+        # click login
         login_btn_xps = [
             "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'login')]",
             "//input[@type='submit' and contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login')]"
@@ -403,7 +501,6 @@ try:
             except Exception:
                 continue
         if not clicked:
-            # fallback: press Enter on password field
             try:
                 pwd = driver.find_element(By.XPATH, "//input[@type='password']")
                 pwd.send_keys("\n")
@@ -419,16 +516,15 @@ try:
         driver.quit()
         raise SystemExit(1)
 
-    # Wait a short while for UI to stabilize
+    # optional short wait for UI stabilization
     try:
         WebDriverWait(driver, 12).until(
             EC.presence_of_element_located((By.XPATH, "//*[contains(@class,'main') or contains(@id,'app') or contains(@role,'main') or //div[@id='root']]"))
         )
     except Exception:
-        # not fatal
         pass
 
-    # Process AMF-only files
+    # scan for AMF files and process
     print("Scanning config_dir for AMF files...")
     for file in os.listdir(config_dir):
         print(f"Found file: {file}")
@@ -438,10 +534,14 @@ try:
 
         file_path = os.path.abspath(os.path.join(config_dir, file))
         print(f"Processing AMF file: {file_path}")
+
         try:
             save_debug(f"before_click_amf_{file}")
+            # Steps: configure -> AMF tab -> click 'amf' entry -> upload file -> import/apply/confirm
             click_nf_tab(driver, "AMF")
-            click_add_button(driver, "AMF")
+            # IMPORTANT: click the 'amf' list item (lowercase in UI) to reveal Choose File control
+            click_nf_entry(driver, "amf")
+            # now upload; upload function has robust waits
             upload_config_file(driver, file_path)
             click_import(driver)
             click_apply(driver)
@@ -452,7 +552,6 @@ try:
             print(f"Failed to upload {file}: {e}")
             traceback.print_exc()
             save_debug(f"error_amf_{file}")
-            # continue to next file (if any)
             continue
 
     print("AMF-only run finished.")
