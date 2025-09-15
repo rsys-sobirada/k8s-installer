@@ -13,13 +13,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time, os, traceback
-from selenium.common.exceptions import (
-    NoAlertPresentException,
-    UnexpectedAlertPresentException,
-    TimeoutException,
-    StaleElementReferenceException,
-    WebDriverException,
-)
 
 # -------- Config ----------
 url = "https://172.27.28.193.nip.io/ems/login"
@@ -432,124 +425,43 @@ def click_import(driver):
         driver.save_screenshot(f"debug_screenshots/{int(time.time())}_error_persist_config.png")
         raise
 
-def click_apply(driver, logger=None, apply_xpath="//button[normalize-space()='Apply']",
-                wait_timeout=12, alert_wait=5, max_retries=2):
-    """
-    Click the "Apply" button and robustly handle any confirm/alert dialogs that appear.
-    - driver: selenium webdriver
-    - logger: optional (use print() if None)
-    - apply_xpath: XPath for the apply button (adjust for your app)
-    - wait_timeout: how long to wait for button to become clickable
-    - alert_wait: short wait for an alert to appear after click
-    - max_retries: how many times to retry clicking if alert interrupts
-    """
-    log = logger.info if logger else print
-
-    for attempt in range(1, max_retries + 1):
+def click_apply(driver):
+    try:
         try:
-            log(f"[click_apply] Attempt {attempt} - waiting for Apply button (timeout={wait_timeout}s)")
-            # Wait for the Apply button to be clickable
-            btn = WebDriverWait(driver, wait_timeout).until(
-                EC.element_to_be_clickable((By.XPATH, apply_xpath))
+            btn = WebDriverWait(driver, 12).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
             )
-            log("[click_apply] Apply button found - clicking")
-            try:
-                btn.click()
-            except (StaleElementReferenceException, WebDriverException) as e:
-                # If the element went stale or click failed, re-find and click
-                log(f"[click_apply] click() failed with {type(e).__name__}: {e} - re-finding and retrying click")
-                btn = WebDriverWait(driver, wait_timeout).until(
-                    EC.element_to_be_clickable((By.XPATH, apply_xpath))
-                )
-                btn.click()
-
-            # After click, an alert/confirm may appear. wait a short time and handle it.
-            try:
-                log(f"[click_apply] Waiting up to {alert_wait}s for alert to appear")
-                alert = WebDriverWait(driver, alert_wait).until(lambda d: d.switch_to.alert)
-            except TimeoutException:
-                # No alert appeared in short time; success path (maybe page changed)
-                log("[click_apply] No alert appeared after click.")
-                return True
-
-            # If we got here, an alert is present
-            try:
-                alert_text = alert.text
-            except Exception:
-                alert_text = "<unreadable alert text>"
-            log(f"[click_apply] Alert detected with text: {alert_text!r}")
-
-            # Decide accept or dismiss. Here we accept because your logs show a confirm asking
-            # "Do you want to continue?" — change to .dismiss() if you prefer.
-            try:
-                log("[click_apply] Accepting alert")
-                alert.accept()
-            except Exception as e:
-                log(f"[click_apply] alert.accept() raised {type(e).__name__}: {e} - attempting safe recover")
-                try:
-                    # final attempt
-                    driver.switch_to.alert.accept()
-                except Exception:
-                    log("[click_apply] Could not accept alert; continuing (alert may have gone away)")
-
-            # Wait briefly for alert to go away
-            try:
-                WebDriverWait(driver, 3).until_not(lambda d: _is_alert_present(d))
-            except TimeoutException:
-                log("[click_apply] Warning: alert still present after accept() wait")
-
-            # After handling alert, wait for expected post-apply condition: e.g., Apply button hidden,
-            # or a success message. Adjust below to your app's logic if needed.
-            log("[click_apply] Waiting for Apply button to become not clickable / gone (post-apply state)")
-            try:
-                WebDriverWait(driver, wait_timeout).until_not(
-                    EC.element_to_be_clickable((By.XPATH, apply_xpath))
-                )
-            except TimeoutException:
-                # Might still be OK — maybe UI doesn't remove the button. Treat as success after alert handled.
-                log("[click_apply] Post-apply wait timed out; proceeding anyway after alert handled.")
-
-            log("[click_apply] Apply action completed (alert handled).")
-            return True
-
-        except UnexpectedAlertPresentException as ua:
-            # This occurs if an alert popped up while waiting for the element
-            log(f"[click_apply] UnexpectedAlertPresentException caught: {ua}. Attempting to handle alert now.")
+        except UnexpectedAlertPresentException:
+            print("Alert appeared during Apply button wait.")
             try:
                 alert = driver.switch_to.alert
-                try:
-                    txt = alert.text
-                except Exception:
-                    txt = "<unreadable alert text>"
-                log(f"[click_apply] Alert text: {txt!r}. Accepting alert.")
+                print("Alert text:", alert.text)
                 alert.accept()
-            except NoAlertPresentException:
-                log("[click_apply] No alert present when trying to handle UnexpectedAlertPresentException.")
+                print("Alert accepted.")
+                time.sleep(1)
+                btn = WebDriverWait(driver, 12).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
+                )
             except Exception as e:
-                log(f"[click_apply] Error while handling unexpected alert: {type(e).__name__}: {e}")
-            # retry the loop
-            continue
-
-        except TimeoutException:
-            log("[click_apply] Timeout waiting for Apply button. Will not retry further.")
-            return False
-
-        except Exception as e:
-            log(f"[click_apply] Unexpected exception: {type(e).__name__}: {e}")
-            return False
-
-    log("[click_apply] Reached max retries without successful apply.")
-    return False
-
-
-def _is_alert_present(driver):
-    """Helper used in WebDriverWait until_not to detect alert presence."""
-    try:
-        _ = driver.switch_to.alert
-        return True
-    except NoAlertPresentException:
-        return False
-
+                print("Failed to handle alert:", e)
+                raise
+        try:
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
+        time.sleep(0.6)
+        print("Clicked Apply")
+        try:
+            alert = driver.switch_to.alert
+            print("Post-Apply Alert text:", alert.text)
+            alert.accept()
+            print("Post-Apply Alert accepted")
+        except NoAlertPresentException:
+            print("No alert present after Apply")
+    except Exception as e:
+        _save_page_source("apply_button_error")
+        print("Error clicking Apply:", e)
+        raise
 def confirm_popup(driver):
     try:
         btn = WebDriverWait(driver, 10).until(
