@@ -428,7 +428,10 @@ def click_import(driver):
 
 
 
+from selenium.common.exceptions import TimeoutException
+
 def click_apply(driver):
+    btn = None  # Declare upfront
     try:
         try:
             btn = WebDriverWait(driver, 12).until(
@@ -452,29 +455,33 @@ def click_apply(driver):
                 print("Failed to handle alert:", e)
                 raise
 
-        try:
-            btn.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", btn)
-        time.sleep(0.6)
-        print("Clicked Apply")
+        if btn:
+            try:
+                btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+            time.sleep(0.6)
+            print("Clicked Apply")
 
-        # Post-Apply alert handling
-        try:
-            WebDriverWait(driver, 3).until(EC.alert_is_present())
-            alert = driver.switch_to.alert
-            print("Post-Apply Alert text:", alert.text)
-            alert.accept()
-            print("Post-Apply Alert accepted")
-        except TimeoutException:
-            print("No alert present after Apply")
-        except Exception as e:
-            print("Error handling post-Apply alert:", e)
+            # Post-Apply alert handling
+            try:
+                WebDriverWait(driver, 3).until(EC.alert_is_present())
+                alert = driver.switch_to.alert
+                print("Post-Apply Alert text:", alert.text)
+                alert.accept()
+                print("Post-Apply Alert accepted")
+            except TimeoutException:
+                print("No alert present after Apply")
+            except Exception as e:
+                print("Error handling post-Apply alert:", e)
+        else:
+            raise Exception("Apply button not found and could not be clicked.")
 
     except Exception as e:
         _save_page_source("apply_button_error")
         print("Error clicking Apply:", e)
         raise
+
 
 def confirm_popup(driver):
     try:
