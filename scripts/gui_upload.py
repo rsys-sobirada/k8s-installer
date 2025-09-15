@@ -425,30 +425,20 @@ def click_import(driver):
         raise
 
 def click_apply(driver):
-    try:
-    # Handle alert before locating the Apply button
-    try:
-        alert = driver.switch_to.alert
-        print("Pre-Apply Alert text:", alert.text)
-        alert.accept()
-        print("Pre-Apply Alert accepted")
-        time.sleep(0.5)
-    except Exception:
-        pass
-
-        btn = WebDriverWait(driver, 12).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
-        )
         try:
-            btn.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", btn)
-        time.sleep(0.6)
-        print("Clicked Apply")
-    except Exception as e:
-        _save_page_source("apply_button_error")
-        print("Error clicking Apply:", e)
-        raise
+            btn = WebDriverWait(driver, 12).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
+            )
+            try:
+                btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+            time.sleep(0.6)
+            print("Clicked Apply")
+        except Exception as e:
+            _save_page_source("apply_button_error")
+            print("Error clicking Apply:", e)
+            raise
 
 def confirm_popup(driver):
     try:
