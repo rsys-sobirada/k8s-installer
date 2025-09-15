@@ -424,8 +424,20 @@ def click_import(driver):
         driver.save_screenshot(f"debug_screenshots/{int(time.time())}_error_persist_config.png")
         raise
 
+from selenium.common.exceptions import UnexpectedAlertPresentException, NoAlertPresentException
+
 def click_apply(driver):
     try:
+        # Handle alert before locating the button
+        try:
+            alert = driver.switch_to.alert
+            print("Pre-Apply Alert text:", alert.text)
+            alert.accept()
+            print("Pre-Apply Alert accepted")
+            time.sleep(0.5)
+        except NoAlertPresentException:
+            pass
+
         btn = WebDriverWait(driver, 12).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
         )
@@ -435,14 +447,16 @@ def click_apply(driver):
             driver.execute_script("arguments[0].click();", btn)
         time.sleep(0.6)
         print("Clicked Apply")
-        # Handle confirmation alert
+
+        # Handle alert after clicking Apply
         try:
             alert = driver.switch_to.alert
-            print("Alert text:", alert.text)
+            print("Post-Apply Alert text:", alert.text)
             alert.accept()
-            print("Alert accepted")
+            print("Post-Apply Alert accepted")
         except NoAlertPresentException:
             print("No alert present after Apply")
+
     except Exception as e:
         _save_page_source("apply_button_error")
         print("Error clicking Apply:", e)
