@@ -410,18 +410,18 @@ def upload_config_file(driver, file_path):
 # -------- Import / Apply / Confirm ----------
 def click_import(driver):
     try:
+        print("Looking for 'Persist Configurations' button...")
         btn = WebDriverWait(driver, 12).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'import')]"))
+            EC.element_to_be_clickable((
+                By.XPATH,
+                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'persist configurations')]"
+            ))
         )
-        try:
-            btn.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", btn)
-        time.sleep(0.6)
-        print("Clicked Import")
+        btn.click()
+        print("Clicked 'Persist Configurations' button successfully")
     except Exception as e:
-        _save_page_source("import_button_error")
-        print("Error clicking Import:", e)
+        print(f"Error clicking 'Persist Configurations': {e}")
+        driver.save_screenshot(f"debug_screenshots/{int(time.time())}_error_persist_config.png")
         raise
 
 def click_apply(driver):
