@@ -1,34 +1,16 @@
-pipeline {
-    agent any
+# Create venv if not exists
+if [ ! -f "./venv/bin/python" ]; then
+    python3 -m venv venv
+fi
 
-    environment {
-        EMS_URL = "https://172.27.28.193.nip.io/ems/login"
-        EMS_USER = "root"
-        EMS_PASS = "root123"
-        CONFIG_ZIP = "/var/lib/jenkins/downloads/merged_config.zip"
-        VENV_PATH = "venv"
-    }
+# Activate venv and install dependencies
+./venv/bin/pip install --upgrade pip
 
-    stages {
-        stage('Unzip Config Files') {
-            steps {
-                sh 'rm -rf config_files && mkdir config_files'
-                sh "unzip -o ${CONFIG_ZIP} -d config_files"
-            }
-        }
+# Install playwright only if not installed
+if ! ./venv/bin/python -c "import playwright" 2>/dev/null; then
+    ./venv/bin/pip install playwright
+    ./venv/bin/python -m playwright install chromium
+fi
 
-        stage('Setup Python Environment') {
-            steps {
-                sh 'python3 -m venv venv'
-                sh './venv/bin/pip install --upgrade pip'
-                sh './venv/bin/pip install selenium'
-            }
-        }
-
-        stage('Run GUI Automation') {
-            steps {
-                sh './venv/bin/python3 scripts/gui_upload.py'
-            }
-        }
-    }
-}
+# Run the script
+./venv/bin/python scripts/gui_upload.py
