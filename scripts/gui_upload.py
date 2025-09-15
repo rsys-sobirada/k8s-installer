@@ -440,8 +440,6 @@ def click_apply(driver):
         print("Error clicking Apply:", e)
         raise
 
-
-verify_amf_config_applied(driver)
 def confirm_popup(driver):
     try:
         btn = WebDriverWait(driver, 10).until(
@@ -455,6 +453,18 @@ def confirm_popup(driver):
         print("Confirmed popup")
     except Exception:
         print("No confirmation popup found (or click failed)")
+
+
+def verify_amf_config_applied(driver):
+    """Check for success message or status after Apply."""
+    try:
+        success_keywords = ["successfully", "configuration applied", "completed", "applied"]
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//*[contains(text(),'successfully') or contains(text(),'applied') or contains(text(),'completed')]"))
+        )
+        print("✅ AMF configuration appears to be applied successfully.")
+    except Exception:
+        print("⚠️ Could not verify success message after Apply.")
 
 # -------- Main flow ----------
 try:
