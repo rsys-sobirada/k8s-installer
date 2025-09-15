@@ -428,10 +428,9 @@ def click_import(driver):
 
 
 
-from selenium.common.exceptions import TimeoutException
 
 def click_apply(driver):
-    btn = None  # Declare upfront
+    btn = None  # Ensure btn is initialized
     try:
         try:
             btn = WebDriverWait(driver, 12).until(
@@ -479,8 +478,10 @@ def click_apply(driver):
 
     except Exception as e:
         _save_page_source("apply_button_error")
+        save_debug("apply_button_error")
         print("Error clicking Apply:", e)
         raise
+
 
 
 def confirm_popup(driver):
