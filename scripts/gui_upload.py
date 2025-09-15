@@ -434,34 +434,38 @@ def click_apply(driver):
         except UnexpectedAlertPresentException:
             print("Alert appeared during Apply button wait.")
             try:
-                alert = driver.switch_to.alert
-                print("Alert text:", alert.text)
-                alert.accept()
+                # Accept alert without reading text
+                driver.switch_to.alert.accept()
                 print("Alert accepted.")
                 time.sleep(1)
+                # Retry locating Apply button
                 btn = WebDriverWait(driver, 12).until(
                     EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
                 )
             except Exception as e:
                 print("Failed to handle alert:", e)
                 raise
+
+        # Click the Apply button
         try:
             btn.click()
         except Exception:
             driver.execute_script("arguments[0].click();", btn)
         time.sleep(0.6)
         print("Clicked Apply")
+
+        # Handle any post-click alert
         try:
-            alert = driver.switch_to.alert
-            print("Post-Apply Alert text:", alert.text)
-            alert.accept()
+            driver.switch_to.alert.accept()
             print("Post-Apply Alert accepted")
         except NoAlertPresentException:
             print("No alert present after Apply")
+
     except Exception as e:
         _save_page_source("apply_button_error")
         print("Error clicking Apply:", e)
         raise
+
 def confirm_popup(driver):
     try:
         btn = WebDriverWait(driver, 10).until(
