@@ -32,7 +32,7 @@ from selenium.common.exceptions import (
 )
 
 # ---------------------- Config ----------------------
-url = "https://172.27.28.193.nip.io/ems/login"
+url = "https://172.27.28.165.nip.io/ems/login"
 username = "root"
 password = "root123"
 
