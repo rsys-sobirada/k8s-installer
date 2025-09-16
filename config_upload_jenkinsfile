@@ -1,15 +1,11 @@
-stage('Run GUI Automation') {
-    steps {
-        sh '''
-            export CONFIG_DIR="./config_files"   # or absolute path
-            export HEADLESS=1                    # set to 0 to watch it run (requires Xvfb in CI)
-            export FAST_MODE=1                   # optional: shorter waits when env is healthy
-            ./venv/bin/python scripts/gui_upload.py
-        '''
+stage('Run GUI Automation (headful)') {
+  steps {
+    wrap([$class: 'Xvfb', screen: '1920x1080x24']) {
+      sh '''
+        set -euxo pipefail
+        export HEADLESS=0
+        ./venv/bin/python scripts/gui_upload.py
+      '''
     }
-    post {
-        always {
-            archiveArtifacts artifacts: 'debug_screenshots/**/*.*', allowEmptyArchive: true
-        }
-    }
+  }
 }
