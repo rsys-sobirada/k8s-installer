@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-# AMF-only upload automation: Configure -> AMF -> "amf" entry -> upload JSON -> Persist -> Confirm -> Apply
+# gui_upload.py  (v3, 2025-09-16)
+# AMF-only upload automation:
+#   Configure -> AMF -> "amf" entry -> upload JSON -> Persist -> (native confirm) -> [Apply if needed]
+#
+# Highlights in v3:
+# - Robust login (cert interstitial, iframe/SSO-aware, doc.ready)
+# - Explicit native confirm handling after "Persist Configurations"
+# - Skip Apply when persist is final (based on alert text heuristic)
+# - Scroll-aware + modal/iframe-aware Apply retained (if Apply exists)
+# - FAST_MODE to trim timeouts; larger headless viewport
+# - Rich debug artifacts (.png + .html)
 #
 # Usage:
-#   CONFIG_DIR=/path/to/configs HEADLESS=1 ./venv/bin/python scripts/gui_upload.py
-# Defaults:
-#   CONFIG_DIR = ./config_files
-#   HEADLESS   = 1  (set to 0 to see the browser)
-#
-# This version:
-# - Explicitly handles native confirm after Persist (accepts it)
-# - Scroll-aware + modal/iframe-aware Apply
-# - Larger viewport in headless
-# - Broader Import/Persist detection
-# - Resilient screenshot & extra debug artifacts
+#   CONFIG_DIR=/path/to/configs HEADLESS=1 FAST_MODE=0 ./venv/bin/python scripts/gui_upload.py
 
 import os
 import time
@@ -31,14 +31,26 @@ from selenium.common.exceptions import (
     NoAlertPresentException,
 )
 
+# ---------------------- Version banner ----------------------
+print("gui_upload.py version: v3 (2025-09-16) - robust login, persist-final fast path, scroll-apply")
+
 # ---------------------- Config ----------------------
-url = "https://172.27.28.165.nip.io/ems/login"
+url = "https://172.27.28.193.nip.io/ems/login"
 username = "root"
 password = "root123"
 
 config_dir = os.environ.get("CONFIG_DIR", "config_files")
 debug_dir = "debug_screenshots"
 os.makedirs(debug_dir, exist_ok=True)
+
+# Speed knobs
+FAST_MODE = os.environ.get("FAST_MODE", "0") == "1"
+OVERLAY_TIMEOUT = 6 if FAST_MODE else 12
+SHORT_SLEEP = 0.2 if FAST_MODE else 0.5
+SCROLL_ATTEMPTS = 1 if FAST_MODE else 2
+
+# Global flag indicating persist action is final (skip Apply)
+PERSIST_IS_FINAL = False
 
 # ---------------------- WebDriver setup ----------------------
 options = Options()
@@ -49,7 +61,13 @@ options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 options.accept_insecure_certs = True
 
-# Make Firefox auto-accept any unhandled prompt if one slips through
+# Prefer moving on after DOMContentLoaded (can speed up page loads)
+try:
+    options.set_capability("pageLoadStrategy", "eager")
+except Exception:
+    pass
+
+# Safety net: accept any unhandled prompts if they slip through
 try:
     options.set_capability("unhandledPromptBehavior", "accept")
 except Exception:
@@ -63,37 +81,22 @@ try:
 except Exception:
     pass
 
-# ---------------------- Debug helpers ----------------------
-def handle_native_alerts(timeout=8, accept=True):
-    """
-    Wait for window.alert/confirm/prompt and accept/dismiss it.
-    Returns True if a prompt was handled, False otherwise.
-    """
-    try:
-        WebDriverWait(driver, timeout).until(EC.alert_is_present())
-        alert = driver.switch_to.alert
+# ---------------------- Utility/Debug helpers ----------------------
+def wait_document_ready(timeout=25):
+    end = time.time() + timeout
+    while time.time() < end:
         try:
-            print("Native alert text:", alert.text)
+            ready = driver.execute_script("return document.readyState")
+            if ready == "complete":
+                return True
         except Exception:
             pass
-        if accept:
-            alert.accept()
-            print("Native alert accepted")
-        else:
-            alert.dismiss()
-            print("Native alert dismissed")
-        time.sleep(0.4)
-        return True
-    except TimeoutException:
-        return False
-    except Exception as e:
-        print("Error while handling native alert:", e)
-        return False
+        time.sleep(0.2)
+    return False
 
 def save_debug(name):
-    # Try to handle a blocking prompt first, then take a screenshot
+    """Take a screenshot; if a native prompt blocks it, accept and retry once."""
     try:
-        # Quick sweep: accept any prompt that might be blocking
         handle_native_alerts(timeout=1, accept=True)
     except Exception:
         pass
@@ -104,7 +107,6 @@ def save_debug(name):
         print(f"Saved screenshot: {path}")
     except Exception as e:
         print(f"Failed to save screenshot {path}: {e}")
-        # One more chance after clearing a prompt
         if handle_native_alerts(timeout=2, accept=True):
             time.sleep(0.2)
             try:
@@ -122,7 +124,207 @@ def _save_page_source(name):
     except Exception as e:
         print(f"Failed to save page source {path}: {e}")
 
-# ---------------------- Element finder ----------------------
+def handle_native_alerts(timeout=8, accept=True):
+    """
+    Wait for window.alert/confirm/prompt and accept/dismiss it.
+    Returns alert text ('' if none).
+    """
+    try:
+        WebDriverWait(driver, timeout).until(EC.alert_is_present())
+        alert = driver.switch_to.alert
+        text = ""
+        try:
+            text = alert.text or ""
+            print("Native alert text:", text)
+        except Exception:
+            pass
+        if accept:
+            alert.accept()
+            print("Native alert accepted")
+        else:
+            alert.dismiss()
+            print("Native alert dismissed")
+        time.sleep(SHORT_SLEEP)
+        return text
+    except TimeoutException:
+        return ""
+    except Exception as e:
+        print("Error while handling native alert:", e)
+        return ""
+
+# ---------------------- Login helpers ----------------------
+def handle_firefox_cert_interstitial(max_tries=2):
+    """
+    Accept Firefox 'Warning: Potential Security Risk Ahead' interstitial if shown.
+    """
+    for _ in range(max_tries):
+        try:
+            cur = driver.current_url or ""
+        except Exception:
+            cur = ""
+        if "about:certerror" in cur or "certerror" in cur.lower():
+            print("Detected Firefox certificate interstitial; attempting to accept risk...")
+            try:
+                # Expand advanced panel
+                try:
+                    driver.find_element(By.ID, "advancedButton").click()
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+                # Accept the risk and continue
+                for btn_id in ("acceptTheRiskButton", "exceptionDialogButton"):
+                    try:
+                        btn = driver.find_element(By.ID, btn_id)
+                        driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(1.2)
+                        break
+                    except Exception:
+                        continue
+            except Exception as e:
+                print("Cert interstitial handling error:", e)
+            time.sleep(0.8)
+        else:
+            break
+
+def _first_visible(els):
+    for e in els:
+        try:
+            if e.is_displayed():
+                return e
+        except Exception:
+            continue
+    return None
+
+def _find_in_iframes(find_fn):
+    """Run a finder inside each iframe and return the first visible element found + frame."""
+    frames = driver.find_elements(By.TAG_NAME, "iframe")
+    for idx, fr in enumerate(frames):
+        try:
+            driver.switch_to.frame(fr)
+            el = find_fn()
+            if el:
+                print(f"Found element in iframe[{idx}]")
+                driver.switch_to.default_content()
+                return (el, fr)
+        except Exception:
+            pass
+        finally:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+    return (None, None)
+
+def locate_login_fields(timeout=30):
+    """
+    Return (username_input, password_input, login_button or None).
+    Scans main page and iframes with broad patterns.
+    """
+    end = time.time() + timeout
+
+    user_xps = [
+        "//input[@type='text' or @type='email']",
+        "//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'user') or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'user')]",
+        "//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login') or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login')]",
+        "//input[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'user') or contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'email')]",
+    ]
+    pass_xps = [
+        "//input[@type='password']",
+        "//input[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'pass') or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'pass')]",
+    ]
+    login_btn_xps = [
+        "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login')]",
+        "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'sign in')]",
+        "//input[@type='submit']",
+        "//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login') or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'sign in')]",
+    ]
+
+    def find_fields_in_context():
+        # username
+        u = None
+        for xp in user_xps:
+            els = driver.find_elements(By.XPATH, xp)
+            u = _first_visible(els)
+            if u:
+                break
+        # password
+        p = _first_visible(driver.find_elements(By.XPATH, pass_xps[0])) \
+            or _first_visible(driver.find_elements(By.XPATH, pass_xps[1]))
+        # login button (optional)
+        b = None
+        for xp in login_btn_xps:
+            b = _first_visible(driver.find_elements(By.XPATH, xp))
+            if b:
+                break
+        return (u, p, b)
+
+    while time.time() < end:
+        try:
+            u, p, b = find_fields_in_context()
+            if u and p:
+                return (u, p, b)
+            # try iframes
+            def inner():
+                u2, p2, b2 = find_fields_in_context()
+                return _first_visible([u2, p2, b2])
+            el, fr = _find_in_iframes(inner)
+            if el:
+                # Re-enter iframe to fetch concrete fields
+                driver.switch_to.frame(fr)
+                u, p, b = find_fields_in_context()
+                driver.switch_to.default_content()
+                if u and p:
+                    return (u, p, b)
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+    return (None, None, None)
+
+def robust_login_flow():
+    driver.get(url)
+    wait_document_ready(timeout=25)
+    handle_firefox_cert_interstitial(max_tries=2)
+
+    # Log current URL & title for debugging
+    try:
+        print("Login page URL:", driver.current_url)
+        print("Login page title:", driver.title)
+    except Exception:
+        pass
+
+    u, p, btn = locate_login_fields(timeout=30)
+    if not u or not p:
+        save_debug("login_failed")
+        _save_page_source("login_failed")
+        raise TimeoutException("Could not find username/password fields on the login page")
+
+    # Fill credentials
+    try:
+        u.clear()
+    except Exception:
+        pass
+    u.send_keys(username)
+
+    try:
+        p.clear()
+    except Exception:
+        pass
+    p.send_keys(password)
+
+    # Click login OR press Enter in password field
+    if btn:
+        try:
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
+    else:
+        p.send_keys("\n")
+
+    time.sleep(2.0)
+    save_debug("after_login")
+
+# ---------------------- Generic element finder ----------------------
 def find_element_by_text_any(tag_text, timeout=6):
     """
     Find an element containing tag_text (case-insensitive) using multiple strategies.
@@ -247,7 +449,7 @@ def open_configure_menu():
             except Exception:
                 driver.execute_script("arguments[0].click();", el)
             print("Clicked 'Configure' via XPath:", xp)
-            time.sleep(1.2)
+            time.sleep(0.3 if FAST_MODE else 1.0)
             return
         except Exception:
             continue
@@ -259,7 +461,7 @@ def open_configure_menu():
         except Exception:
             driver.execute_script("arguments[0].click();", el)
         print("Clicked 'Configure' (fallback)")
-        time.sleep(1.2)
+        time.sleep(0.3 if FAST_MODE else 1.0)
         return
     except Exception as e:
         print(f"Warning: Could not open 'Configure' menu: {e}")
@@ -278,15 +480,15 @@ def click_nf_tab(driver, nf_name):
         elem = find_element_by_text_any(nf_name, timeout=6)
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
-            time.sleep(0.4)
+            time.sleep(SHORT_SLEEP)
         except Exception:
             pass
         try:
             elem.click()
-            time.sleep(0.6)
+            time.sleep(SHORT_SLEEP)
         except Exception:
             driver.execute_script("arguments[0].click();", elem)
-            time.sleep(0.6)
+            time.sleep(SHORT_SLEEP)
         print(f"Clicked NF tab '{nf_name}'")
     except Exception as e:
         _save_page_source(f"click_lookup_failed_{nf_name}")
@@ -300,15 +502,15 @@ def click_nf_entry(driver, entry_text):
         elem = find_element_by_text_any(entry_text, timeout=8)
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
-            time.sleep(0.3)
+            time.sleep(SHORT_SLEEP)
         except Exception:
             pass
         try:
             elem.click()
-            time.sleep(0.6)
+            time.sleep(SHORT_SLEEP)
         except Exception:
             driver.execute_script("arguments[0].click();", elem)
-            time.sleep(0.6)
+            time.sleep(SHORT_SLEEP)
         print(f"Clicked NF entry '{entry_text}'")
     except Exception as e:
         _save_page_source(f"nf_entry_not_found_{entry_text}")
@@ -333,7 +535,7 @@ def upload_config_file(driver, file_path):
         "//input[contains(@name,'file') and @type='file']",
         "//input[contains(@data-test,'file') and @type='file']",
     ]
-    time.sleep(0.6)
+    time.sleep(SHORT_SLEEP)
 
     # 1) try with a larger wait
     for sel in selectors:
@@ -348,7 +550,7 @@ def upload_config_file(driver, file_path):
                 pass
             file_input.send_keys(file_path)
             print("Sent file path to input (xpath path)")
-            time.sleep(0.5)
+            time.sleep(SHORT_SLEEP)
             return
         except Exception:
             continue
@@ -363,7 +565,7 @@ def upload_config_file(driver, file_path):
                     driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible';", e)
                     e.send_keys(file_path)
                     print("Sent file path to one of the inputs")
-                    time.sleep(0.5)
+                    time.sleep(SHORT_SLEEP)
                     return
                 except Exception:
                     continue
@@ -387,7 +589,7 @@ def upload_config_file(driver, file_path):
                 btn.click()
             except Exception:
                 driver.execute_script("arguments[0].click();", btn)
-            time.sleep(0.6)
+            time.sleep(0.3)
             try:
                 file_input = WebDriverWait(driver, 3).until(
                     EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
@@ -395,7 +597,7 @@ def upload_config_file(driver, file_path):
                 driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible';", file_input)
                 file_input.send_keys(file_path)
                 print("Sent file path after clicking choose/browse")
-                time.sleep(0.5)
+                time.sleep(SHORT_SLEEP)
                 return
             except Exception:
                 pass
@@ -420,7 +622,7 @@ def upload_config_file(driver, file_path):
                             pass
                         file_input.send_keys(file_path)
                         found = True
-                        time.sleep(0.5)
+                        time.sleep(SHORT_SLEEP)
                         break
                     except Exception:
                         continue
@@ -450,7 +652,7 @@ def upload_config_file(driver, file_path):
         tmp = driver.find_element(By.ID, unique_id)
         tmp.send_keys(file_path)
         print("Injected temporary input and sent file path.")
-        time.sleep(0.5)
+        time.sleep(SHORT_SLEEP)
         return
     except Exception as e:
         print("Failed to inject/use temporary input:", e)
@@ -464,8 +666,10 @@ def click_import(driver):
     """
     Broadened import/persist detection: looks for buttons like
     'Persist Configurations', 'Persist', 'Import', 'Save configuration', 'Save', 'Upload'.
-    Also explicitly accepts the native confirm that appears after clicking Persist.
+    Explicitly accepts the native confirm after clicking Persist.
+    Sets global PERSIST_IS_FINAL when alert text indicates final commit.
     """
+    global PERSIST_IS_FINAL
     try:
         print("Looking for 'Persist Configurations' / Import button...")
         texts = ["persist configurations", "persist", "import", "upload", "save configuration", "save"]
@@ -482,9 +686,16 @@ def click_import(driver):
                     driver.execute_script("arguments[0].click();", btn)
                 print(f"Clicked import-like button: '{t}'")
 
-                # NEW: if a native confirm pops up right after Persist, accept it.
-                if handle_native_alerts(timeout=8, accept=True):
+                # Accept native confirm (if any) and inspect its text
+                alert_text = handle_native_alerts(timeout=8, accept=True)
+                if alert_text:
                     print("Confirmed 'Persist Configurations' native dialog")
+                    # Heuristic: if alert says we're copying running->startup for ALL NFs,
+                    # treat this as final commit; skip Apply.
+                    lt = alert_text.lower()
+                    if "all nfs" in lt or ("running" in lt and "startup" in lt):
+                        PERSIST_IS_FINAL = True
+                        print("Persist appears final (no Apply needed).")
 
                 return
             except Exception:
@@ -495,7 +706,6 @@ def click_import(driver):
         driver.save_screenshot(f"debug_screenshots/{int(time.time())}_error_persist_config.png")
         raise
 
-# ---- Scroll & modal aware Apply support ----
 def scroll_page(step_ratio=0.85, attempts=6, direction="down"):
     """Progressively scroll the main window."""
     dy = "Math.floor(window.innerHeight*arguments[0])"
@@ -629,7 +839,7 @@ def try_press_enter_fallback():
     except Exception:
         return False
 
-def wait_for_overlay_to_settle(timeout=12):
+def wait_for_overlay_to_settle(timeout=OVERLAY_TIMEOUT):
     """
     Wait for common UI overlays/spinners/toasts to disappear so buttons are clickable.
     Non-fatal if nothing is found.
@@ -657,13 +867,13 @@ def wait_for_overlay_to_settle(timeout=12):
                     continue
             if not visible:
                 return
-            time.sleep(0.4)
+            time.sleep(0.3)
     except Exception:
         pass
 
 def click_apply(driver):
     """
-    Scroll-aware and modal-aware Apply:
+    Scroll-aware and modal/iframe-aware Apply:
     - handle leftover native prompt (if any)
     - scroll page + scrollable containers to bottom
     - search for Apply/Confirm in action bars/footers or anywhere
@@ -676,16 +886,16 @@ def click_apply(driver):
 
         # Capture state and let UI settle a bit
         save_debug("after_persist_clicked")
-        wait_for_overlay_to_settle(timeout=6)
-        time.sleep(0.3)
+        wait_for_overlay_to_settle(timeout=OVERLAY_TIMEOUT)
+        time.sleep(SHORT_SLEEP)
 
-        # 1) Scroll the page and scrollable containers; many UIs place Apply in a sticky footer.
-        scroll_page(step_ratio=1.0, attempts=2, direction="down")
+        # 1) Scroll the page and scrollable containers
+        scroll_page(step_ratio=1.0, attempts=SCROLL_ATTEMPTS, direction="down")
         scroll_all_scrollables_to_bottom()
         time.sleep(0.2)
 
-        # 2) Try to find & click Apply-like button in the page first
-        btn = find_apply_like_button(timeout=6)
+        # 2) Try to find & click Apply-like button in the page
+        btn = find_apply_like_button(timeout=6 if FAST_MODE else 10)
         if btn:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             time.sleep(0.2)
@@ -694,8 +904,8 @@ def click_apply(driver):
             except Exception:
                 driver.execute_script("arguments[0].click();", btn)
             print("Clicked Apply/Confirm in page body after scrolling")
-            time.sleep(0.6)
-            wait_for_overlay_to_settle(timeout=6)
+            time.sleep(SHORT_SLEEP)
+            wait_for_overlay_to_settle(timeout=OVERLAY_TIMEOUT)
             return
 
         # 3) Look for Apply-like button inside modals/dialogs if present
@@ -739,8 +949,8 @@ def click_apply(driver):
                 except Exception:
                     driver.execute_script("arguments[0].click();", btn)
                 print("Clicked Apply/Confirm inside modal")
-                time.sleep(0.6)
-                wait_for_overlay_to_settle(timeout=6)
+                time.sleep(SHORT_SLEEP)
+                wait_for_overlay_to_settle(timeout=OVERLAY_TIMEOUT)
                 return
 
         # 4) If dialog is inside an iframe, search there
@@ -759,8 +969,8 @@ def click_apply(driver):
                             driver.execute_script("arguments[0].click();", btn)
                         print(f"Clicked Apply/Confirm inside iframe[{idx}]")
                         driver.switch_to.default_content()
-                        time.sleep(0.6)
-                        wait_for_overlay_to_settle(timeout=6)
+                        time.sleep(SHORT_SLEEP)
+                        wait_for_overlay_to_settle(timeout=OVERLAY_TIMEOUT)
                         return
                 finally:
                     try:
@@ -772,7 +982,7 @@ def click_apply(driver):
 
         # 5) As a last resort: send END + Enter
         if try_press_enter_fallback():
-            wait_for_overlay_to_settle(timeout=6)
+            wait_for_overlay_to_settle(timeout=OVERLAY_TIMEOUT)
             return
 
         # 6) Not found -> capture artifacts and raise
@@ -800,12 +1010,12 @@ def confirm_popup(driver):
             btn.click()
         except Exception:
             driver.execute_script("arguments[0].click();", btn)
-        time.sleep(0.5)
+        time.sleep(SHORT_SLEEP)
         print("Confirmed popup")
     except Exception:
         print("No confirmation popup found (or click failed)")
 
-def wait_for_success_notice(timeout=12):
+def wait_for_success_notice(timeout=8 if FAST_MODE else 12):
     """
     Optional: Wait for a success toast/snackbar/alert.
     """
@@ -830,59 +1040,9 @@ def wait_for_success_notice(timeout=12):
 try:
     print("Using config_dir:", os.path.abspath(config_dir))
 
-    driver.get(url)
-    time.sleep(2)
     save_debug("login_page")
-
-    # Login
     try:
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Enter your username' or @name='username' or @id='username']"))
-        )
-        # username
-        try:
-            driver.find_element(By.XPATH, "//input[@placeholder='Enter your username']").send_keys(username)
-        except Exception:
-            try:
-                driver.find_element(By.XPATH, "//input[@name='username']").send_keys(username)
-            except Exception:
-                driver.find_element(By.XPATH, "//input[@id='username']").send_keys(username)
-
-        # password
-        try:
-            driver.find_element(By.XPATH, "//input[@placeholder='Enter your password']").send_keys(password)
-        except Exception:
-            try:
-                driver.find_element(By.XPATH, "//input[@name='password']").send_keys(password)
-            except Exception:
-                driver.find_element(By.XPATH, "//input[@id='password']").send_keys(password)
-
-        # click login
-        login_btn_xps = [
-            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'login')]",
-            "//input[@type='submit' and contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login')]",
-        ]
-        clicked = False
-        for xp in login_btn_xps:
-            try:
-                login_btn = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.XPATH, xp)))
-                try:
-                    login_btn.click()
-                except Exception:
-                    driver.execute_script("arguments[0].click();", login_btn)
-                clicked = True
-                break
-            except Exception:
-                continue
-        if not clicked:
-            try:
-                pwd = driver.find_element(By.XPATH, "//input[@type='password']")
-                pwd.send_keys("\n")
-            except Exception:
-                pass
-
-        time.sleep(3)
-        save_debug("after_login")
+        robust_login_flow()
     except Exception as e:
         save_debug("login_failed")
         print("Login failed:", e)
@@ -892,7 +1052,7 @@ try:
 
     # optional short wait for UI stabilization
     try:
-        WebDriverWait(driver, 12).until(
+        WebDriverWait(driver, 12 if not FAST_MODE else 6).until(
             EC.presence_of_element_located((By.XPATH, "//*[contains(@class,'main') or contains(@id,'app') or contains(@role,'main') or //div[@id='root']]"))
         )
     except Exception:
@@ -911,22 +1071,25 @@ try:
         try:
             save_debug(f"before_click_amf_{file}")
 
-            # Steps: Configure -> AMF tab -> click 'amf' entry -> upload file -> Persist -> Confirm -> Apply
+            # Steps: Configure -> AMF tab -> click 'amf' entry -> upload file -> Persist -> (confirm) -> [Apply if needed]
             click_nf_tab(driver, "AMF")
             click_nf_entry(driver, "amf")  # IMPORTANT: this reveals the Choose File control
 
             # Upload; function has robust waits
             upload_config_file(driver, file_path)
 
-            # Import/Persist and confirm native prompt immediately
+            # Import/Persist and inspect native confirm
             click_import(driver)
 
-            # Apply (scroll-aware & modal/iframe aware)
-            click_apply(driver)
+            # Apply only if Persist wasn't final
+            if not PERSIST_IS_FINAL:
+                click_apply(driver)
+                confirm_popup(driver)
+            else:
+                print("Skipping Apply due to final Persist confirmation.")
 
-            # Optional: acknowledge any inline confirmation and/or wait for success toast
-            confirm_popup(driver)
-            wait_for_success_notice(timeout=8)
+            # Optional success signal
+            wait_for_success_notice(timeout=8 if FAST_MODE else 12)
 
             save_debug(f"completed_amf_{file}")
             print(f"Upload completed for {file}")
