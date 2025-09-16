@@ -1,11 +1,52 @@
-stage('Run GUI Automation (headful)') {
-  steps {
-    wrap([$class: 'Xvfb', screen: '1920x1080x24']) {
-      sh '''
-        set -euxo pipefail
-        export HEADLESS=0
-        ./venv/bin/python scripts/gui_upload.py
-      '''
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    CONFIG_DIR = "./config_files"  // or absolute path
+    HEADLESS   = "1"               // set to "0" if you enable Xvfb and want to watch it
+    FAST_MODE  = "1"               // optional: shorter waits in the script
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Prepare venv (if needed)') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          python3 --version
+          if [ ! -x ./venv/bin/python ]; then
+            python3 -m venv venv
+            ./venv/bin/pip install -U pip
+            ./venv/bin/pip install -U selenium
+          fi
+          ./venv/bin/python -V
+        '''
+      }
+    }
+
+    stage('Run GUI Automation') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          ./venv/bin/python scripts/gui_upload.py
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'debug_screenshots/**/*.*', allowEmptyArchive: true
     }
   }
 }
