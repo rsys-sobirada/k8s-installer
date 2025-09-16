@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-# AMF-only upload automation: Configure -> AMF -> "amf" entry -> upload JSON -> Import/Persist -> Apply
+# AMF-only upload automation: Configure -> AMF -> "amf" entry -> upload JSON -> Persist -> Confirm -> Apply
 #
 # Usage:
 #   CONFIG_DIR=/path/to/configs HEADLESS=1 ./venv/bin/python scripts/gui_upload.py
 # Defaults:
 #   CONFIG_DIR = ./config_files
-#   HEADLESS = 1 (set to 0 to see the browser)
+#   HEADLESS   = 1  (set to 0 to see the browser)
 #
-# This version is scroll-aware, modal-aware, and saves extra debug artifacts.
+# This version:
+# - Explicitly handles native confirm after Persist (accepts it)
+# - Scroll-aware + modal/iframe-aware Apply
+# - Larger viewport in headless
+# - Broader Import/Persist detection
+# - Resilient screenshot & extra debug artifacts
 
 import os
 import time
@@ -27,16 +32,13 @@ from selenium.common.exceptions import (
 )
 
 # ---------------------- Config ----------------------
-url = "https://172.27.28.165.nip.io/ems/login"
+url = "https://172.27.28.193.nip.io/ems/login"
 username = "root"
 password = "root123"
 
 config_dir = os.environ.get("CONFIG_DIR", "config_files")
 debug_dir = "debug_screenshots"
 os.makedirs(debug_dir, exist_ok=True)
-
-# Only AMF for this run
-suffix_tab_map = {"_amf": "AMF"}
 
 # ---------------------- WebDriver setup ----------------------
 options = Options()
@@ -47,23 +49,69 @@ options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 options.accept_insecure_certs = True
 
+# Make Firefox auto-accept any unhandled prompt if one slips through
+try:
+    options.set_capability("unhandledPromptBehavior", "accept")
+except Exception:
+    pass
+
 driver = webdriver.Firefox(options=options)
 
 # Make the headless viewport tall so bottom bars/footers are visible
 try:
-    # You can alternatively use options.add_argument("--width=1500"); options.add_argument("--height=2200")
     driver.set_window_size(1500, 2200)
 except Exception:
     pass
 
 # ---------------------- Debug helpers ----------------------
+def handle_native_alerts(timeout=8, accept=True):
+    """
+    Wait for window.alert/confirm/prompt and accept/dismiss it.
+    Returns True if a prompt was handled, False otherwise.
+    """
+    try:
+        WebDriverWait(driver, timeout).until(EC.alert_is_present())
+        alert = driver.switch_to.alert
+        try:
+            print("Native alert text:", alert.text)
+        except Exception:
+            pass
+        if accept:
+            alert.accept()
+            print("Native alert accepted")
+        else:
+            alert.dismiss()
+            print("Native alert dismissed")
+        time.sleep(0.4)
+        return True
+    except TimeoutException:
+        return False
+    except Exception as e:
+        print("Error while handling native alert:", e)
+        return False
+
 def save_debug(name):
+    # Try to handle a blocking prompt first, then take a screenshot
+    try:
+        # Quick sweep: accept any prompt that might be blocking
+        handle_native_alerts(timeout=1, accept=True)
+    except Exception:
+        pass
+
     path = os.path.join(debug_dir, f"{int(time.time())}_{name}.png")
     try:
         driver.save_screenshot(path)
         print(f"Saved screenshot: {path}")
     except Exception as e:
         print(f"Failed to save screenshot {path}: {e}")
+        # One more chance after clearing a prompt
+        if handle_native_alerts(timeout=2, accept=True):
+            time.sleep(0.2)
+            try:
+                driver.save_screenshot(path)
+                print(f"Saved screenshot (retry): {path}")
+            except Exception as e2:
+                print(f"Retry failed to save screenshot {path}: {e2}")
 
 def _save_page_source(name):
     path = os.path.join(debug_dir, f"{int(time.time())}_{name}.html")
@@ -267,22 +315,6 @@ def click_nf_entry(driver, entry_text):
         print(f"Error clicking NF entry '{entry_text}': {e}")
         raise
 
-def click_add_button(driver):
-    """Click a generic 'Add' button (kept for safety though not needed in AMF path)."""
-    try:
-        xp = "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add')]"
-        btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.XPATH, xp)))
-        try:
-            btn.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", btn)
-        time.sleep(0.6)
-        print("Clicked Add button")
-    except Exception as e:
-        _save_page_source("add_button_not_found")
-        print("Add button not found:", e)
-        raise
-
 # ---------------------- Upload helpers ----------------------
 def upload_config_file(driver, file_path):
     """
@@ -432,6 +464,7 @@ def click_import(driver):
     """
     Broadened import/persist detection: looks for buttons like
     'Persist Configurations', 'Persist', 'Import', 'Save configuration', 'Save', 'Upload'.
+    Also explicitly accepts the native confirm that appears after clicking Persist.
     """
     try:
         print("Looking for 'Persist Configurations' / Import button...")
@@ -448,6 +481,11 @@ def click_import(driver):
                 except Exception:
                     driver.execute_script("arguments[0].click();", btn)
                 print(f"Clicked import-like button: '{t}'")
+
+                # NEW: if a native confirm pops up right after Persist, accept it.
+                if handle_native_alerts(timeout=8, accept=True):
+                    print("Confirmed 'Persist Configurations' native dialog")
+
                 return
             except Exception:
                 continue
@@ -491,6 +529,7 @@ def scroll_all_scrollables_to_bottom():
                     continue
         except Exception:
             continue
+
 def _find_modal_roots():
     """
     Return a list of likely modal/dialog root elements.
@@ -625,13 +664,16 @@ def wait_for_overlay_to_settle(timeout=12):
 def click_apply(driver):
     """
     Scroll-aware and modal-aware Apply:
-    - enlarge viewport (done at driver init)
+    - handle leftover native prompt (if any)
     - scroll page + scrollable containers to bottom
     - search for Apply/Confirm in action bars/footers or anywhere
     - if not found, try modal/iframe contexts
     - final fallback: press Enter on active element
     """
     try:
+        # If a native confirm is still open, accept it first
+        handle_native_alerts(timeout=2, accept=True)
+
         # Capture state and let UI settle a bit
         save_debug("after_persist_clicked")
         wait_for_overlay_to_settle(timeout=6)
@@ -763,6 +805,27 @@ def confirm_popup(driver):
     except Exception:
         print("No confirmation popup found (or click failed)")
 
+def wait_for_success_notice(timeout=12):
+    """
+    Optional: Wait for a success toast/snackbar/alert.
+    """
+    patterns = ["successfully", "applied", "persisted", "saved", "completed"]
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            nodes = driver.find_elements(By.XPATH, "//*[contains(@class,'toast') or contains(@class,'snackbar') or contains(@class,'alert') or contains(@class,'message')]")
+            for n in nodes:
+                if not n.is_displayed():
+                    continue
+                text = (n.text or "").lower()
+                if any(p in text for p in patterns):
+                    print("Success notice:", text)
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
 # ---------------------- Main flow ----------------------
 try:
     print("Using config_dir:", os.path.abspath(config_dir))
@@ -848,17 +911,22 @@ try:
         try:
             save_debug(f"before_click_amf_{file}")
 
-            # Steps: Configure -> AMF tab -> click 'amf' entry -> upload file -> Import/Apply/Confirm
+            # Steps: Configure -> AMF tab -> click 'amf' entry -> upload file -> Persist -> Confirm -> Apply
             click_nf_tab(driver, "AMF")
             click_nf_entry(driver, "amf")  # IMPORTANT: this reveals the Choose File control
 
             # Upload; function has robust waits
             upload_config_file(driver, file_path)
 
-            # Import/Persist and Apply
+            # Import/Persist and confirm native prompt immediately
             click_import(driver)
+
+            # Apply (scroll-aware & modal/iframe aware)
             click_apply(driver)
+
+            # Optional: acknowledge any inline confirmation and/or wait for success toast
             confirm_popup(driver)
+            wait_for_success_notice(timeout=8)
 
             save_debug(f"completed_amf_{file}")
             print(f"Upload completed for {file}")
