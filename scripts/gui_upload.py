@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
-# scripts/gui_upload.py
-# AMF-only upload automation: Configure -> AMF -> amf entry -> upload JSON
+# AMF-only upload automation: Configure -> AMF -> "amf" entry -> upload JSON -> Import/Persist -> Apply
 #
 # Usage:
-#   CONFIG_DIR=/path/to/configs ./venv/bin/python scripts/gui_upload.py
-# Defaults to ./config_files if CONFIG_DIR not set.
+#   CONFIG_DIR=/path/to/configs HEADLESS=1 ./venv/bin/python scripts/gui_upload.py
+# Defaults:
+#   CONFIG_DIR = ./config_files
+#   HEADLESS = 1 (set to 0 to see the browser)
+#
+# This version is scroll-aware, modal-aware, and saves extra debug artifacts.
+
+import os
+import time
+import traceback
 
 from selenium import webdriver
-from selenium.common.exceptions import UnexpectedAlertPresentException, NoAlertPresentException
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import time, os, traceback
-from selenium.common.exceptions import TimeoutException
 
-# -------- Config ----------
+from selenium.common.exceptions import (
+    TimeoutException,
+    UnexpectedAlertPresentException,
+    NoAlertPresentException,
+)
+
+# ---------------------- Config ----------------------
 url = "https://172.27.28.193.nip.io/ems/login"
 username = "root"
 password = "root123"
@@ -27,16 +38,25 @@ os.makedirs(debug_dir, exist_ok=True)
 # Only AMF for this run
 suffix_tab_map = {"_amf": "AMF"}
 
-# -------- WebDriver setup ----------
+# ---------------------- WebDriver setup ----------------------
 options = Options()
-options.add_argument("--headless")
+headless = os.environ.get("HEADLESS", "1")
+if headless != "0":
+    options.add_argument("--headless")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 options.accept_insecure_certs = True
 
 driver = webdriver.Firefox(options=options)
 
-# -------- Debug helpers ----------
+# Make the headless viewport tall so bottom bars/footers are visible
+try:
+    # You can alternatively use options.add_argument("--width=1500"); options.add_argument("--height=2200")
+    driver.set_window_size(1500, 2200)
+except Exception:
+    pass
+
+# ---------------------- Debug helpers ----------------------
 def save_debug(name):
     path = os.path.join(debug_dir, f"{int(time.time())}_{name}.png")
     try:
@@ -54,10 +74,10 @@ def _save_page_source(name):
     except Exception as e:
         print(f"Failed to save page source {path}: {e}")
 
-# -------- Robust finder (text/attributes/iframes) ----------
+# ---------------------- Element finder ----------------------
 def find_element_by_text_any(tag_text, timeout=6):
     """
-    Find an element containing tag_text (case-insensitive) using several strategies.
+    Find an element containing tag_text (case-insensitive) using multiple strategies.
     Raises Exception if not found and saves page source for debugging.
     """
     lower_text = tag_text.lower()
@@ -66,7 +86,7 @@ def find_element_by_text_any(tag_text, timeout=6):
         f"//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{lower_text}')]",
     ]
 
-    # 1) try quick XPath attempts
+    # 1) quick XPath attempts
     for xp in xpaths:
         try:
             elem = WebDriverWait(driver, timeout).until(
@@ -119,44 +139,44 @@ def find_element_by_text_any(tag_text, timeout=6):
         iframes = driver.find_elements(By.TAG_NAME, "iframe")
         if iframes:
             print(f"Found {len(iframes)} iframe(s); scanning them for '{tag_text}'")
-        for idx, fr in enumerate(iframes):
-            try:
-                driver.switch_to.frame(fr)
-                for xp in xpaths:
-                    try:
-                        elem = WebDriverWait(driver, 1).until(
-                            EC.presence_of_element_located((By.XPATH, xp))
-                        )
-                        driver.switch_to.default_content()
-                        return elem
-                    except Exception:
-                        pass
-                inner_els = driver.find_elements(By.XPATH, "//*")
-                for e in inner_els:
-                    try:
-                        for a in attrs:
-                            val = e.get_attribute(a)
-                            if val and lower_text in val.lower():
-                                driver.switch_to.default_content()
-                                print(f"Found in iframe[{idx}] by attribute {a}='{val[:80]}'")
-                                return e
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-            finally:
+            for idx, fr in enumerate(iframes):
                 try:
-                    driver.switch_to.default_content()
+                    driver.switch_to.frame(fr)
+                    for xp in xpaths:
+                        try:
+                            elem = WebDriverWait(driver, 1).until(
+                                EC.presence_of_element_located((By.XPATH, xp))
+                            )
+                            driver.switch_to.default_content()
+                            return elem
+                        except Exception:
+                            pass
+                    inner_els = driver.find_elements(By.XPATH, "//*")
+                    for e in inner_els:
+                        try:
+                            for a in attrs:
+                                val = e.get_attribute(a)
+                                if val and lower_text in val.lower():
+                                    driver.switch_to.default_content()
+                                    print(f"Found in iframe[{idx}] by attribute {a}='{val[:80]}'")
+                                    return e
+                        except Exception:
+                            continue
                 except Exception:
                     pass
+                finally:
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
     except Exception:
         pass
 
-    # not found: save page source and raise
+    # not found: save and raise
     _save_page_source(f"no_elem_{tag_text}")
     raise Exception(f"Element containing text '{tag_text}' not found using candidate strategies.")
 
-# -------- Click helpers ----------
+# ---------------------- Click helpers ----------------------
 def click_element_via_js(elem):
     driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", elem)
     driver.execute_script("arguments[0].click();", elem)
@@ -183,7 +203,6 @@ def open_configure_menu():
             return
         except Exception:
             continue
-
     # fallback: find by visible text
     try:
         el = find_element_by_text_any("Configure", timeout=3)
@@ -249,7 +268,7 @@ def click_nf_entry(driver, entry_text):
         raise
 
 def click_add_button(driver):
-    """Click a generic 'Add' button (keeps for safety though not needed in amf path)."""
+    """Click a generic 'Add' button (kept for safety though not needed in AMF path)."""
     try:
         xp = "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add')]"
         btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.XPATH, xp)))
@@ -264,15 +283,15 @@ def click_add_button(driver):
         print("Add button not found:", e)
         raise
 
-# -------- Robust upload function ----------
+# ---------------------- Upload helpers ----------------------
 def upload_config_file(driver, file_path):
     """
     Robust upload:
-      - waits for input[type=file] with extended timeout
-      - tries multiple selectors
-      - clicks 'Choose/Browse' triggers and searches in iframes
-      - unhides input if necessary
-      - injects a temporary input as last resort
+    - waits for input[type=file] with extended timeout
+    - tries multiple selectors
+    - clicks 'Choose/Browse/Select' triggers and searches in iframes
+    - unhides input if necessary
+    - injects a temporary input as last resort
     """
     print(f"Attempting to upload file: {file_path}")
     selectors = [
@@ -282,11 +301,9 @@ def upload_config_file(driver, file_path):
         "//input[contains(@name,'file') and @type='file']",
         "//input[contains(@data-test,'file') and @type='file']",
     ]
-
-    # give UI some time to render
     time.sleep(0.6)
 
-    # 1) try with a larger wait (race conditions)
+    # 1) try with a larger wait
     for sel in selectors:
         try:
             file_input = WebDriverWait(driver, 12).until(
@@ -340,7 +357,9 @@ def upload_config_file(driver, file_path):
                 driver.execute_script("arguments[0].click();", btn)
             time.sleep(0.6)
             try:
-                file_input = WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.XPATH, "//input[@type='file']")))
+                file_input = WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
+                )
                 driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible';", file_input)
                 file_input.send_keys(file_path)
                 print("Sent file path after clicking choose/browse")
@@ -404,77 +423,320 @@ def upload_config_file(driver, file_path):
     except Exception as e:
         print("Failed to inject/use temporary input:", e)
 
-    # nothing worked — save artifacts and raise
     _save_page_source("file_input_error")
     save_debug("file_input_error")
     raise Exception("Could not locate file input element to upload the config file.")
 
-# -------- Import / Apply / Confirm ----------
+# ---------------------- Import / Apply helpers ----------------------
 def click_import(driver):
+    """
+    Broadened import/persist detection: looks for buttons like
+    'Persist Configurations', 'Persist', 'Import', 'Save configuration', 'Save', 'Upload'.
+    """
     try:
-        print("Looking for 'Persist Configurations' button...")
-        btn = WebDriverWait(driver, 12).until(
-            EC.element_to_be_clickable((
-                By.XPATH,
-                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'persist configurations')]"
-            ))
-        )
-        btn.click()
-        print("Clicked 'Persist Configurations' button successfully")
+        print("Looking for 'Persist Configurations' / Import button...")
+        texts = ["persist configurations", "persist", "import", "upload", "save configuration", "save"]
+        for t in texts:
+            try:
+                btn = WebDriverWait(driver, 12).until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '%s')]" % t)
+                    )
+                )
+                try:
+                    btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", btn)
+                print(f"Clicked import-like button: '{t}'")
+                return
+            except Exception:
+                continue
+        raise Exception("No import/persist/upload button found")
     except Exception as e:
-        print(f"Error clicking 'Persist Configurations': {e}")
+        print(f"Error clicking import/persist: {e}")
         driver.save_screenshot(f"debug_screenshots/{int(time.time())}_error_persist_config.png")
         raise
 
+# ---- Scroll & modal aware Apply support ----
+def scroll_page(step_ratio=0.85, attempts=6, direction="down"):
+    """Progressively scroll the main window."""
+    dy = "Math.floor(window.innerHeight*arguments[0])"
+    for _ in range(attempts):
+        if direction == "down":
+            driver.execute_script(f"window.scrollBy(0, {dy});", step_ratio)
+        else:
+            driver.execute_script(f"window.scrollBy(0, -{dy});", step_ratio)
+        time.sleep(0.2)
 
+def scroll_all_scrollables_to_bottom():
+    """
+    Find likely scrollable containers (overflow panels, side panes, content areas)
+    and scroll them to bottom.
+    """
+    xps = [
+        "//*[contains(@class,'scroll') or contains(@class,'content') or contains(@class,'container') or contains(@class,'panel') or contains(@style,'overflow')]",
+    ]
+    for xp in xps:
+        try:
+            els = driver.find_elements(By.XPATH, xp)
+            for el in els:
+                try:
+                    is_scrollable = driver.execute_script(
+                        "return arguments[0].scrollHeight > arguments[0].clientHeight;", el
+                    )
+                    if is_scrollable and el.is_displayed():
+                        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", el)
+                        time.sleep(0.1)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+def _find_modal_roots():
+    """
+    Return a list of likely modal/dialog root elements.
+    """
+    modal_xps = [
+        "//*[@role='dialog']",
+        "//*[contains(@class,'modal') or contains(@class,'dialog')]",
+        "//*[contains(@class,'cdk-overlay-pane')]",
+        "//*[contains(@class,'MuiDialog-root')]",
+        "//*[contains(@class,'ant-modal') or contains(@class,'ant-modal-root')]",
+        "//*[contains(@class,'p-dialog') or contains(@class,'p-dialog-content')]",
+    ]
+    roots = []
+    for xp in modal_xps:
+        try:
+            roots.extend(driver.find_elements(By.XPATH, xp))
+        except Exception:
+            continue
+    return [r for r in roots if r.is_displayed()]
 
+def _click_in(el):
+    try:
+        el.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
+
+def _find_clickable_in_context(root, xpath, timeout=6):
+    """Wait up to timeout seconds for a descendant matching xpath to be visible."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            el = root.find_element(By.XPATH, xpath)
+            if el.is_displayed():
+                return el
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return None
+
+def find_apply_like_button(context=None, timeout=6):
+    """
+    Search for Apply-like buttons in common action bars/footers first, then anywhere in the context.
+    Returns the WebElement or None.
+    """
+    root = context if context is not None else driver
+    btn_texts = ["apply", "apply changes", "confirm", "proceed", "ok", "yes", "submit", "update", "save", "continue"]
+
+    # Prefer action bars/footers/button-bars
+    footer_xps = [
+        ".//*[contains(@class,'action') or contains(@class,'footer') or contains(@class,'button-bar') or contains(@class,'btn-toolbar')]" if context is not None
+        else "//*[contains(@class,'action') or contains(@class,'footer') or contains(@class,'button-bar') or contains(@class,'btn-toolbar')]"
+    ]
+    try:
+        footers = []
+        for xp in footer_xps:
+            try:
+                footers.extend(root.find_elements(By.XPATH, xp))
+            except Exception:
+                continue
+        footers = [f for f in footers if f.is_displayed()]
+        for ftr in footers:
+            for t in btn_texts:
+                btn = _find_clickable_in_context(
+                    ftr,
+                    ".//*[self::button or self::a or self::span or self::div]"
+                    "[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '%s')]" % t,
+                    timeout=2
+                )
+                if btn:
+                    return btn
+    except Exception:
+        pass
+
+    # Fallback: search anywhere in the root
+    for t in btn_texts:
+        try:
+            btn = WebDriverWait(driver if context is None else driver, timeout).until(
+                EC.element_to_be_clickable((
+                    By.XPATH,
+                    ("//*[self::button or self::a or self::span or self::div]"
+                     "[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '%s')]" % t)
+                ))
+            )
+            return btn
+        except Exception:
+            continue
+    return None
+
+def try_press_enter_fallback():
+    try:
+        driver.switch_to.active_element.send_keys(Keys.END)
+        time.sleep(0.2)
+        driver.switch_to.active_element.send_keys("\n")
+        print("Sent END + Enter as fallback")
+        time.sleep(0.5)
+        return True
+    except Exception:
+        return False
+
+def wait_for_overlay_to_settle(timeout=12):
+    """
+    Wait for common UI overlays/spinners/toasts to disappear so buttons are clickable.
+    Non-fatal if nothing is found.
+    """
+    overlay_xps = [
+        "//*[contains(@class,'overlay') and contains(@class,'backdrop')]",
+        "//*[contains(@class,'modal-backdrop')]",
+        "//*[contains(@class,'cdk-overlay-backdrop')]",
+        "//*[contains(@class,'MuiBackdrop-root')]",
+        "//*[contains(@class,'ant-modal-wrap') and contains(@style,'display: none')=false]",
+        "//*[contains(@class,'p-dialog-mask') and contains(@style,'display: none')=false]",
+        "//*[contains(@class,'spinner') or contains(@class,'progress') or contains(@class,'loading')]",
+    ]
+    try:
+        end = time.time() + timeout
+        while time.time() < end:
+            visible = False
+            for xp in overlay_xps:
+                try:
+                    els = driver.find_elements(By.XPATH, xp)
+                    if any(e.is_displayed() for e in els):
+                        visible = True
+                        break
+                except Exception:
+                    continue
+            if not visible:
+                return
+            time.sleep(0.4)
+    except Exception:
+        pass
 
 def click_apply(driver):
-    btn = None  # Ensure btn is initialized
+    """
+    Scroll-aware and modal-aware Apply:
+    - enlarge viewport (done at driver init)
+    - scroll page + scrollable containers to bottom
+    - search for Apply/Confirm in action bars/footers or anywhere
+    - if not found, try modal/iframe contexts
+    - final fallback: press Enter on active element
+    """
     try:
-        try:
-            btn = WebDriverWait(driver, 12).until(
-                EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
-            )
-        except UnexpectedAlertPresentException:
-            print("Alert appeared during Apply button wait.")
-            try:
-                WebDriverWait(driver, 3).until(EC.alert_is_present())
-                alert = driver.switch_to.alert
-                print("Alert text:", alert.text)
-                alert.accept()
-                print("Alert accepted.")
-                time.sleep(1)
-                btn = WebDriverWait(driver, 12).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'apply')]"))
-                )
-            except TimeoutException:
-                print("No alert present when trying to handle it.")
-            except Exception as e:
-                print("Failed to handle alert:", e)
-                raise
+        # Capture state and let UI settle a bit
+        save_debug("after_persist_clicked")
+        wait_for_overlay_to_settle(timeout=6)
+        time.sleep(0.3)
 
+        # 1) Scroll the page and scrollable containers; many UIs place Apply in a sticky footer.
+        scroll_page(step_ratio=1.0, attempts=2, direction="down")
+        scroll_all_scrollables_to_bottom()
+        time.sleep(0.2)
+
+        # 2) Try to find & click Apply-like button in the page first
+        btn = find_apply_like_button(timeout=6)
         if btn:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            time.sleep(0.2)
             try:
                 btn.click()
             except Exception:
                 driver.execute_script("arguments[0].click();", btn)
+            print("Clicked Apply/Confirm in page body after scrolling")
             time.sleep(0.6)
-            print("Clicked Apply")
+            wait_for_overlay_to_settle(timeout=6)
+            return
 
-            # Post-Apply alert handling
+        # 3) Look for Apply-like button inside modals/dialogs if present
+        modals = _find_modal_roots()
+        for m in modals:
+            # If the modal requires acknowledgements, tick obvious checkboxes
             try:
-                WebDriverWait(driver, 3).until(EC.alert_is_present())
-                alert = driver.switch_to.alert
-                print("Post-Apply Alert text:", alert.text)
-                alert.accept()
-                print("Post-Apply Alert accepted")
-            except TimeoutException:
-                print("No alert present after Apply")
-            except Exception as e:
-                print("Error handling post-Apply alert:", e)
-        else:
-            raise Exception("Apply button not found and could not be clicked.")
+                for lbl in ["i understand", "acknowledge", "i agree", "confirm", "overwrite", "force", "accept", "proceed"]:
+                    try:
+                        lab = m.find_element(
+                            By.XPATH,
+                            ".//label[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '%s')]" % lbl
+                        )
+                        # click nearest checkbox in modal
+                        cbs = m.find_elements(By.XPATH, ".//input[@type='checkbox']")
+                        for cb in cbs:
+                            try:
+                                if not cb.is_selected() and cb.is_displayed():
+                                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cb)
+                                    time.sleep(0.1)
+                                    try:
+                                        cb.click()
+                                    except Exception:
+                                        driver.execute_script("arguments[0].click();", cb)
+                                    time.sleep(0.2)
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Now try buttons inside the modal
+            btn = find_apply_like_button(context=m, timeout=5)
+            if btn:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                time.sleep(0.2)
+                try:
+                    btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", btn)
+                print("Clicked Apply/Confirm inside modal")
+                time.sleep(0.6)
+                wait_for_overlay_to_settle(timeout=6)
+                return
+
+        # 4) If dialog is inside an iframe, search there
+        try:
+            iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            for idx, fr in enumerate(iframes):
+                try:
+                    driver.switch_to.frame(fr)
+                    btn = find_apply_like_button(timeout=4)
+                    if btn:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                        time.sleep(0.2)
+                        try:
+                            btn.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", btn)
+                        print(f"Clicked Apply/Confirm inside iframe[{idx}]")
+                        driver.switch_to.default_content()
+                        time.sleep(0.6)
+                        wait_for_overlay_to_settle(timeout=6)
+                        return
+                finally:
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 5) As a last resort: send END + Enter
+        if try_press_enter_fallback():
+            wait_for_overlay_to_settle(timeout=6)
+            return
+
+        # 6) Not found -> capture artifacts and raise
+        _save_page_source("apply_button_error")
+        save_debug("apply_button_error")
+        raise Exception("Apply/Confirm button not found after scrolling page/containers, modal, and iframe search.")
 
     except Exception as e:
         _save_page_source("apply_button_error")
@@ -482,12 +744,15 @@ def click_apply(driver):
         print("Error clicking Apply:", e)
         raise
 
-
-
 def confirm_popup(driver):
+    """
+    Optional: if an 'OK/Yes' inline confirmation appears after Apply.
+    """
     try:
         btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'ok') or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'yes')]"))
+            EC.element_to_be_clickable(
+                (By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'ok') or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'yes')]")
+            )
         )
         try:
             btn.click()
@@ -498,9 +763,10 @@ def confirm_popup(driver):
     except Exception:
         print("No confirmation popup found (or click failed)")
 
-# -------- Main flow ----------
+# ---------------------- Main flow ----------------------
 try:
     print("Using config_dir:", os.path.abspath(config_dir))
+
     driver.get(url)
     time.sleep(2)
     save_debug("login_page")
@@ -518,6 +784,7 @@ try:
                 driver.find_element(By.XPATH, "//input[@name='username']").send_keys(username)
             except Exception:
                 driver.find_element(By.XPATH, "//input[@id='username']").send_keys(username)
+
         # password
         try:
             driver.find_element(By.XPATH, "//input[@placeholder='Enter your password']").send_keys(password)
@@ -530,7 +797,7 @@ try:
         # click login
         login_btn_xps = [
             "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'login')]",
-            "//input[@type='submit' and contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login')]"
+            "//input[@type='submit' and contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login')]",
         ]
         clicked = False
         for xp in login_btn_xps:
@@ -568,28 +835,31 @@ try:
     except Exception:
         pass
 
-    # scan for AMF files and process
+    # Scan for AMF files and process
     print("Scanning config_dir for AMF files...")
     for file in os.listdir(config_dir):
         print(f"Found file: {file}")
         if not file.lower().endswith("_amf.json"):
             print(f"Skipping (not AMF): {file}")
             continue
-
         file_path = os.path.abspath(os.path.join(config_dir, file))
         print(f"Processing AMF file: {file_path}")
 
         try:
             save_debug(f"before_click_amf_{file}")
-            # Steps: configure -> AMF tab -> click 'amf' entry -> upload file -> import/apply/confirm
+
+            # Steps: Configure -> AMF tab -> click 'amf' entry -> upload file -> Import/Apply/Confirm
             click_nf_tab(driver, "AMF")
-            # IMPORTANT: click the 'amf' list item (lowercase in UI) to reveal Choose File control
-            click_nf_entry(driver, "amf")
-            # now upload; upload function has robust waits
+            click_nf_entry(driver, "amf")  # IMPORTANT: this reveals the Choose File control
+
+            # Upload; function has robust waits
             upload_config_file(driver, file_path)
+
+            # Import/Persist and Apply
             click_import(driver)
             click_apply(driver)
             confirm_popup(driver)
+
             save_debug(f"completed_amf_{file}")
             print(f"Upload completed for {file}")
         except Exception as e:
@@ -599,6 +869,7 @@ try:
             continue
 
     print("AMF-only run finished.")
+
 finally:
     try:
         driver.quit()
