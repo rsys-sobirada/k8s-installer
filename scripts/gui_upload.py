@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """
-gui_upload.py - Robust AMF config uploader with strong click/fallback logic.
+gui_upload.py - Use original Configure click logic + robust AMF selection.
 
 Flow:
-  1. Login
-  2. Configure (robust click)
-  3. AMF (click top category then robust left 'amf' entry)
-  4. Choose File (upload _amf.json)
-  5. Import / Persist
-  6. Scroll & Apply
-  7. Ok / confirmation
-  8. Repeat for files in config_files
-
-Saves debug screenshots / HTML into debug_screenshots/ for Jenkins archival.
-Set HEADLESS=0 environment variable to run with browser visible (recommended for initial debug).
+ - Login
+ - open_configure_menu()  <- uses conservative original logic to click Configure
+ - click_nf_tab("AMF")    <- clicks the AMF category
+ - ensure_select_amf()    <- robust left-panel 'amf' click (many fallbacks)
+ - Choose file -> Import -> scroll -> Apply -> Ok
+Saves debug screenshots and HTML under debug_screenshots/
 """
 
 import os
@@ -27,7 +22,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException
 
 # ---------------- CONFIG ----------------
 URL = os.environ.get("EMS_URL", "https://172.27.28.193.nip.io/ems/login")
@@ -37,7 +32,7 @@ CONFIG_DIR = os.environ.get("CONFIG_DIR", "config_files")
 DEBUG_DIR = os.environ.get("DEBUG_DIR", "debug_screenshots")
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
-HEADLESS = os.environ.get("HEADLESS", "1") != "0"   # set HEADLESS=0 to see browser
+HEADLESS = os.environ.get("HEADLESS", "1") != "0"
 FAST_MODE = os.environ.get("FAST_MODE", "0") == "1"
 
 SHORT_SLEEP = 0.2 if FAST_MODE else 0.6
@@ -90,7 +85,7 @@ class StepCapture:
 
 step = StepCapture(DEBUG_DIR)
 
-# ---------------- small utilities ----------------
+# ---------------- Utilities ----------------
 def wait_document_ready(timeout=20):
     end = time.time() + timeout
     while time.time() < end:
@@ -156,133 +151,116 @@ def wait_for_no_overlay(wait=12):
         time.sleep(0.25)
     return False
 
-# ---------------- robust click helpers ----------------
-def click_element_by_text(text, timeout=12):
+# ---------------- Original-style Configure click (restored) ----------------
+def open_configure_menu():
     """
-    Try to click an element that contains the given text (case-insensitive).
-    Returns the clicked element or raises.
+    Conservative logic to click the 'Configure' navigation item.
+    Mirrors original script's multi-xpath approach and JS fallback.
     """
-    t = text.lower()
-    xpaths = [
-        f"//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{t}')]",
-        f"//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{t}')]",
-        f"//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{t}')]",
+    step.snap("S_BEFORE_click_configure", html=True)
+    wait_for_no_overlay(wait=8)
+
+    candidate_xps = [
+        "//nav//a//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'configure')]",
+        "//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'configure')]",
+        "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'configure')]",
+        "//*[@aria-label and contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'configure')]",
+        "//*[@title and contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'configure')]",
     ]
-    last_exc = None
-    for xp in xpaths:
+
+    last_err = None
+    for xp in candidate_xps:
         try:
-            el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, xp)))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'nearest'});", el)
-            time.sleep(SHORT_SLEEP)
+            elems = driver.find_elements(By.XPATH, xp)
+            elem = _first_visible(elems)
+            if not elem:
+                continue
+            try:
+                elem.click()
+            except Exception:
+                try:
+                    driver.execute_script("arguments[0].click();", elem)
+                except Exception as js_e:
+                    last_err = js_e
+            time.sleep(MED_SLEEP)
+            step.snap("S_CLICKED_configure", html=True)
+            # verify Configure panel open by checking presence of left menu or AMF entry
+            # wait a short while for panel to render
+            time.sleep(0.6)
+            return True
+        except Exception as e:
+            last_err = e
+            continue
+
+    # fallback: try to find configure text anywhere and click first visible
+    try:
+        el = _first_visible(driver.find_elements(By.XPATH, "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'configure')]"))
+        if el:
             try:
                 el.click()
             except Exception:
                 driver.execute_script("arguments[0].click();", el)
-            time.sleep(SHORT_SLEEP)
-            step.snap(f"S_CLICKED_{text}", html=True)
-            return el
-        except Exception as e:
-            last_exc = e
-            continue
-    raise Exception(f"click_element_by_text: could not click element by text '{text}'; last: {last_exc}")
-
-def robust_click_target(element):
-    """Try multiple click strategies on a WebElement."""
-    try:
-        element.click()
-        return True
-    except Exception:
-        pass
-    try:
-        ActionChains(driver).move_to_element(element).click(element).perform()
-        return True
-    except Exception:
-        pass
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'nearest'});", element)
-        driver.execute_script("arguments[0].click();", element)
-        return True
-    except Exception:
-        pass
-    return False
-
-# ---------------- ensure Configure clicked ----------------
-def ensure_click_configure():
-    """
-    Robustly click the 'Configure' navigation item.
-    Tries text click, aria/title, and falls back to candidate search.
-    """
-    step.snap("S_BEFORE_click_configure", html=True)
-    wait_for_no_overlay(wait=8)
-    # 1) try direct text
-    try:
-        click_element_by_text("configure", timeout=8)
-        step.snap("S_AFTER_click_configure", html=True)
-        return True
-    except Exception as e:
-        print("Direct click 'Configure' failed:", e)
-
-    # 2) try known nav selectors (aria-label/title)
-    try:
-        xps = [
-            "//*[contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'configure')]",
-            "//*[contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'configure')]",
-            "//nav//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'configure')]"
-        ]
-        for xp in xps:
-            try:
-                el = driver.find_element(By.XPATH, xp)
-                if el and el.is_displayed():
-                    if robust_click_target(el):
-                        step.snap("S_AFTER_click_configure_alt", html=True)
-                        return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # 3) candidate search: find visible elements that likely represent the left nav,
-    #    then click the one that contains 'configure' text inside them.
-    try:
-        candidates = driver.find_elements(By.XPATH, "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'configure')]")
-        for c in candidates:
-            try:
-                if not c.is_displayed():
-                    continue
-                if robust_click_target(c):
-                    step.snap("S_AFTER_click_configure_fuzzy", html=True)
-                    return True
-            except Exception:
-                continue
+            time.sleep(MED_SLEEP)
+            step.snap("S_CLICKED_configure_fallback", html=True)
+            return True
     except Exception:
         pass
 
     step.snap("S_ERR_click_configure", html=True)
-    raise Exception("ensure_click_configure: unable to click 'Configure'")
+    raise Exception(f"open_configure_menu: unable to click Configure (last_err={last_err})")
 
-# ---------------- ensure click AMF (category & left entry) ----------------
+# ---------------- Click NF tab (original-style) ----------------
+def click_nf_tab(nf_name):
+    """
+    Click the NF category tab (AMF/SMF/etc) using text match (original logic restored).
+    """
+    step.snap(f"S_BEFORE_click_nf_{nf_name}", html=True)
+    wait_for_no_overlay(wait=8)
+    t = nf_name.lower()
+    xpaths = [
+        f"//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{t}')]",
+        f"//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{t}')]",
+        f"//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{t}')]"
+    ]
+    last_err = None
+    for xp in xpaths:
+        try:
+            elems = driver.find_elements(By.XPATH, xp)
+            elem = _first_visible(elems)
+            if elem:
+                try:
+                    elem.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", elem)
+                time.sleep(SHORT_SLEEP)
+                step.snap(f"S_AFTER_click_nf_{nf_name}", html=True)
+                return elem
+        except Exception as e:
+            last_err = e
+            continue
+    step.snap("S_ERR_click_nf_tab", html=True)
+    raise Exception(f"click_nf_tab: could not click NF '{nf_name}'; last_err={last_err}")
+
+# ---------------- Robust left-panel AMF selection ----------------
 def ensure_select_amf():
     """
-    Ensure 'AMF' category and left 'amf' entry are selected.
-    We:
-      - try clicking AMF category (top/main)
-      - then robustly search for left panel entry labeled 'amf' and click it using many strategies
-      - dump candidate outerHTML to debug file for troubleshooting if cannot find
+    Robustly select the left-panel 'amf' entry after Configure -> AMF category.
+    Dumps candidates and tries many click strategies.
     """
     step.snap("S_BEFORE_select_amf", html=True)
-    wait_for_no_overlay(wait=8)
-    # attempt category click (main area)
-    try:
-        click_element_by_text("amf", timeout=6)
-        time.sleep(SHORT_SLEEP)
-        step.snap("S_AFTER_click_amf_category", html=True)
-    except Exception:
-        # not fatal — proceed to robust left-panel selection
-        print("Top AMF category click didn't work or not sufficient; continuing to left-panel selection.")
+    wait_for_no_overlay(wait=10)
+    time.sleep(SHORT_SLEEP)
 
-    # now robust left-side entry
-    # gather candidates
-    patterns = [
+    # Try clicking top/main AMF category first (non-fatal)
+    try:
+        click_nf_tab("AMF")
+        time.sleep(SHORT_SLEEP)
+    except Exception:
+        # will continue to robust left-panel logic
+        pass
+
+    # Collect candidate elements containing 'amf'
+    xpath_patterns = [
         "//*[translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='amf']",
         "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),' amf ')]",
         "//nav//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]",
@@ -290,25 +268,26 @@ def ensure_select_amf():
         "//*[@title and contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]",
         "//li[.//text()[contains(translate(. ,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]]",
     ]
+
     candidates = []
-    for xp in patterns:
+    for xp in xpath_patterns:
         try:
             found = driver.find_elements(By.XPATH, xp)
             for f in found:
                 if f not in candidates:
                     candidates.append(f)
         except Exception:
-            pass
+            continue
 
-    # Dump candidate outerHTML for debugging
+    # Dump candidate outerHTML to debug file
     try:
         dump_lines = []
         dump_lines.append(f"AMF candidates dump time={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        for i, el in enumerate(candidates[:50]):
+        for i, el in enumerate(candidates[:100]):
             try:
                 outer = driver.execute_script("return arguments[0].outerHTML;", el)
             except Exception:
-                outer = "<outerHTML not available>"
+                outer = "<outerHTML unavailable>"
             vis = False
             try:
                 vis = el.is_displayed()
@@ -318,89 +297,97 @@ def ensure_select_amf():
         dump_file = os.path.join(DEBUG_DIR, f"amf_candidates_{int(time.time())}.txt")
         with open(dump_file, "w", encoding="utf-8") as fh:
             fh.writelines(dump_lines)
-        print("[DEBUG] candidate dump written:", dump_file)
+        print("[DEBUG] wrote candidate dump:", dump_file)
         step.snap("S_AFTER_amf_candidates_dump", html=True)
     except Exception as e:
-        print("Failed to write AMF candidate dump:", e)
+        print("Failed to dump AMF candidates:", e)
 
-    # Try preferred exact-text candidates first
-    for el in list(candidates):
+    # prioritize exact-text matches
+    for el in candidates:
         try:
-            try:
-                txt = (el.text or "").strip()
-            except Exception:
-                txt = ""
+            txt = (el.text or "").strip()
             if txt and txt.lower() == "amf":
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                time.sleep(0.12)
-                if robust_click_target(el):
-                    step.snap("S_CLICK_amf_exact", html=True)
-                    print("Clicked AMF exact candidate")
-                    return True
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                try:
+                    el.click()
+                except Exception:
+                    try:
+                        driver.execute_script("arguments[0].click();", el)
+                    except Exception:
+                        pass
+                step.snap("S_CLICK_amf_exact", html=True)
+                print("Clicked AMF exact candidate")
+                return True
         except Exception:
             continue
 
-    # try child anchors / clickable children inside each candidate
-    for el in list(candidates):
+    # try clicking child anchors/spans or JS/actionchains
+    for el in candidates:
         try:
-            # anchor child
             try:
                 a = el.find_element(By.XPATH, ".//a[normalize-space(.)!='']")
                 if a.is_displayed():
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", a)
-                    time.sleep(0.1)
-                    if robust_click_target(a):
-                        step.snap("S_CLICK_amf_child_a", html=True)
-                        print("Clicked AMF via child <a>")
-                        return True
+                    try:
+                        a.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", a)
+                    step.snap("S_CLICK_amf_child_a", html=True)
+                    print("Clicked child <a> in candidate")
+                    return True
             except Exception:
                 pass
-            # span child
+
             try:
                 sp = el.find_element(By.XPATH, ".//span[normalize-space(.)!='']")
                 if sp.is_displayed():
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", sp)
-                    time.sleep(0.1)
-                    if robust_click_target(sp):
-                        step.snap("S_CLICK_amf_child_span", html=True)
-                        print("Clicked AMF via child <span>")
-                        return True
+                    try:
+                        sp.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", sp)
+                    step.snap("S_CLICK_amf_child_span", html=True)
+                    print("Clicked child <span> in candidate")
+                    return True
             except Exception:
                 pass
-            # action chains on element
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            time.sleep(0.08)
+
+            # try action chains
             try:
                 ActionChains(driver).move_to_element(el).pause(0.08).click(el).perform()
                 step.snap("S_CLICK_amf_actionchains", html=True)
-                print("Clicked AMF via ActionChains on candidate")
+                print("Clicked candidate via ActionChains")
                 return True
             except Exception:
                 pass
+
             # js click fallback
             try:
                 driver.execute_script("arguments[0].click();", el)
                 step.snap("S_CLICK_amf_js", html=True)
-                print("Clicked AMF via JS on candidate")
+                print("Clicked candidate via JS")
                 return True
             except Exception:
                 pass
         except Exception:
             continue
 
-    # As last resort fuzzy search and click
+    # fuzzy last resort
     try:
         fuzzy = driver.find_elements(By.XPATH, "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]")
         for f in fuzzy:
             try:
                 if not f.is_displayed():
                     continue
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", f)
-                time.sleep(0.08)
-                if robust_click_target(f):
-                    step.snap("S_CLICK_amf_fuzzy", html=True)
-                    print("Clicked AMF via fuzzy candidate")
-                    return True
+                try:
+                    f.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", f)
+                step.snap("S_CLICK_amf_fuzzy", html=True)
+                print("Clicked fuzzy element containing 'amf'")
+                return True
             except Exception:
                 continue
     except Exception:
@@ -428,10 +415,10 @@ def upload_config_file(file_path):
         except Exception:
             pass
 
-    # fallback inject
+    # fallback injection
     try:
-        uid = f"tmp_file_input_{int(time.time())}"
-        js = "var i=document.createElement('input'); i.type='file'; i.id=arguments[0]; i.style.display='block'; document.body.appendChild(i); return i;"
+        uid = f"tmp_upload_{int(time.time())}"
+        js = "var inp=document.createElement('input'); inp.type='file'; inp.id=arguments[0]; inp.style.display='block'; document.body.appendChild(inp); return inp;"
         driver.execute_script(js, uid)
         tmp = driver.find_element(By.ID, uid)
         tmp.send_keys(file_path)
@@ -440,9 +427,9 @@ def upload_config_file(file_path):
         return True
     except Exception:
         step.snap("S_ERR_upload_no_input", html=True)
-        raise Exception("upload_config_file: could not find or create file input")
+        raise Exception("upload_config_file: cannot locate or inject file input")
 
-# ---------------- import/apply helpers ----------------
+# ---------------- import / apply helpers ----------------
 def click_import():
     step.snap("S_BEFORE_import", html=True)
     texts = ["persist configurations", "persist", "import", "upload", "persist configuration", "save configuration"]
@@ -451,19 +438,21 @@ def click_import():
             btns = driver.find_elements(By.XPATH, f"//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{t}')]")
             btn = _first_visible(btns)
             if btn:
-                if robust_click_target(btn):
-                    time.sleep(MED_SLEEP)
-                    step.snap("S_AFTER_import", html=True)
-                    handle_native_alerts(timeout=6, accept=True)
-                    return True
+                try:
+                    btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", btn)
+                time.sleep(MED_SLEEP)
+                step.snap("S_AFTER_import", html=True)
+                handle_native_alerts(timeout=6, accept=True)
+                return True
         except Exception:
-            pass
+            continue
     step.snap("S_ERR_import_not_found", html=True)
     raise Exception("click_import: import/persist button not found")
 
 def click_apply():
     step.snap("S_BEFORE_apply", html=True)
-    # scroll a small amount
     try:
         driver.execute_script("window.scrollBy(0, 300);")
     except Exception:
@@ -476,18 +465,21 @@ def click_apply():
             btns = driver.find_elements(By.XPATH, f"//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{w}')]")
             btn = _first_visible(btns)
             if btn:
-                if robust_click_target(btn):
-                    time.sleep(MED_SLEEP)
-                    step.snap("S_AFTER_apply", html=True)
-                    handle_native_alerts(timeout=6, accept=True)
-                    return True
+                try:
+                    btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", btn)
+                time.sleep(MED_SLEEP)
+                step.snap("S_AFTER_apply", html=True)
+                handle_native_alerts(timeout=6, accept=True)
+                return True
         except Exception:
-            pass
+            continue
 
     step.snap("S_ERR_apply_not_found", html=True)
     raise Exception("click_apply: apply/confirm button not found")
 
-# ---------------- main flow ----------------
+# ---------------- Main flow ----------------
 def main():
     try:
         print("Starting GUI upload run")
@@ -496,18 +488,13 @@ def main():
         wait_document_ready(25)
         time.sleep(MED_SLEEP)
 
-        # Login
+        # Login fields
         try:
             u = driver.find_element(By.XPATH, "//input[@type='text' or @type='email' or contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'user')]")
             p = driver.find_element(By.XPATH, "//input[@type='password' or contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'pass')]")
         except Exception:
-            # broader search
-            try:
-                u = WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, "//input[@type='text' or @type='email']")))
-                p = WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, "//input[@type='password']")))
-            except Exception as ee:
-                step.snap("S_ERR_login_fields_missing", html=True)
-                raise Exception("Login fields not found") from ee
+            u = WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, "//input[@type='text' or @type='email']")))
+            p = WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, "//input[@type='password']")))
 
         u.clear(); u.send_keys(USERNAME)
         p.clear(); p.send_keys(PASSWORD)
@@ -517,17 +504,17 @@ def main():
         wait_document_ready(20)
         time.sleep(MED_SLEEP)
 
-        # Ensure Configure clicked
+        # Open Configure (use original restored logic)
         try:
-            ensure_click_configure()
+            open_configure_menu()
         except Exception as e:
-            print("ensure_click_configure failed:", e)
+            print("open_configure_menu failed:", e)
             step.snap("S_ERR_configure_click", html=True)
             raise
 
         time.sleep(SHORT_SLEEP)
 
-        # Ensure AMF selected
+        # Attempt to select AMF
         try:
             ensure_select_amf()
         except Exception as e:
@@ -538,10 +525,9 @@ def main():
         time.sleep(MED_SLEEP)
         step.snap("S_AFTER_amf_selected", html=True)
 
-        # Upload files
+        # Upload AMF files
         if not os.path.isdir(CONFIG_DIR):
             raise Exception(f"CONFIG_DIR '{CONFIG_DIR}' not found")
-
         files = sorted(os.listdir(CONFIG_DIR))
         for fname in files:
             if not fname.lower().endswith("_amf.json"):
@@ -553,7 +539,6 @@ def main():
             upload_config_file(fpath)
             click_import()
 
-            # scroll towards bottom to make Apply visible and click
             try:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight - 200);")
             except Exception:
@@ -562,18 +547,21 @@ def main():
 
             click_apply()
 
-            # click Ok if visible
+            # click Ok if appears
             try:
                 okbtns = driver.find_elements(By.XPATH, "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'ok') and (self::button or self::a)]")
                 okbtn = _first_visible(okbtns)
                 if okbtn:
-                    robust_click_target(okbtn)
+                    try:
+                        okbtn.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", okbtn)
                     time.sleep(SHORT_SLEEP)
                     step.snap("S_AFTER_ok_click", html=True)
             except Exception:
                 pass
 
-            # wait for success toast
+            # wait for toast success
             end = time.time() + (8 if FAST_MODE else 20)
             success_found = False
             while time.time() < end:
@@ -593,7 +581,7 @@ def main():
                 time.sleep(0.4)
 
             if success_found:
-                print("Upload success detected for:", fname)
+                print("Upload success for:", fname)
             else:
                 print("No explicit success toast for:", fname)
             step.snap(f"S_DONE_upload_{fname}", html=True)
