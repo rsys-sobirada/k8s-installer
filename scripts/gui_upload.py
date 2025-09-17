@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-gui_upload.py - Use original Configure click logic for AMF as well + robust verification.
-
+gui_upload.py - Robust AMF uploader, now with explicit click for the 'amf' sub-entry
 Flow:
   - Login
   - open_configure_menu()  (original-style)
-  - open_nf_menu('AMF')    (uses same original-style logic as Configure)
-  - wait_for_amf_panel()   (verify AMF UI loaded)
+  - open_nf_menu('AMF')    (original-style)
+  - click_amf_subentry()   (new: click the 'amf' item inside AMF panel)
+  - wait_for_amf_panel()
   - Choose File -> Import -> scroll -> Apply -> Ok
-Debug screenshots/html saved to debug_screenshots/
-Set HEADLESS=0 for visible browser during troubleshooting.
+Saves debug screenshots/html into debug_screenshots/.
+Set HEADLESS=0 for visible browser while debugging.
 """
 
 import os
@@ -126,8 +126,8 @@ def wait_for_no_overlay(wait=12):
         "//*[contains(@class,'overlay') or contains(@class,'backdrop') or contains(@class,'modal-backdrop') or contains(@class,'cdk-overlay-backdrop') or contains(@class,'MuiBackdrop-root')]",
         "//*[contains(@class,'spinner') or contains(@class,'loading') or contains(@class,'progress')]"
     ]
-    deadline = time.time() + wait
-    while time.time() < deadline:
+    end = time.time() + wait
+    while time.time() < end:
         visible = False
         for xp in overlay_xps:
             try:
@@ -137,11 +137,11 @@ def wait_for_no_overlay(wait=12):
                             visible = True
                             break
                     except Exception:
-                        pass
+                        continue
                 if visible:
                     break
             except Exception:
-                pass
+                continue
         if not visible:
             return True
         time.sleep(0.25)
@@ -241,11 +241,9 @@ def open_nf_menu(name):
             if not el:
                 continue
             try:
-                # try clicking element itself first
                 el.click()
             except Exception:
                 try:
-                    # fallback to JS click
                     driver.execute_script("arguments[0].click();", el)
                 except Exception as js_e:
                     last_err = js_e
@@ -255,7 +253,7 @@ def open_nf_menu(name):
         except Exception as e:
             last_err = e
             continue
-    # final fallback: fuzzy search
+    # fallback
     try:
         el = _first_visible(driver.find_elements(By.XPATH, f"//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{t}')]"))
         if el:
@@ -271,14 +269,196 @@ def open_nf_menu(name):
     step.snap(f"S_ERR_click_nf_{name}", html=True)
     raise Exception(f"open_nf_menu: unable to click NF '{name}' (last={last_err})")
 
+# ---------------- New: click 'amf' sub-entry inside AMF panel ----------------
+def click_amf_subentry(timeout=12):
+    """
+    Find and click the 'amf' sub-entry that appears under the AMF panel.
+    Strategy:
+      - Try to locate a panel/region that belongs to AMF (heuristics)
+      - Search inside that region for exact 'amf' entries (exact text first)
+      - Try child anchors/spans, ActionChains, JS click fallback
+      - If nothing found, dump candidate outerHTMLs to debug file for analysis
+    """
+    step.snap("S_BEFORE_click_amf_subentry", html=True)
+    wait_for_no_overlay(wait=8)
+    time.sleep(SHORT_SLEEP)
+
+    # Heuristics to find AMF panel container(s)
+    panel_xps = [
+        "//*[contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]",               # id contains amf
+        "//*[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]",            # class contains amf
+        "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf') and (contains(@class,'panel') or contains(@class,'content') or contains(@role,'region'))]",
+        # any visible container that includes the word 'AMF' in its text (likely panel header)
+        "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf') and (self::div or self::section or self::aside)]",
+    ]
+
+    panels = []
+    for xp in panel_xps:
+        try:
+            found = driver.find_elements(By.XPATH, xp)
+            for f in found:
+                if f not in panels:
+                    panels.append(f)
+        except Exception:
+            continue
+
+    # Fallback: if no panels found, consider whole document as context
+    contexts = panels if panels else [driver]
+
+    # Search inside contexts for exact 'amf' sub-entry first
+    candidates = []
+    for ctx in contexts:
+        try:
+            # exact match (case-insensitive)
+            exacts = ctx.find_elements(By.XPATH, ".//*[translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='amf']")
+            for e in exacts:
+                if e not in candidates:
+                    candidates.append(e)
+            # contains ' amf ' or starts/ends (word boundaries)
+            contains = ctx.find_elements(By.XPATH, ".//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),' amf ') or starts-with(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf ') or substring(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), string-length(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')) - string-length('amf') +1)='amf']")
+            for e in contains:
+                if e not in candidates:
+                    candidates.append(e)
+            # also look for anchors / li elements inside context
+            anchors = ctx.find_elements(By.XPATH, ".//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]")
+            for e in anchors:
+                if e not in candidates:
+                    candidates.append(e)
+            lis = ctx.find_elements(By.XPATH, ".//li[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]")
+            for e in lis:
+                if e not in candidates:
+                    candidates.append(e)
+        except Exception:
+            continue
+
+    # If still empty, do a global fuzzy search
+    if not candidates:
+        try:
+            fuzzy = driver.find_elements(By.XPATH, "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]")
+            for e in fuzzy:
+                if e not in candidates:
+                    candidates.append(e)
+        except Exception:
+            pass
+
+    # Dump candidate info for debugging if none or many
+    try:
+        dump_lines = []
+        dump_lines.append(f"amf_subentry candidates dump time={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        for i, el in enumerate(candidates[:200]):
+            try:
+                outer = driver.execute_script("return arguments[0].outerHTML;", el)
+            except Exception:
+                outer = "<outerHTML unavailable>"
+            vis = False
+            try:
+                vis = el.is_displayed()
+            except Exception:
+                vis = False
+            dump_lines.append(f"--- candidate {i} visible={vis} ---\n{outer}\n\n")
+        dump_file = os.path.join(DEBUG_DIR, f"amf_subentry_candidates_{int(time.time())}.txt")
+        with open(dump_file, "w", encoding="utf-8") as fh:
+            fh.writelines(dump_lines)
+        print("[DEBUG] wrote amf_subentry candidate dump:", dump_file)
+        step.snap("S_AFTER_amf_subentry_candidates_dump", html=True)
+    except Exception as e:
+        print("Failed to dump amf_subentry candidates:", e)
+
+    # Try to click candidates (prioritize visible exact matches)
+    for el in candidates:
+        try:
+            txt = ""
+            try:
+                txt = (el.text or "").strip()
+            except Exception:
+                txt = ""
+            # prefer exact 'amf'
+            if txt and txt.lower() == "amf":
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                except Exception:
+                    pass
+                time.sleep(0.12)
+                if robust_click_target(el):
+                    step.snap("S_CLICK_amf_subentry_exact", html=True)
+                    print("Clicked amf subentry (exact text).")
+                    return True
+        except Exception:
+            continue
+
+    # Try clicking anchors/spans inside candidates
+    for el in candidates:
+        try:
+            try:
+                a = el.find_element(By.XPATH, ".//a[normalize-space(.)!='']")
+                if a.is_displayed():
+                    try:
+                        a.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", a)
+                    step.snap("S_CLICK_amf_subentry_child_a", html=True)
+                    print("Clicked child <a> inside candidate")
+                    return True
+            except Exception:
+                pass
+
+            try:
+                sp = el.find_element(By.XPATH, ".//span[normalize-space(.)!='']")
+                if sp.is_displayed():
+                    try:
+                        sp.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", sp)
+                    step.snap("S_CLICK_amf_subentry_child_span", html=True)
+                    print("Clicked child <span> inside candidate")
+                    return True
+            except Exception:
+                pass
+
+            # action chains on candidate
+            try:
+                ActionChains(driver).move_to_element(el).pause(0.08).click(el).perform()
+                step.snap("S_CLICK_amf_subentry_actionchains", html=True)
+                print("Clicked candidate via ActionChains")
+                return True
+            except Exception:
+                pass
+
+            # JS click fallback
+            try:
+                driver.execute_script("arguments[0].click();", el)
+                step.snap("S_CLICK_amf_subentry_js", html=True)
+                print("Clicked candidate via JS click fallback")
+                return True
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    # Final fuzzy pass (global click attempt)
+    try:
+        fuzzy = driver.find_elements(By.XPATH, "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]")
+        for f in fuzzy:
+            try:
+                if not f.is_displayed():
+                    continue
+                try:
+                    f.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", f)
+                step.snap("S_CLICK_amf_subentry_fuzzy", html=True)
+                print("Clicked fuzzy element containing 'amf'")
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    step.snap("S_ERR_click_amf_subentry_final", html=True)
+    raise Exception("click_amf_subentry: unable to locate or click the 'amf' sub-entry. Check amf_subentry_candidates_*.txt and screenshots.")
+
 # ---------------- verify AMF panel presence ----------------
 def wait_for_amf_panel(timeout=12):
-    """
-    Confirm AMF panel loaded by waiting for one of:
-     - input[type=file]
-     - a button with 'choose'/'browse'/'import'/'persist'
-     - known AMF panel elements (heuristic)
-    """
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -300,8 +480,8 @@ def wait_for_amf_panel(timeout=12):
                             return True
                     except Exception:
                         continue
-            # also check for a panel area that looks like NF details - heuristic class names
-            possible_panels = driver.find_elements(By.XPATH, "//*[contains(@class,'panel') or contains(@class,'content') or contains(@class,'config') or contains(@id,'amf') or contains(@id,'AMF')]")
+            # check for panel text
+            possible_panels = driver.find_elements(By.XPATH, "//*[contains(@class,'panel') or contains(@class,'content') or contains(@id,'amf') or contains(@id,'AMF')]")
             for p in possible_panels:
                 try:
                     if p.is_displayed() and p.text and len(p.text) > 5:
@@ -314,7 +494,7 @@ def wait_for_amf_panel(timeout=12):
         time.sleep(0.4)
     return False
 
-# ---------------- upload helpers (unchanged logic) ----------------
+# ---------------- upload helpers ----------------
 def upload_config_file(file_path):
     step.snap("S_BEFORE_upload", html=True)
     selectors = ["//input[@type='file']","//input[contains(@class,'file') and @type='file']","//input[contains(@id,'file') and @type='file']"]
@@ -328,6 +508,7 @@ def upload_config_file(file_path):
             return True
         except Exception:
             continue
+    # fallback injection
     try:
         uid = f"tmp_file_{int(time.time())}"
         driver.execute_script("var i=document.createElement('input'); i.type='file'; i.id=arguments[0]; i.style.display='block'; document.body.appendChild(i); return i;", uid)
@@ -409,7 +590,7 @@ def main():
         wait_document_ready(20)
         time.sleep(MED_SLEEP)
 
-        # Click Configure using original logic
+        # Click Configure (original-style)
         try:
             open_configure_menu()
         except Exception as e:
@@ -419,7 +600,7 @@ def main():
 
         time.sleep(SHORT_SLEEP)
 
-        # Click AMF using the SAME conservative logic
+        # Click AMF category (original-style)
         try:
             open_nf_menu("AMF")
         except Exception as e:
@@ -427,37 +608,44 @@ def main():
             step.snap("S_ERR_amf_menu_click", html=True)
             raise
 
-        # Wait/verify AMF panel loaded
+        time.sleep(SHORT_SLEEP)
+
+        # Now click the sub-entry "amf" under AMF (new explicit step)
+        try:
+            click_amf_subentry()
+        except Exception as e:
+            print("click_amf_subentry failed:", e)
+            step.snap("S_ERR_amf_subentry_click", html=True)
+            raise
+
+        # Verify AMF panel is ready (file input or import/persist hints)
         if not wait_for_amf_panel(timeout=12):
-            # dump candidates to debug if panel not loaded
-            # search for amf-like elements and dump
+            # dump candidates and fail with useful message
             try:
                 candidates = driver.find_elements(By.XPATH, "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'amf')]")
                 dump = []
-                for i, c in enumerate(candidates[:100]):
+                for i, c in enumerate(candidates[:200]):
                     try:
                         outer = driver.execute_script("return arguments[0].outerHTML;", c)
                     except Exception:
                         outer = "<outerHTML unavailable>"
                     vis = False
-                    try:
-                        vis = c.is_displayed()
-                    except Exception:
-                        vis = False
+                    try: vis = c.is_displayed()
+                    except Exception: vis = False
                     dump.append(f"--- cand {i} visible={vis} ---\n{outer}\n\n")
-                dump_file = os.path.join(DEBUG_DIR, f"amf_candidates_{int(time.time())}.txt")
+                dump_file = os.path.join(DEBUG_DIR, f"amf_subentry_candidates_{int(time.time())}.txt")
                 with open(dump_file, "w", encoding="utf-8") as fh:
                     fh.writelines(dump)
-                print("[DEBUG] amf candidates dump:", dump_file)
-                step.snap("S_AFTER_amf_candidates_dump", html=True)
+                print("[DEBUG] amf_subentry candidates dump:", dump_file)
+                step.snap("S_AFTER_amf_subentry_candidates_dump", html=True)
             except Exception as e:
-                print("Failed to dump AMF candidates:", e)
-            raise Exception("AMF panel did not appear after clicking AMF; check amf_candidates_*.txt and screenshots")
+                print("Failed to dump amf candidates:", e)
+            raise Exception("AMF panel did not appear after clicking amf sub-entry; check debug artifacts.")
 
         step.snap("S_AFTER_amf_panel_ready", html=True)
         time.sleep(SHORT_SLEEP)
 
-        # Upload all AMF files
+        # Upload AMF files
         if not os.path.isdir(CONFIG_DIR):
             raise Exception(f"CONFIG_DIR '{CONFIG_DIR}' not found")
         files = sorted(os.listdir(CONFIG_DIR))
@@ -471,7 +659,6 @@ def main():
             upload_config_file(fpath)
             click_import()
 
-            # scroll a bit for Apply and click
             try:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight - 200);")
             except Exception:
@@ -490,7 +677,7 @@ def main():
             except Exception:
                 pass
 
-            # wait for success toast (best effor)
+            # wait for success toast
             end = time.time() + (8 if FAST_MODE else 20)
             success_found = False
             while time.time() < end:
