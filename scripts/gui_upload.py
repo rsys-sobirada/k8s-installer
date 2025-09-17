@@ -237,28 +237,65 @@ def upload_config_file(file_path):
     raise Exception("upload_config_file: no file input found")
 
 def click_import():
+    """
+    Robust Import click:
+    - First, locate Import relative to Export
+    - Then fallback to generic 'import' button search
+    """
     step.snap("S_BEFORE_import", html=True)
-    texts = ["import", "persist", "upload"]
-    for t in texts:
+    wait_for_no_overlay(wait=8)
+    time.sleep(SHORT_SLEEP)
+
+    import_btn = None
+
+    # 1) Find Export and check siblings for Import
+    try:
+        exports = driver.find_elements(By.XPATH, "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'export')]")
+        for exp in exports:
+            if not exp.is_displayed():
+                continue
+            try:
+                sibs = exp.find_elements(By.XPATH, "./preceding::*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'import')]")
+                for s in sibs:
+                    if s.is_displayed():
+                        import_btn = s
+                        break
+            except Exception:
+                continue
+            if import_btn:
+                break
+    except Exception:
+        pass
+
+    # 2) Fallback: direct Import button search
+    if not import_btn:
         try:
-            nodes = driver.find_elements(By.XPATH, f"//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{t}')]")
-            for btn in nodes:
-                if not btn.is_displayed():
-                    continue
-                try:
-                    btn.click()
-                except Exception:
-                    try:
-                        driver.execute_script("arguments[0].click();", btn)
-                    except Exception:
-                        ActionChains(driver).move_to_element(btn).click(btn).perform()
-                step.snap("S_AFTER_import", html=True)
-                time.sleep(MED_SLEEP)
-                return True
+            nodes = driver.find_elements(By.XPATH,
+                "//*[self::button or self::a or self::span or self::div]"
+                "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'import')]"
+            )
+            import_btn = _first_visible(nodes)
         except Exception:
-            continue
-    step.snap("S_ERR_import_not_found", html=True)
-    raise Exception("click_import: Import button not found")
+            import_btn = None
+
+    # 3) If still not found, fail
+    if not import_btn:
+        step.snap("S_ERR_import_not_found", html=True)
+        raise Exception("click_import: Import button not found (even near Export)")
+
+    # 4) Try clicking Import
+    try:
+        import_btn.click()
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", import_btn)
+        except Exception:
+            ActionChains(driver).move_to_element(import_btn).click(import_btn).perform()
+
+    step.snap("S_AFTER_click_import", html=True)
+    time.sleep(MED_SLEEP)
+    return True
+
 
 def apply_and_confirm(scroll_steps=6):
     step.snap("S_BEFORE_apply", html=True)
