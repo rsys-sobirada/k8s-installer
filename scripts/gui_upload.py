@@ -297,27 +297,38 @@ def click_import():
     return True
 
 
-def apply_and_confirm(scroll_steps=6):
+def apply_and_confirm():
+    """
+    Scroll to bottom, click Apply (blue button), then confirm Ok popup.
+    """
     step.snap("S_BEFORE_apply", html=True)
+    wait_for_no_overlay(wait=8)
+    time.sleep(SHORT_SLEEP)
+
     apply_btn = None
-    # scroll down until Apply visible
-    for _ in range(scroll_steps):
+
+    # 1) Scroll down in steps until Apply is found
+    for _ in range(8):  # scroll up to 8 times
         try:
-            candidates = driver.find_elements(By.XPATH,
+            candidates = driver.find_elements(
+                By.XPATH,
                 "//*[self::button or self::a or self::span or self::div]"
-                "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'apply')]"
+                "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'apply') "
+                "or contains(@class,'apply')]"
             )
             apply_btn = _first_visible(candidates)
             if apply_btn:
                 break
         except Exception:
             pass
-        driver.execute_script("window.scrollBy(0, 400);")
+        driver.execute_script("window.scrollBy(0, 500);")
         time.sleep(0.8)
+
     if not apply_btn:
         step.snap("S_ERR_apply_not_found", html=True)
-        raise Exception("apply_and_confirm: Apply button not found")
+        raise Exception("apply_and_confirm: Apply button not found at bottom")
 
+    # 2) Click Apply (robustly)
     try:
         apply_btn.click()
     except Exception:
@@ -327,14 +338,14 @@ def apply_and_confirm(scroll_steps=6):
             ActionChains(driver).move_to_element(apply_btn).click(apply_btn).perform()
     step.snap("S_AFTER_click_apply", html=True)
 
-    # wait for confirmation popup
+    # 3) Wait for confirmation popup/modal
     time.sleep(1.5)
+    ok_btn = None
     ok_xps = [
         "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'ok')]",
         "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'yes')]",
         "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'confirm')]",
     ]
-    ok_btn = None
     end = time.time() + 8
     while time.time() < end and not ok_btn:
         for xp in ok_xps:
@@ -346,6 +357,7 @@ def apply_and_confirm(scroll_steps=6):
                 continue
         if not ok_btn:
             time.sleep(0.5)
+
     if ok_btn:
         try:
             ok_btn.click()
@@ -353,13 +365,17 @@ def apply_and_confirm(scroll_steps=6):
             driver.execute_script("arguments[0].click();", ok_btn)
         step.snap("S_AFTER_click_ok", html=True)
         return True
+
+    # fallback: native browser alert
     alert_text = handle_native_alerts(timeout=3, accept=True)
     if alert_text:
         print("Accepted native confirmation alert:", alert_text)
         step.snap("S_AFTER_alert_ok", html=True)
         return True
+
     step.snap("S_ERR_no_confirmation", html=True)
-    raise Exception("apply_and_confirm: no confirmation found after Apply")
+    raise Exception("apply_and_confirm: no confirmation popup after Apply")
+
 
 # ---------------- Main flow ----------------
 def main():
