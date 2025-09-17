@@ -4,12 +4,13 @@ pipeline {
   options {
     timestamps()
     disableConcurrentBuilds()
+    skipDefaultCheckout(true)    // prevent implicit "Declarative: Checkout SCM"
   }
 
   environment {
     CONFIG_DIR = "./config_files"  // or absolute path
-    HEADLESS   = "1"               // set to "0" if you enable Xvfb and want to watch it
-    FAST_MODE  = "1"               // optional: shorter waits in the script
+    HEADLESS   = "1"               // set "0" to watch it run (needs Xvfb)
+    FAST_MODE  = "1"               // optional: shorter waits when env is healthy
   }
 
   stages {
@@ -21,30 +22,57 @@ pipeline {
 
     stage('Prepare venv (if needed)') {
       steps {
-        sh '''#!/usr/bin/env bash
-set -Eeuo pipefail
-python3 --version
-if [[ ! -x ./venv/bin/python ]]; then
-  python3 -m venv venv
-  ./venv/bin/pip install -U pip setuptools wheel
-  ./venv/bin/pip install -U selenium
-fi
-./venv/bin/python -V
-'''
+        // Run with Bash so pipefail works reliably
+        sh '''
+          bash -lc '
+            set -Eeuo pipefail
+            python3 --version
+
+            if [[ ! -x ./venv/bin/python ]]; then
+              python3 -m venv venv
+              ./venv/bin/pip install -U pip setuptools wheel
+              ./venv/bin/pip install -U selenium
+            fi
+
+            ./venv/bin/python -V
+
+            # Optional: sanity check Firefox & geckodriver if present
+            (firefox --version || true)
+            (geckodriver --version || true)
+          '
+        '''
       }
     }
 
     stage('Run GUI Automation') {
       steps {
-        sh '''#!/usr/bin/env bash
-set -Eeuo pipefail
-export CONFIG_DIR="${CONFIG_DIR:-./config_files}"
-export HEADLESS="${HEADLESS:-1}"
-export FAST_MODE="${FAST_MODE:-1}"
-./venv/bin/python scripts/gui_upload.py
-'''
+        // Run with Bash so pipefail works reliably
+        sh '''
+          bash -lc '
+            set -Eeuo pipefail
+            export CONFIG_DIR="${CONFIG_DIR:-./config_files}"
+            export HEADLESS="${HEADLESS:-1}"
+            export FAST_MODE="${FAST_MODE:-1}"
+            ./venv/bin/python scripts/gui_upload.py
+          '
+        '''
       }
     }
+
+    // --- Optional: Headful run with Xvfb if you want to watch the browser ---
+    // stage('Run GUI Automation (headful)') {
+    //   when { expression { return env.HEADLESS == '0' } }
+    //   steps {
+    //     wrap([$class: 'Xvfb', screen: '1920x1080x24']) {
+    //       sh '''
+    //         bash -lc '
+    //           set -Eeuo pipefail
+    //           ./venv/bin/python scripts/gui_upload.py
+    //         '
+    //       '''
+    //     }
+    //   }
+    // }
   }
 
   post {
