@@ -469,6 +469,62 @@ def click_nf_entry(driver, entry_text):
         raise
 
 # ---------------------- Upload helpers ----------------------
+
+def select_amf_from_left_panel():
+    """
+    Try to emulate the left panel: click 'Add' if present (blue button),
+    then click the left-side entry 'amf' so the panel matches the screenshot.
+    This is intentionally conservative: it will not fail if controls are absent.
+    """
+    try:
+        # Ensure Configure is open (best-effort)
+        try:
+            open_configure_menu()
+        except Exception:
+            pass
+        step.snap("S_LEFT_before_select_amf", html=True)
+        # Try to find a visible 'Add' button in the left panel
+        add_xps = [
+            "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'add')]",
+            "//*[contains(@class,'add') and contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'add')]",
+            "//div[contains(normalize-space(.),'Add') and contains(@class,'panel')]",
+        ]
+        for xp in add_xps:
+            try:
+                btn = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((By.XPATH, xp)))
+                if btn and btn.is_displayed():
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", btn)
+                        btn.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", btn)
+                    step.snap("S_LEFT_after_click_add", html=True)
+                    time.sleep(0.3)
+                    break
+            except Exception:
+                continue
+
+        # Now find the left-panel item labeled 'amf' (exact word match preference)
+        try:
+            amf_elem = None
+            candidates = driver.find_elements(By.XPATH, "//*[translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='amf']")
+            amf_elem = _first_visible(candidates)
+            if not amf_elem:
+                # fallback: contains 'amf'
+                amf_elem = find_element_by_text_any(" amf ")
+            if amf_elem:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", amf_elem)
+                try: amf_elem.click()
+                except Exception: driver.execute_script("arguments[0].click();", amf_elem)
+                step.snap("S_LEFT_after_click_amf", html=True)
+            else:
+                step.snap("S_LEFT_no_amf_found", html=True)
+        except Exception as e:
+            step.snap("S_LEFT_amf_click_error", html=True)
+            print("Error selecting left-panel amf:", e)
+    except Exception as e:
+        print("select_amf_from_left_panel encountered error:", e)
+
 def upload_config_file(driver, file_path):
     print(f"Attempting to upload file: {file_path}")
     step.snap("S_UPLOAD_before", html=True)
@@ -920,6 +976,9 @@ try:
 
             # Navigate
             click_nf_tab(driver, "AMF")
+            
+            # NEW: attempt left-panel selection (click Add then left "amf" entry) to match screenshot
+            select_amf_from_left_panel()
             click_nf_entry(driver, "amf")
 
             # Upload
