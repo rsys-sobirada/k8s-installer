@@ -10,7 +10,10 @@ pipeline {
   environment {
     CONFIG_DIR = "./config_files"  // or absolute path
     HEADLESS   = "1"               // set "0" to watch it run (needs Xvfb)
-    FAST_MODE  = "1"               // optional: shorter waits when env is healthy
+    FAST_MODE  = "1"   // optional: shorter waits when env is healthy
+    CAPTURE_ALL_STEPS = "1"
+    CAPTURE_HTML      = "1" 
+
   }
 
   stages {
