@@ -5,16 +5,17 @@ pipeline {
         stage('Run GUI Automation') {
             steps {
                 sh """
-                    # run your automation script
+                    # Activate venv and run your Python automation
                     ./venv/bin/python scripts/gui_upload.py
                 """
             }
         }
+    }
 
-        stage('Archive Screenshots') {
-            steps {
-                archiveArtifacts artifacts: 'debug_screenshots/**/*.*', fingerprint: true
-            }
+    post {
+        always {
+            // Collect screenshots + HTML captures from debug_screenshots/
+            archiveArtifacts artifacts: 'debug_screenshots/**/*.*', fingerprint: true
         }
     }
 }
