@@ -8,8 +8,10 @@ pipeline {
                     # ensure debug dir exists
                     mkdir -p debug_screenshots
 
-                    # activate venv and run automation
-                    # capture console output into gui_run.log for debugging
+                    # install selenium-wire inside venv if missing
+                    ./venv/bin/pip install --quiet selenium-wire
+
+                    # run automation and capture console output
                     ./venv/bin/python scripts/gui_upload.py \
                         > debug_screenshots/gui_run.log 2>&1
                 """
@@ -19,7 +21,6 @@ pipeline {
 
     post {
         always {
-            // Collect screenshots, HTML dumps, toast logs, network logs, console logs
             archiveArtifacts artifacts: 'debug_screenshots/**/*.*', fingerprint: true
         }
     }
