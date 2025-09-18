@@ -5,8 +5,13 @@ pipeline {
         stage('Run GUI Automation') {
             steps {
                 sh """
-                    # Activate venv and run your Python automation
-                    ./venv/bin/python scripts/gui_upload.py
+                    # ensure debug dir exists
+                    mkdir -p debug_screenshots
+
+                    # activate venv and run automation
+                    # capture console output into gui_run.log for debugging
+                    ./venv/bin/python scripts/gui_upload.py \
+                        > debug_screenshots/gui_run.log 2>&1
                 """
             }
         }
@@ -14,7 +19,7 @@ pipeline {
 
     post {
         always {
-            // Collect screenshots + HTML captures from debug_screenshots/
+            // Collect screenshots, HTML dumps, toast logs, network logs, console logs
             archiveArtifacts artifacts: 'debug_screenshots/**/*.*', fingerprint: true
         }
     }
