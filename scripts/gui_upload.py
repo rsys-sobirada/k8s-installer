@@ -299,8 +299,8 @@ def click_import():
 
 def apply_and_confirm():
     """
-    Scroll to bottom, click Apply (blue button), then confirm Ok popup.
-    Includes diagnostics for visibility, enabled state, and click success.
+    Locate the blue Apply button (anchored near Fetch/Clear), click it,
+    then confirm the Ok popup.
     """
     step.snap("S_BEFORE_apply", html=True)
     wait_for_no_overlay(wait=8)
@@ -308,57 +308,61 @@ def apply_and_confirm():
 
     apply_btn = None
 
-    # 1) Scroll down in steps until Apply is found
-    for _ in range(8):
-        try:
-            candidates = driver.find_elements(
-                By.XPATH,
-                "//*[self::button or self::a or self::span or self::div]"
-                "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'apply') "
-                "or contains(@class,'apply')]"
-            )
-            apply_btn = _first_visible(candidates)
+    # 1) Look for Apply near Fetch or Clear
+    try:
+        fetch_btns = driver.find_elements(
+            By.XPATH,
+            "//*[self::button or self::a or self::span or self::div]"
+            "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'fetch')]"
+        )
+        for fb in fetch_btns:
+            try:
+                sibs = fb.find_elements(
+                    By.XPATH,
+                    "./preceding::*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'apply')]"
+                )
+                for s in sibs:
+                    if s.is_displayed():
+                        apply_btn = s
+                        break
+            except Exception:
+                continue
             if apply_btn:
                 break
-        except Exception as e:
-            print("Error while finding Apply button:", e)
-        driver.execute_script("window.scrollBy(0, 500);")
-        time.sleep(0.8)
+    except Exception:
+        pass
+
+    # 2) Fallback: global search
+    if not apply_btn:
+        try:
+            nodes = driver.find_elements(
+                By.XPATH,
+                "//*[self::button or self::a or self::span or self::div]"
+                "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'apply')]"
+            )
+            apply_btn = _first_visible(nodes)
+        except Exception:
+            apply_btn = None
 
     if not apply_btn:
         step.snap("S_ERR_apply_not_found", html=True)
-        raise Exception("apply_and_confirm: Apply button not found at bottom")
+        raise Exception("apply_and_confirm: Apply button not found")
 
-    # 2) Diagnostics before clicking
-    try:
-        print("Apply button text:", apply_btn.text)
-        print("Apply button enabled:", apply_btn.is_enabled())
-        print("Apply button displayed:", apply_btn.is_displayed())
-        print("Apply button location:", apply_btn.location)
-        print("Apply button size:", apply_btn.size)
-        print("Apply button HTML:", apply_btn.get_attribute('outerHTML'))
-    except Exception as e:
-        print("Error during Apply button diagnostics:", e)
-
-    # 3) Click Apply (robustly)
+    # 3) Try click Apply
     try:
         apply_btn.click()
         print("Clicked Apply using .click()")
-    except Exception as e1:
+    except Exception:
         try:
             driver.execute_script("arguments[0].click();", apply_btn)
             print("Clicked Apply using JS click")
-        except Exception as e2:
-            try:
-                ActionChains(driver).move_to_element(apply_btn).click(apply_btn).perform()
-                print("Clicked Apply using ActionChains")
-            except Exception as e3:
-                step.snap("S_ERR_apply_click_failed", html=True)
-                raise Exception(f"apply_and_confirm: Failed to click Apply button. Errors: {e1}, {e2}, {e3}")
+        except Exception:
+            ActionChains(driver).move_to_element(apply_btn).click(apply_btn).perform()
+            print("Clicked Apply using ActionChains")
 
     step.snap("S_AFTER_click_apply", html=True)
 
-    # 4) Wait for confirmation popup/modal
+    # 4) Wait for confirmation popup and click Ok
     time.sleep(1.5)
     ok_btn = None
     ok_xps = [
@@ -386,7 +390,7 @@ def apply_and_confirm():
         step.snap("S_AFTER_click_ok", html=True)
         return True
 
-    # fallback: native browser alert
+    # Fallback: native alert
     alert_text = handle_native_alerts(timeout=3, accept=True)
     if alert_text:
         print("Accepted native confirmation alert:", alert_text)
