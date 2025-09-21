@@ -158,13 +158,23 @@ def click_amf_subentry():
 # ---------------- Import helpers ----------------
 def upload_config_file(file_path):
     step.snap("S_BEFORE_upload", html=True)
+
+    # ORIGINAL logic fix: always use absolute path
+    abs_path = os.path.abspath(file_path)
+    if not os.path.exists(abs_path):
+        step.snap("S_ERR_file_missing", html=True)
+        raise FileNotFoundError(f"Config file not found: {abs_path}")
+
+    print(f"[DEBUG] Uploading config file: {abs_path}")
+
     inp = driver.find_element(By.XPATH, "//input[@type='file']")
     driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible';", inp)
-    inp.send_keys(file_path)
-    # fire change event
+    inp.send_keys(abs_path)  # <<< original safe logic
     driver.execute_script("arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", inp)
+
     time.sleep(SHORT_SLEEP)
     step.snap("S_AFTER_upload", html=True)
+
 
 def click_import():
     step.snap("S_BEFORE_import", html=True)
